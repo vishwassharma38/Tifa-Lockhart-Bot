@@ -4,25 +4,37 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tifa-lockhart-bot"
-version = "0.1.0"
+version = "1.0.0"
 description = "A responsible Tifa Lockhart media discovery and archive bot."
-requires-python = ">=3.12"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
 dependencies = [
   "discord.py>=2.4,<3",
   "aiohttp>=3.10,<4",
   "python-dotenv>=1.0,<2",
+  "supabase>=2.10,<3",
+  "boto3>=1.35,<2",
+  "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1", "ruff>=0.7,<1"]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.24,<1",
+  "ruff>=0.7,<1",
+]
 
 [tool.setuptools.packages.find]
 include = ["app*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
