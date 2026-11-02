@@ -23,6 +23,10 @@ def read_migrations() -> tuple[list[Path], str]:
     return files, "\n".join(path.read_text(encoding="utf-8") for path in files)
 
 
+def read_migration(name: str) -> str:
+    return (MIGRATIONS / name).read_text(encoding="utf-8")
+
+
 def test_migrations_are_named_and_ordered() -> None:
     files, _sql = read_migrations()
 
@@ -114,3 +118,23 @@ def test_stored_object_key_is_content_addressed() -> None:
 
     assert "r2_object_key ~ '^assets/[0-9a-f]{2}/[0-9a-f]{64}\\.[a-z0-9]+$'" in sql
     assert "r2_object_key like 'assets/' || left(sha256, 2) || '/' || sha256 || '.%'" in sql
+
+
+def test_provider_neutral_storage_migration_is_safe_and_present() -> None:
+    files, _sql = read_migrations()
+    names = [path.name for path in files]
+
+    assert "001_initial_schema.sql" in names
+    assert "002_provider_neutral_storage_columns.sql" in names
+
+    sql = read_migration("002_provider_neutral_storage_columns.sql")
+    lowered = sql.lower()
+
+    assert "rename column r2_bucket to storage_bucket" in lowered
+    assert "rename column r2_object_key to storage_object_key" in lowered
+    assert "rename constraint media_items_r2_object_key_key" in lowered
+    assert "media_items_storage_object_key_key" in lowered
+    assert "drop table" not in lowered
+    assert "drop column" not in lowered
+    assert "delete from" not in lowered
+    assert "truncate" not in lowered

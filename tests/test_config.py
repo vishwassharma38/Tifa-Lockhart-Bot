@@ -238,6 +238,97 @@ def test_b2_endpoint_must_match_region() -> None:
         settings.validate_service_configuration()
 
 
+def test_eu_central_b2_configuration_is_accepted() -> None:
+    settings = Settings.from_env(
+        env={
+            "B2_ENDPOINT_URL": "https://s3.eu-central-003.backblazeb2.com",
+            "B2_REGION": "eu-central-003",
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "application-key",
+        },
+        load_env_file=False,
+    )
+
+    settings.validate_service_configuration()
+
+    assert settings.b2_configured is True
+    assert settings.b2_region == "eu-central-003"
+
+
+def test_eu_central_endpoint_must_match_region() -> None:
+    settings = Settings.from_env(
+        env={
+            "B2_ENDPOINT_URL": "https://s3.us-west-004.backblazeb2.com",
+            "B2_REGION": "eu-central-003",
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "application-key",
+        },
+        load_env_file=False,
+    )
+
+    with pytest.raises(ConfigurationError, match="B2_ENDPOINT_URL"):
+        settings.validate_service_configuration()
+
+
+def test_b2_endpoint_with_unexpected_host_is_rejected() -> None:
+    settings = Settings.from_env(
+        env={
+            "B2_ENDPOINT_URL": "https://s3.eu-central-003.example.com",
+            "B2_REGION": "eu-central-003",
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "application-key",
+        },
+        load_env_file=False,
+    )
+
+    with pytest.raises(ConfigurationError, match="B2_ENDPOINT_URL"):
+        settings.validate_service_configuration()
+
+
+@pytest.mark.parametrize(
+    "region",
+    ["auto", "", "eu-central-3", "EU-CENTRAL-003", "us-east-1"],
+)
+def test_unsupported_or_empty_b2_region_is_rejected(region: str) -> None:
+    settings = Settings.from_env(
+        env={
+            "B2_ENDPOINT_URL": "https://s3.eu-central-003.backblazeb2.com",
+            "B2_REGION": region,
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "application-key",
+        },
+        load_env_file=False,
+    )
+
+    with pytest.raises(ConfigurationError, match="B2_REGION"):
+        settings.validate_service_configuration()
+
+
+def test_b2_validation_errors_do_not_expose_credentials() -> None:
+    settings = Settings.from_env(
+        env={
+            "B2_ENDPOINT_URL": "https://s3.eu-central-003.example.com",
+            "B2_REGION": "eu-central-003",
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "b2-key-id-secret",
+            "B2_APPLICATION_KEY": "b2-application-key-secret",
+        },
+        load_env_file=False,
+    )
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        settings.validate_service_configuration()
+
+    message = str(exc_info.value)
+    assert "B2_ENDPOINT_URL" in message
+    assert "b2-key-id-secret" not in message
+    assert "b2-application-key-secret" not in message
+
+
 def test_b2_endpoint_requires_https() -> None:
     settings = Settings.from_env(
         env={
