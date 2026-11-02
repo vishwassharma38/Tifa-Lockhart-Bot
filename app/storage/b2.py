@@ -238,11 +238,16 @@ class B2Storage:
         cleanup: bool = True,
         timeout: float | None = None,
     ) -> StorageVerificationResult:
-        """Upload, retrieve, compare, and optionally delete a temporary object."""
+        """Upload, retrieve, compare, and optionally delete a temporary object.
+
+        B2 keeps historical object versions. Deleting the temporary object only
+        removes the current version (and may create a hide marker); it does not
+        permanently purge earlier versions. Cleanup is restricted to the exact
+        uniquely named health-check key created by this call.
+        """
         self._ensure_client()
         object_key = f"{_VERIFICATION_PREFIX}/{uuid.uuid4().hex}.txt"
         payload = _VERIFICATION_PAYLOAD
-        cleaned_up = False
 
         try:
             await self.upload_bytes(
@@ -258,22 +263,51 @@ class B2Storage:
             )
             if not hmac.compare_digest(downloaded, payload):
                 raise StorageVerificationError("B2 verification payload did not round-trip")
-        finally:
+        except Exception as verification_error:
             if cleanup:
-                try:
-                    await self.delete_object(object_key, timeout=timeout)
-                    cleaned_up = True
-                except Exception as exc:
-                    log.warning(
-                        "Failed to delete the B2 verification object (%s)",
-                        type(exc).__name__,
-                    )
+                cleanup_error = await self._cleanup_verification_object(
+                    object_key,
+                    timeout=timeout,
+                )
+                if cleanup_error is not None:
+                    raise StorageVerificationError(
+                        "B2 verification failed and cleanup failed "
+                        f"({type(verification_error).__name__}, {cleanup_error})"
+                    ) from verification_error
+            raise
+
+        cleanup_error = None
+        if cleanup:
+            cleanup_error = await self._cleanup_verification_object(
+                object_key,
+                timeout=timeout,
+            )
+            if cleanup_error is not None:
+                log.warning(
+                    "Failed to delete the B2 verification object (%s)",
+                    cleanup_error,
+                )
 
         return StorageVerificationResult(
             object_key=object_key,
             size_bytes=len(payload),
-            cleaned_up=cleaned_up,
+            cleaned_up=cleanup and cleanup_error is None,
+            cleanup_requested=cleanup,
+            cleanup_error=cleanup_error,
         )
+
+    async def _cleanup_verification_object(
+        self,
+        object_key: str,
+        *,
+        timeout: float | None,
+    ) -> str | None:
+        """Delete one verification object and return an error type name on failure."""
+        try:
+            await self.delete_object(object_key, timeout=timeout)
+        except Exception as exc:
+            return type(exc).__name__
+        return None
 
     async def close(self) -> None:
         """Close the underlying S3 client if it exposes a close method."""

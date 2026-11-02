@@ -29,11 +29,19 @@ async def _verify() -> int:
     finally:
         await storage.close()
 
+    outcome = "complete" if result.complete else "incomplete"
     print(
-        "Backblaze B2 verification succeeded: "
+        f"Backblaze B2 verification {outcome}: "
         f"key={result.object_key} size_bytes={result.size_bytes} "
-        f"cleaned_up={result.cleaned_up}"
+        f"cleanup_requested={result.cleanup_requested} cleaned_up={result.cleaned_up}"
     )
+    if not result.complete:
+        print(
+            "Backblaze B2 verification cleanup failed "
+            f"({result.cleanup_error}); the temporary object may still exist.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

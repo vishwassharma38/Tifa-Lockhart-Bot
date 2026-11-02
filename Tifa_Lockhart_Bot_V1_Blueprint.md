@@ -476,9 +476,12 @@ Storage rules:
 - Store bucket name, object key, MIME type, size, and SHA-256 in Supabase.
 - Use the S3-compatible B2 endpoint and credentials from environment variables.
 - Upload only after the file passes validation and duplicate checks.
-- Do not apply an automatic object-expiration lifecycle rule in V1.
+- Do not apply an automatic object-expiration lifecycle rule to archived media in V1.
 - Retain archived objects until the owner explicitly removes them or a rights/access issue requires removal.
 - Discord publishing fetches the private object through the bot's B2 client and uploads it as an attachment; the bot does not need to expose the B2 object publicly.
+- B2 retains object versions. Deleting a verification object through the S3-compatible API may hide the current version rather than permanently removing historical versions. Routine verification must delete only the exact `healthchecks/<uuid>.txt` object it created and must never perform bucket-wide or prefix-wide version deletion.
+- A lifecycle rule scoped to the `healthchecks/` prefix may expire temporary verification objects and their non-current versions after a short interval. Do not extend that rule to `assets/` or the whole bucket.
+- The verification command must report cleanup failure as an incomplete verification and exit nonzero.
 
 ### 10.3 Core database tables
 
@@ -523,13 +526,13 @@ One record per unique physical media file.
 | `media_type`                                        | `image`, `animation`, or `video`                                                      |
 | `category`                                          | `fanart`, `cosplay_photography`, `official_artwork`, `wallpaper`, `video`, or `other` |
 | `size_bytes`, `width`, `height`, `duration_seconds` | Technical metadata where available                                                    |
-| `r2_bucket`, `r2_object_key`                        | Private storage reference                                                             |
+| `storage_bucket`, `storage_object_key`              | Private storage reference                                                             |
 | `verification_status`                               | `verified` or `dumpster`                                                              |
 | `favorite`                                          | Boolean, default false                                                                |
 | `download_status`                                   | `stored`, `failed`, or `skipped`                                                      |
 | `created_at`, `downloaded_at`                       | Lifecycle timestamps                                                                  |
 
-The historical column names `r2_bucket` and `r2_object_key` are retained so the Phase 1 schema and content-addressed media identity stay stable. They store the private Backblaze B2 bucket name and object key; the SHA-256 uniqueness and deduplication rules are unchanged.
+Storage references use provider-neutral column names: `storage_bucket` and `storage_object_key`. They store the private Backblaze B2 bucket name and object key; the SHA-256 uniqueness and deduplication rules are unchanged. The checked-in migration `002_provider_neutral_storage_columns.sql` renames the historical `r2_*` columns in place for databases where `001_initial_schema.sql` was already applied, preserving existing data.
 
 #### `media_sources`
 

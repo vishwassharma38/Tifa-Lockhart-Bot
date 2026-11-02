@@ -23,6 +23,8 @@ from app.storage.base import (
 VERIFICATION_KEY_PREFIX = "healthchecks/"
 ENDPOINT_URL = "https://s3.us-west-004.backblazeb2.com"
 REGION = "us-west-004"
+EU_ENDPOINT_URL = "https://s3.eu-central-003.backblazeb2.com"
+EU_REGION = "eu-central-003"
 KEY_ID = "test-key-id"
 APPLICATION_KEY = "test-application-key"
 
@@ -50,6 +52,7 @@ class FakeS3:
         self.head_calls: list[str] = []
         self.puts: list[dict[str, Any]] = []
         self.deletes: list[str] = []
+        self.delete_attempts: list[str] = []
         self.objects: dict[str, bytes] = {}
         self.closed = False
         self.head_error: Exception | None = None
@@ -78,6 +81,7 @@ class FakeS3:
 
     def delete_object(self, Bucket: str, Key: str) -> None:
         del Bucket
+        self.delete_attempts.append(Key)
         if self.delete_error is not None:
             raise self.delete_error
         self.deletes.append(Key)
@@ -111,14 +115,20 @@ async def slow_thread(function, *args, **kwargs):
     return function(*args, **kwargs)
 
 
-def make_storage(client: FakeS3, **kwargs: Any) -> tuple[B2Storage, FakeFactory]:
+def make_storage(
+    client: FakeS3,
+    *,
+    endpoint_url: str = ENDPOINT_URL,
+    region: str = REGION,
+    **kwargs: Any,
+) -> tuple[B2Storage, FakeFactory]:
     factory = FakeFactory(client)
     storage = B2Storage(
-        ENDPOINT_URL,
+        endpoint_url,
         KEY_ID,
         APPLICATION_KEY,
         "private-bucket",
-        REGION,
+        region,
         client_factory=factory,
         to_thread=kwargs.pop("to_thread", immediate_thread),
         **kwargs,
@@ -165,6 +175,22 @@ async def test_verify_initializes_client_and_propagates_b2_settings() -> None:
     assert isinstance(factory.kwargs["config"], Config)
     assert factory.kwargs["config"].signature_version == "s3v4"
     assert factory.kwargs["config"].s3 == {"addressing_style": "path"}
+
+
+async def test_eu_central_endpoint_and_region_are_passed_to_client() -> None:
+    client = FakeS3()
+    storage, factory = make_storage(
+        client,
+        endpoint_url=EU_ENDPOINT_URL,
+        region=EU_REGION,
+    )
+
+    status = await storage.verify()
+
+    assert status.state is ServiceState.VERIFIED
+    assert factory.kwargs["endpoint_url"] == EU_ENDPOINT_URL
+    assert factory.kwargs["region_name"] == EU_REGION
+    assert factory.kwargs["config"].signature_version == "s3v4"
 
 
 async def test_verify_reports_unavailable_for_auth_permission_failure() -> None:
@@ -307,8 +333,12 @@ async def test_verification_uploads_downloads_and_cleans_up() -> None:
 
     assert result.object_key.startswith(VERIFICATION_KEY_PREFIX)
     assert result.size_bytes > 0
+    assert result.cleanup_requested is True
     assert result.cleaned_up is True
+    assert result.cleanup_error is None
+    assert result.complete is True
     assert client.deletes == [result.object_key]
+    assert client.delete_attempts == [result.object_key]
     assert result.object_key not in client.objects
     assert client.puts[0]["Key"] == result.object_key
 
@@ -319,8 +349,12 @@ async def test_verification_can_leave_temporary_object_when_cleanup_disabled() -
 
     result = await storage.verify_upload_download(cleanup=False)
 
+    assert result.cleanup_requested is False
     assert result.cleaned_up is False
+    assert result.cleanup_error is None
+    assert result.complete is True
     assert client.deletes == []
+    assert client.delete_attempts == []
     assert result.object_key in client.objects
 
 
@@ -332,8 +366,8 @@ async def test_verification_cleans_up_after_download_failure() -> None:
     with pytest.raises(StorageObjectNotFoundError):
         await storage.verify_upload_download(cleanup=True)
 
-    assert len(client.deletes) == 1
-    assert client.deletes[0].startswith(VERIFICATION_KEY_PREFIX)
+    assert len(client.delete_attempts) == 1
+    assert client.delete_attempts[0].startswith(VERIFICATION_KEY_PREFIX)
 
 
 async def test_verification_cleans_up_after_upload_failure() -> None:
@@ -344,8 +378,8 @@ async def test_verification_cleans_up_after_upload_failure() -> None:
     with pytest.raises(StorageAccessDeniedError):
         await storage.verify_upload_download(cleanup=True)
 
-    assert len(client.deletes) == 1
-    assert client.deletes[0].startswith(VERIFICATION_KEY_PREFIX)
+    assert len(client.delete_attempts) == 1
+    assert client.delete_attempts[0].startswith(VERIFICATION_KEY_PREFIX)
 
 
 async def test_verification_detects_mismatched_payload() -> None:
@@ -360,7 +394,37 @@ async def test_verification_detects_mismatched_payload() -> None:
     with pytest.raises(StorageVerificationError):
         await storage.verify_upload_download(cleanup=True)
 
-    assert len(client.deletes) == 1
+    assert len(client.delete_attempts) == 1
+
+
+async def test_verification_reports_cleanup_failure_as_incomplete() -> None:
+    client = FakeS3()
+    client.delete_error = client_error("InternalError", "delete failed", "DeleteObject")
+    storage, _factory = make_storage(client)
+
+    result = await storage.verify_upload_download(cleanup=True)
+
+    assert result.cleanup_requested is True
+    assert result.cleaned_up is False
+    assert result.cleanup_error == "StorageOperationError"
+    assert result.complete is False
+    assert client.delete_attempts == [result.object_key]
+    assert result.object_key in client.objects
+
+
+async def test_verification_reports_cleanup_failure_after_primary_failure() -> None:
+    client = FakeS3()
+    client.get_error = client_error("NoSuchKey", "not found", "GetObject")
+    client.delete_error = client_error("InternalError", "delete failed", "DeleteObject")
+    storage, _factory = make_storage(client)
+
+    with pytest.raises(StorageVerificationError) as exc_info:
+        await storage.verify_upload_download(cleanup=True)
+
+    assert "StorageObjectNotFoundError" in str(exc_info.value)
+    assert "StorageOperationError" in str(exc_info.value)
+    assert len(client.delete_attempts) == 1
+    assert client.delete_attempts[0].startswith(VERIFICATION_KEY_PREFIX)
 
 
 async def test_verification_never_deletes_unrelated_objects() -> None:

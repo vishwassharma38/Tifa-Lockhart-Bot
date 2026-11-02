@@ -49,6 +49,13 @@ class StorageVerificationResult:
     object_key: str
     size_bytes: int
     cleaned_up: bool
+    cleanup_requested: bool = True
+    cleanup_error: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        """Whether the round-trip succeeded and requested cleanup finished."""
+        return not self.cleanup_requested or self.cleaned_up
 
 
 class ObjectStorage(Protocol):

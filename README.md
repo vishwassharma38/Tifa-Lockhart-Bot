@@ -19,7 +19,7 @@ Phase 1 provides the application foundation:
 
 - Typed environment configuration and secret redaction in logs.
 - Discord gateway client with `/about` and `/status`.
-- Supabase client initialization and checked-in initial SQL migration.
+- Supabase client initialization and checked-in SQL migrations with provider-neutral storage columns.
 - Private Backblaze B2 client initialization and a safe upload/download verification utility.
 - `GET /healthz` HTTP endpoint bound to `0.0.0.0:$PORT`.
 - Single-process startup and graceful shutdown of Discord, HTTP, Supabase, and B2 resources.
@@ -66,6 +66,8 @@ app/
     status.py             Shared dependency status models
 migrations/
   001_initial_schema.sql  Initial Phase 1 schema
+  002_provider_neutral_storage_columns.sql
+                          Renames historical storage columns without data loss
 scripts/
   verify_b2.py            Safe temporary upload/download/delete check
 tests/                    Unit tests with external services mocked
@@ -156,9 +158,9 @@ Command registration behavior:
 1. Create a Supabase project.
 2. Set `SUPABASE_URL` to the project API URL.
 3. Set `SUPABASE_SERVICE_ROLE_KEY` to the server-side service-role key. This key bypasses Row Level Security and must never be exposed to browsers, clients, logs, or source control.
-4. Apply the checked-in migration in order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review `migrations/001_initial_schema.sql`, and run the entire file once. If you use your own PostgreSQL migration tooling, apply the files under `migrations/` in numeric order and record their versions there.
+4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If `001_initial_schema.sql` has already been applied to your project, do not edit or rerun it; apply `002_provider_neutral_storage_columns.sql` only. If you use your own PostgreSQL migration tooling, apply the files in numeric order and record their versions there.
 
-The migration creates `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. It uses UUID keys, `timestamptz`, foreign keys, uniqueness constraints including SHA-256 uniqueness, status checks, indexes, singleton state rows, and Row Level Security with no public policies. It does not delete data or store media binaries in PostgreSQL.
+The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. They use UUID keys, `timestamptz`, foreign keys, uniqueness constraints including SHA-256 uniqueness, status checks, indexes, singleton state rows, and Row Level Security with no public policies. `001` creates the initial schema. `002` renames the historical `r2_bucket` and `r2_object_key` columns to `storage_bucket` and `storage_object_key` in place, renames the related uniqueness constraint, preserves existing rows, and does not drop or recreate `media_items`. The migrations do not delete data or store media binaries in PostgreSQL.
 
 Verify the tables after applying:
 
@@ -173,13 +175,24 @@ where table_schema = 'public'
 order by table_name;
 ```
 
-The repository does not apply migrations to a live project automatically, and no live migration should be considered verified until you run it and check the result yourself.
+The repository does not apply migrations to a live project automatically, and no live migration should be considered verified until you run it and check the result yourself. After applying `002`, confirm the provider-neutral columns exist:
+
+```sql
+select column_name
+from information_schema.columns
+where table_schema = 'public'
+  and table_name = 'media_items'
+  and column_name in ('storage_bucket', 'storage_object_key')
+order by column_name;
+```
+
+If only `r2_bucket` and `r2_object_key` are returned, `002` has not been applied yet.
 
 ### 7. Create the private Backblaze B2 bucket and credentials
 
 1. Create a Backblaze account, enable B2 Cloud Storage, and review Backblaze's current free allowance and billing terms. This repository does not create an account or configure storage for you.
 2. Create a B2 bucket and keep it private. Do not enable public bucket access, a public custom domain, or public object URLs. A Backblaze B2 account is tied to one region, and the bucket's S3 endpoint reflects that region.
-3. In the bucket details, note the bucket region and S3 endpoint. The endpoint format is `https://s3.<region>.backblazeb2.com`. For example, a bucket in `us-west-004` uses `https://s3.us-west-004.backblazeb2.com`. Do not use an endpoint from another region, and do not use `auto` as the region.
+3. In the bucket details, note the bucket region and S3 endpoint. The endpoint format is `https://s3.<region>.backblazeb2.com`. For example, a bucket in `us-west-004` uses `https://s3.us-west-004.backblazeb2.com`, and an EU Central bucket in `eu-central-003` uses `https://s3.eu-central-003.backblazeb2.com`. Do not use an endpoint from another region, and do not use `auto` as the region.
 4. Create an application key scoped to this bucket. Do not use the master application key. Grant the minimum capabilities needed by Phase 1: List All Bucket Names (required for SDK compatibility with bucket-restricted keys), List Files, Read Files, Write Files, and Delete Files. The verification utility needs write, read, and delete access to its temporary object; `/status` checks bucket access with a `HeadBucket` request.
 5. Record the Application Key ID as `B2_KEY_ID` and the Application Key secret as `B2_APPLICATION_KEY`. Backblaze shows the application key only when it is created.
 6. Configure these values in `.env`:
@@ -194,7 +207,15 @@ The repository does not apply migrations to a live project automatically, and no
 python -m scripts.verify_b2
 ```
 
-This uploads a tiny text object under `healthchecks/`, downloads and compares the bytes, then deletes only that generated object. It never uploads real media and never creates a public URL. The `/status` health check also performs a bucket-level `HeadBucket` request, so the application key must permit bucket access; if `/status` reports B2 unavailable while `verify_b2` succeeds, check the key's List Files/List Bucket Names capabilities.
+This uploads a uniquely named tiny text object under `healthchecks/`, downloads and compares the bytes, then attempts to delete only that generated object. It never uploads real media, never creates a public URL, and never performs bucket-wide deletion. The command exits `0` only when the upload, download, byte comparison, and requested cleanup all succeed. If cleanup fails, it prints an error and exits nonzero; upload/download success is not reported as a complete verification when the temporary object could not be deleted.
+
+The `/status` health check also performs a bucket-level `HeadBucket` request, so the application key must permit bucket access; if `/status` reports B2 unavailable while `verify_b2` succeeds, check the key's List Files/List Bucket Names capabilities.
+
+#### B2 object versioning and verification cleanup
+
+Backblaze B2 retains object versions. Deleting an object through the S3-compatible `DeleteObject` operation may create a hide marker or delete marker instead of permanently removing every historical version. A hidden object is no longer returned by normal reads, but its earlier versions may still occupy storage until they are explicitly deleted or expired by a lifecycle rule. Permanent version deletion is a separate operation; the verification utility does not attempt it.
+
+The verification utility only requests deletion of the exact uniquely named `healthchecks/<uuid>.txt` object created by the current run. It never lists and bulk-deletes the bucket, never deletes objects under `assets/`, and never purges all versions in the bucket. If you want historical verification versions to expire automatically, add a Backblaze lifecycle rule scoped to the `healthchecks/` prefix that hides or deletes current objects after a short interval (for example, one day) and expires non-current versions after a short interval. Do not apply an expiration rule to the `assets/` prefix or to the bucket as a whole, because archived media must be retained.
 
 Common B2 configuration errors:
 
@@ -206,7 +227,7 @@ Common B2 configuration errors:
 
 If Supabase or B2 settings are completely absent, the application starts in a documented degraded mode and `/status` reports the service as not configured. If only part of a service's settings is present, startup fails with a clear configuration error rather than pretending the service is available. Missing B2 credentials never prevent the process from starting.
 
-The `media_items` table keeps the historical column names `r2_bucket` and `r2_object_key` so the Phase 1 database schema and media identity remain unchanged. Those columns now store the private B2 bucket name and object key, and the SHA-256 content-addressing and deduplication rules are unchanged.
+The `media_items` table uses the provider-neutral columns `storage_bucket` and `storage_object_key`. Migration `002` renames the historical `r2_bucket` and `r2_object_key` columns in place without changing media identity. Those columns store the private B2 bucket name and object key, and the SHA-256 content-addressing and deduplication rules are unchanged.
 
 ### 8. Run the application locally
 
@@ -258,9 +279,14 @@ Always use the project's virtual environment:
 & ".\.venv\Scripts\python.exe" -m pytest -q
 & ".\.venv\Scripts\python.exe" -m ruff check .
 & ".\.venv\Scripts\python.exe" -m ruff format --check .
+& ".\.venv\Scripts\python.exe" -m pip check
 ```
 
-Tests do not require real Discord, Supabase, or B2 credentials. External services are mocked. No destructive integration tests are run against live services.
+Tests do not require real Discord, Supabase, Reddit, or B2 credentials. External services are mocked. No destructive integration tests are run against live services.
+
+#### Automated verification
+
+GitHub Actions runs the same checks through `.github/workflows/ci.yml` on every push to `main` and every pull request targeting `main`. The workflow uses Python 3.11.8, installs `requirements-dev.txt`, and runs pytest, Ruff lint checks, Ruff formatting checks, and `pip check`. It needs no Discord, Supabase, Reddit, or B2 secrets; all external-service tests use mocks.
 
 ## Configuration reference
 
@@ -302,7 +328,8 @@ The Phase 1 settings are:
 - **`DISCORD_TOKEN is required`** - set the bot token in `.env` before running.
 - **Partial Supabase/B2 configuration error** - set all fields for that service or leave all of them empty for degraded mode.
 - **`/status` shows Unavailable** - check that the Supabase migration was applied, that the B2 bucket exists, that the application key has bucket access, and that the endpoint and region both match the bucket.
-- **`B2_ENDPOINT_URL must match B2_REGION`** - copy the endpoint and region from the same bucket's details. The region is the second label of `s3.<region>.backblazeb2.com`.
+- **`B2_ENDPOINT_URL must match B2_REGION`** - copy the endpoint and region from the same bucket's details. The region is the second label of `s3.<region>.backblazeb2.com`. For example, EU Central uses `B2_REGION=eu-central-003` with `B2_ENDPOINT_URL=https://s3.eu-central-003.backblazeb2.com`.
+- **`verify_b2` exits nonzero with a cleanup failure** - the temporary object may still exist. Confirm the application key has Delete Files access and add a lifecycle rule for the `healthchecks/` prefix if historical versions should expire. Do not delete the bucket or the `assets/` prefix to work around this error.
 - **Slash commands are missing** - confirm the bot was invited with `applications.commands`; allow up to an hour for global sync or set `DISCORD_GUILD_ID` for immediate guild sync.
 - **Port already in use** - change `PORT` or stop the other process. The health endpoint binds to `0.0.0.0`.
 
