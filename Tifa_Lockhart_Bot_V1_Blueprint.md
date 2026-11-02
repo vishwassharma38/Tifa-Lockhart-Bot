@@ -4,7 +4,7 @@
 **Version:** 1.0 (locked V1 scope)  
 **Developer:** SoftwareFromVish  
 **Project owner:** Vish  
-**Primary runtime:** Python 3.12+  
+**Primary runtime:** Python 3.11.8  
 **Deployment target:** Render Web Service  
 **Document status:** Final development specification
 
@@ -39,7 +39,7 @@ The following decisions define the initial release and should not be re-opened d
 | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | Project name                 | Tifa Lockhart Bot                                                                                                                |
 | Developer identity           | SoftwareFromVish                                                                                                                 |
-| Language                     | Python 3.12+                                                                                                                     |
+| Language                     | Python 3.11.8                                                                                                                     |
 | Discord integration          | `discord.py` 2.x, application/slash commands                                                                                     |
 | Primary social source        | Reddit, through a modular PRAW connector                                                                                         |
 | Web discovery                | Brave Search public HTML pages, parsed without using the Brave Search API, subject to applicable access rules and terms          |
@@ -700,7 +700,7 @@ Use APScheduler's asyncio scheduler with timezone `Asia/Kolkata`. Jobs must have
 
 | Purpose                      | Technology                                                                                    |
 | ---------------------------- | --------------------------------------------------------------------------------------------- |
-| Runtime                      | Python 3.12+                                                                                  |
+| Runtime                      | Python 3.11.8                                                                                  |
 | Discord bot                  | `discord.py` 2.x                                                                              |
 | Reddit connector             | PRAW                                                                                          |
 | Async HTTP and health server | `aiohttp`                                                                                     |
