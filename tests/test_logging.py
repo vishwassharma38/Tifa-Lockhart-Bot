@@ -20,17 +20,20 @@ def test_redacts_known_secret_value() -> None:
 def test_redacts_sensitive_assignments_and_bearer_tokens() -> None:
     text = (
         "DISCORD_TOKEN=abc123 SUPABASE_SERVICE_ROLE_KEY: xyz789 "
+        "B2_KEY_ID=key-id-value B2_APPLICATION_KEY: application-key-value "
         "Authorization: Bearer header.payload.signature"
     )
     output = redact_secrets(text)
     assert "abc123" not in output
     assert "xyz789" not in output
+    assert "key-id-value" not in output
+    assert "application-key-value" not in output
     assert "header.payload.signature" not in output
 
 
 def test_redacts_signed_url_query_parameters() -> None:
     text = (
-        "https://example.r2.cloudflarestorage.com/object?"
+        "https://s3.us-west-004.backblazeb2.com/object?"
         "X-Amz-Credential=credential-value&X-Amz-Signature=signature-value"
     )
     output = redact_secrets(text)

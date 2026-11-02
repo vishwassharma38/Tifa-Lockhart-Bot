@@ -19,7 +19,7 @@ def test_defaults_do_not_require_credentials() -> None:
     assert settings.discoveries_channel_id is None
     assert settings.saves_channel_id is None
     assert settings.supabase_configured is False
-    assert settings.r2_configured is False
+    assert settings.b2_configured is False
     assert settings.reddit_access_approved is False
     assert settings.brave_html_enabled is False
 
@@ -39,11 +39,11 @@ def test_parses_phase_one_settings() -> None:
             "DISCORD_SAVES_CHANNEL_ID": "1011",
             "SUPABASE_URL": "https://example.supabase.co",
             "SUPABASE_SERVICE_ROLE_KEY": "service-key",
-            "R2_ENDPOINT_URL": "https://example.r2.cloudflarestorage.com",
-            "R2_ACCESS_KEY_ID": "access-key",
-            "R2_SECRET_ACCESS_KEY": "secret-key",
-            "R2_BUCKET_NAME": "private-bucket",
-            "R2_REGION": "auto",
+            "B2_ENDPOINT_URL": "https://s3.us-west-004.backblazeb2.com",
+            "B2_REGION": "us-west-004",
+            "B2_BUCKET_NAME": "private-bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "application-key",
             "REDDIT_ACCESS_APPROVED": "true",
             "BRAVE_HTML_ENABLED": "false",
         },
@@ -60,7 +60,7 @@ def test_parses_phase_one_settings() -> None:
     assert settings.discoveries_channel_id == 789
     assert settings.saves_channel_id == 1011
     assert settings.supabase_configured is True
-    assert settings.r2_configured is True
+    assert settings.b2_configured is True
     assert settings.reddit_access_approved is True
     assert settings.brave_html_enabled is False
 
@@ -173,12 +173,12 @@ def test_partial_supabase_configuration_is_rejected() -> None:
         settings.validate_service_configuration()
 
 
-def test_partial_r2_configuration_is_rejected() -> None:
+def test_partial_b2_configuration_is_rejected() -> None:
     settings = Settings.from_env(
-        env={"R2_BUCKET_NAME": "bucket"},
+        env={"B2_BUCKET_NAME": "bucket"},
         load_env_file=False,
     )
-    with pytest.raises(ConfigurationError, match="R2_ENDPOINT_URL"):
+    with pytest.raises(ConfigurationError, match="B2_ENDPOINT_URL"):
         settings.validate_service_configuration()
 
 
@@ -187,10 +187,11 @@ def test_invalid_service_urls_are_rejected_without_echoing_values() -> None:
         env={
             "SUPABASE_URL": "not-a-url",
             "SUPABASE_SERVICE_ROLE_KEY": "service-secret",
-            "R2_ENDPOINT_URL": "also-not-a-url",
-            "R2_ACCESS_KEY_ID": "access",
-            "R2_SECRET_ACCESS_KEY": "r2-secret",
-            "R2_BUCKET_NAME": "bucket",
+            "B2_ENDPOINT_URL": "also-not-a-url",
+            "B2_REGION": "us-west-004",
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "b2-secret",
         },
         load_env_file=False,
     )
@@ -200,9 +201,73 @@ def test_invalid_service_urls_are_rejected_without_echoing_values() -> None:
 
     message = str(exc_info.value)
     assert "SUPABASE_URL" in message
-    assert "R2_ENDPOINT_URL" in message
+    assert "B2_ENDPOINT_URL" in message
     assert "service-secret" not in message
-    assert "r2-secret" not in message
+    assert "b2-secret" not in message
+
+
+def test_invalid_b2_region_is_rejected() -> None:
+    settings = Settings.from_env(
+        env={
+            "B2_ENDPOINT_URL": "https://s3.us-west-004.backblazeb2.com",
+            "B2_REGION": "auto",
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "application-key",
+        },
+        load_env_file=False,
+    )
+
+    with pytest.raises(ConfigurationError, match="B2_REGION"):
+        settings.validate_service_configuration()
+
+
+def test_b2_endpoint_must_match_region() -> None:
+    settings = Settings.from_env(
+        env={
+            "B2_ENDPOINT_URL": "https://s3.us-west-002.backblazeb2.com",
+            "B2_REGION": "us-west-004",
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "application-key",
+        },
+        load_env_file=False,
+    )
+
+    with pytest.raises(ConfigurationError, match="B2_ENDPOINT_URL"):
+        settings.validate_service_configuration()
+
+
+def test_b2_endpoint_requires_https() -> None:
+    settings = Settings.from_env(
+        env={
+            "B2_ENDPOINT_URL": "http://s3.us-west-004.backblazeb2.com",
+            "B2_REGION": "us-west-004",
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "application-key",
+        },
+        load_env_file=False,
+    )
+
+    with pytest.raises(ConfigurationError, match="https"):
+        settings.validate_service_configuration()
+
+
+def test_legacy_r2_environment_variables_do_not_configure_b2() -> None:
+    settings = Settings.from_env(
+        env={
+            "R2_ENDPOINT_URL": "https://example.r2.cloudflarestorage.com",
+            "R2_ACCESS_KEY_ID": "access-key",
+            "R2_SECRET_ACCESS_KEY": "secret-key",
+            "R2_BUCKET_NAME": "bucket",
+            "R2_REGION": "auto",
+        },
+        load_env_file=False,
+    )
+
+    assert settings.b2_configured is False
+    settings.validate_service_configuration()
 
 
 def test_complete_service_configuration_passes() -> None:
@@ -210,10 +275,11 @@ def test_complete_service_configuration_passes() -> None:
         env={
             "SUPABASE_URL": "https://example.supabase.co",
             "SUPABASE_SERVICE_ROLE_KEY": "service-key",
-            "R2_ENDPOINT_URL": "https://example.r2.cloudflarestorage.com",
-            "R2_ACCESS_KEY_ID": "access-key",
-            "R2_SECRET_ACCESS_KEY": "secret-key",
-            "R2_BUCKET_NAME": "bucket",
+            "B2_ENDPOINT_URL": "https://s3.us-west-004.backblazeb2.com",
+            "B2_REGION": "us-west-004",
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "application-key",
         },
         load_env_file=False,
     )
@@ -225,22 +291,25 @@ def test_secret_values_and_safe_summary(make_settings) -> None:
         DISCORD_TOKEN="discord-secret-123",
         SUPABASE_URL="https://example.supabase.co",
         SUPABASE_SERVICE_ROLE_KEY="service-secret-123",
-        R2_ENDPOINT_URL="https://example.r2.cloudflarestorage.com",
-        R2_ACCESS_KEY_ID="access-secret-123",
-        R2_SECRET_ACCESS_KEY="r2-secret-123",
-        R2_BUCKET_NAME="bucket",
+        B2_ENDPOINT_URL="https://s3.us-west-004.backblazeb2.com",
+        B2_REGION="us-west-004",
+        B2_BUCKET_NAME="bucket",
+        B2_KEY_ID="key-id-secret-123",
+        B2_APPLICATION_KEY="b2-secret-123",
     )
 
     secrets = settings.secret_values
     assert "discord-secret-123" in secrets
     assert "service-secret-123" in secrets
-    assert "r2-secret-123" in secrets
+    assert "key-id-secret-123" in secrets
+    assert "b2-secret-123" in secrets
     assert all(secrets)
 
     summary = settings.safe_summary()
     assert "discord-secret-123" not in summary
     assert "service-secret-123" not in summary
-    assert "r2-secret-123" not in summary
+    assert "key-id-secret-123" not in summary
+    assert "b2-secret-123" not in summary
     assert "discord=configured" in summary
     assert "supabase=configured" in summary
-    assert "r2=configured" in summary
+    assert "b2=configured" in summary

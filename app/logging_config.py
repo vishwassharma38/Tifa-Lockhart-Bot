@@ -13,8 +13,9 @@ LOGGER_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 _SENSITIVE_ASSIGNMENT = re.compile(
     r"(?i)\b([a-z0-9_]*(?:"
-    r"token|secret|password|api[_-]?key|service[_-]?role[_-]?key|"
-    r"access[_-]?key(?:[_-]?id)?|signature|credential|authorization"
+    r"token|secret|password|api[_-]?key|application[_-]?key|key[_-]?id|"
+    r"service[_-]?role[_-]?key|access[_-]?key(?:[_-]?id)?|signature|"
+    r"credential|authorization"
     r")[a-z0-9_]*)(\s*[:=]\s*)([^\s&,;\"']+)"
 )
 _BEARER_TOKEN = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+")

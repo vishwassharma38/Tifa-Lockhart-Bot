@@ -1,4 +1,4 @@
-"""Cloudflare R2 adapter using the private S3-compatible API."""
+"""Backblaze B2 adapter using the private S3-compatible API."""
 
 from __future__ import annotations
 
@@ -7,57 +7,54 @@ import hmac
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 
 from app.config import Settings
 from app.health.status import DependencyStatus
+from app.storage.base import (
+    StorageAccessDeniedError,
+    StorageError,
+    StorageInitializationError,
+    StorageNotConfiguredError,
+    StorageObjectNotFoundError,
+    StorageObjectTooLargeError,
+    StorageOperationError,
+    StorageTimeoutError,
+    StorageVerificationError,
+    StorageVerificationResult,
+)
 
 log = logging.getLogger(__name__)
 
 _VERIFICATION_PREFIX = "healthchecks"
+_VERIFICATION_PAYLOAD = b"tifa-lockhart-bot b2 verification\n"
+_MISSING_ERROR_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
+_ACCESS_ERROR_CODES = frozenset(
+    {
+        "401",
+        "403",
+        "AccessDenied",
+        "InvalidAccessKeyId",
+        "SignatureDoesNotMatch",
+        "Unauthorized",
+    }
+)
 
 
-class R2Error(RuntimeError):
-    """Base class for R2 adapter errors with secret-free messages."""
-
-
-class R2NotConfiguredError(R2Error):
-    """Raised when an operation requires R2 but credentials are absent."""
-
-
-class R2InitializationError(R2Error):
-    """Raised when a configured R2 client cannot be created."""
-
-
-class R2ObjectTooLargeError(R2Error):
-    """Raised when a downloaded object exceeds the requested bound."""
-
-
-class R2VerificationError(R2Error):
-    """Raised when the upload/download verification does not round-trip."""
-
-
-@dataclass(frozen=True, slots=True)
-class R2VerificationResult:
-    object_key: str
-    size_bytes: int
-    cleaned_up: bool
-
-
-class R2Storage:
-    """Small S3-compatible adapter for the private media bucket."""
+class B2Storage:
+    """Small S3-compatible adapter for the private Backblaze B2 bucket."""
 
     def __init__(
         self,
         endpoint_url: str,
-        access_key_id: str,
-        secret_access_key: str,
+        key_id: str,
+        application_key: str,
         bucket_name: str,
-        region: str = "auto",
+        region: str,
         *,
         client_factory: Callable[..., Any] = boto3.client,
         to_thread: Callable[..., Awaitable[Any]] = asyncio.to_thread,
@@ -66,10 +63,10 @@ class R2Storage:
         operation_timeout: float = 15.0,
     ) -> None:
         self._endpoint_url = endpoint_url
-        self._access_key_id = access_key_id
-        self._secret_access_key = secret_access_key
+        self._key_id = key_id
+        self._application_key = application_key
         self._bucket_name = bucket_name
-        self._region = region or "auto"
+        self._region = region
         self._client_factory = client_factory
         self._to_thread = to_thread
         self._connect_timeout = connect_timeout
@@ -78,13 +75,13 @@ class R2Storage:
         self._client: Any | None = None
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> R2Storage:
+    def from_settings(cls, settings: Settings) -> B2Storage:
         return cls(
-            endpoint_url=settings.r2_endpoint_url,
-            access_key_id=settings.r2_access_key_id,
-            secret_access_key=settings.r2_secret_access_key,
-            bucket_name=settings.r2_bucket_name,
-            region=settings.r2_region,
+            endpoint_url=settings.b2_endpoint_url,
+            key_id=settings.b2_key_id,
+            application_key=settings.b2_application_key,
+            bucket_name=settings.b2_bucket_name,
+            region=settings.b2_region,
         )
 
     @property
@@ -92,9 +89,10 @@ class R2Storage:
         return all(
             (
                 self._endpoint_url,
-                self._access_key_id,
-                self._secret_access_key,
+                self._key_id,
+                self._application_key,
                 self._bucket_name,
+                self._region,
             )
         )
 
@@ -115,18 +113,19 @@ class R2Storage:
             read_timeout=self._read_timeout,
             retries={"max_attempts": 2, "mode": "standard"},
             max_pool_connections=10,
+            s3={"addressing_style": "path"},
         )
         try:
             self._client = self._client_factory(
                 "s3",
                 endpoint_url=self._endpoint_url,
-                aws_access_key_id=self._access_key_id,
-                aws_secret_access_key=self._secret_access_key,
+                aws_access_key_id=self._key_id,
+                aws_secret_access_key=self._application_key,
                 region_name=self._region,
                 config=config,
             )
-        except Exception as exc:
-            raise R2InitializationError("R2 client initialization failed") from exc
+        except Exception:
+            raise StorageInitializationError("B2 client initialization failed") from None
         return True
 
     async def verify(self, timeout: float | None = None) -> DependencyStatus:
@@ -136,7 +135,7 @@ class R2Storage:
         if self._client is None:
             try:
                 self.initialize()
-            except R2InitializationError:
+            except StorageInitializationError:
                 return DependencyStatus.unavailable()
 
         client = self._client
@@ -144,15 +143,16 @@ class R2Storage:
 
         try:
             await self._call(
+                "bucket check",
                 client.head_bucket,
                 Bucket=self._bucket_name,
                 timeout=timeout,
             )
-        except TimeoutError:
-            log.warning("R2 health check timed out")
+        except StorageTimeoutError:
+            log.warning("B2 health check timed out")
             return DependencyStatus.unavailable()
-        except Exception as exc:
-            log.warning("R2 health check failed (%s)", type(exc).__name__)
+        except StorageError as exc:
+            log.warning("B2 health check failed (%s)", type(exc).__name__)
             return DependencyStatus.unavailable()
         return DependencyStatus.verified()
 
@@ -167,10 +167,11 @@ class R2Storage:
         """Upload bytes to the private bucket. No public ACL is applied."""
         self._validate_key(object_key)
         if not payload:
-            raise ValueError("R2 upload payload must not be empty")
+            raise ValueError("B2 upload payload must not be empty")
         client = self._ensure_client()
 
         await self._call(
+            "upload",
             client.put_object,
             Bucket=self._bucket_name,
             Key=object_key,
@@ -201,38 +202,46 @@ class R2Storage:
                 else:
                     data = body.read(max_bytes + 1)
                     if len(data) > max_bytes:
-                        raise R2ObjectTooLargeError("R2 object exceeds the requested size limit")
+                        raise StorageObjectTooLargeError(
+                            "B2 object exceeds the requested size limit"
+                        )
                 return data
             finally:
                 body.close()
 
-        try:
-            return await self._call(_download, timeout=timeout)
-        except TimeoutError:
-            raise R2Error("R2 download timed out") from None
+        return await self._call(
+            "download",
+            _download,
+            timeout=timeout,
+            missing_is_not_found=True,
+        )
 
     async def delete_object(self, object_key: str, *, timeout: float | None = None) -> None:
-        """Delete one explicitly named object."""
+        """Delete one explicitly named object, treating an absent object as deleted."""
         self._validate_key(object_key)
         client = self._ensure_client()
-        await self._call(
-            client.delete_object,
-            Bucket=self._bucket_name,
-            Key=object_key,
-            timeout=timeout,
-        )
+        try:
+            await self._call(
+                "delete",
+                client.delete_object,
+                Bucket=self._bucket_name,
+                Key=object_key,
+                timeout=timeout,
+                missing_is_not_found=True,
+            )
+        except StorageObjectNotFoundError:
+            return
 
     async def verify_upload_download(
         self,
         *,
         cleanup: bool = True,
         timeout: float | None = None,
-    ) -> R2VerificationResult:
+    ) -> StorageVerificationResult:
         """Upload, retrieve, compare, and optionally delete a temporary object."""
         self._ensure_client()
         object_key = f"{_VERIFICATION_PREFIX}/{uuid.uuid4().hex}.txt"
-        payload = b"tifa-lockhart-bot r2 verification\n"
-        uploaded = False
+        payload = _VERIFICATION_PAYLOAD
         cleaned_up = False
 
         try:
@@ -242,26 +251,25 @@ class R2Storage:
                 content_type="text/plain",
                 timeout=timeout,
             )
-            uploaded = True
             downloaded = await self.download_bytes(
                 object_key,
                 max_bytes=len(payload) + 1,
                 timeout=timeout,
             )
             if not hmac.compare_digest(downloaded, payload):
-                raise R2VerificationError("R2 verification payload did not round-trip")
+                raise StorageVerificationError("B2 verification payload did not round-trip")
         finally:
-            if cleanup and uploaded:
+            if cleanup:
                 try:
                     await self.delete_object(object_key, timeout=timeout)
                     cleaned_up = True
                 except Exception as exc:
                     log.warning(
-                        "Failed to delete the R2 verification object (%s)",
+                        "Failed to delete the B2 verification object (%s)",
                         type(exc).__name__,
                     )
 
-        return R2VerificationResult(
+        return StorageVerificationResult(
             object_key=object_key,
             size_bytes=len(payload),
             cleaned_up=cleaned_up,
@@ -278,34 +286,63 @@ class R2Storage:
             try:
                 close()
             except Exception as exc:
-                log.debug("Ignoring R2 close error (%s)", type(exc).__name__)
+                log.debug("Ignoring B2 close error (%s)", type(exc).__name__)
 
     def _ensure_client(self) -> Any:
         if not self.configured:
-            raise R2NotConfiguredError("R2 storage is not configured")
+            raise StorageNotConfiguredError("B2 storage is not configured")
         if self._client is None:
             self.initialize()
         client = self._client
         if client is None:
-            raise R2InitializationError("R2 client is not initialized")
+            raise StorageInitializationError("B2 client is not initialized")
         return client
 
     async def _call(
         self,
+        operation: str,
         function: Callable[..., Any],
         *args: Any,
         timeout: float | None = None,
+        missing_is_not_found: bool = False,
         **kwargs: Any,
     ) -> Any:
-        operation = self._to_thread(function, *args, **kwargs)
-        return await asyncio.wait_for(
-            operation,
-            timeout=timeout if timeout is not None else self._operation_timeout,
-        )
+        operation_coro = self._to_thread(function, *args, **kwargs)
+        try:
+            return await asyncio.wait_for(
+                operation_coro,
+                timeout=timeout if timeout is not None else self._operation_timeout,
+            )
+        except TimeoutError:
+            raise StorageTimeoutError(f"B2 {operation} timed out") from None
+        except ClientError as exc:
+            raise self._translate_client_error(
+                exc,
+                operation,
+                missing_is_not_found=missing_is_not_found,
+            ) from None
+        except BotoCoreError:
+            raise StorageOperationError(f"B2 {operation} failed") from None
+
+    @staticmethod
+    def _translate_client_error(
+        exc: ClientError,
+        operation: str,
+        *,
+        missing_is_not_found: bool,
+    ) -> StorageError:
+        response = exc.response if isinstance(exc.response, dict) else {}
+        error = response.get("Error", {}) if isinstance(response, dict) else {}
+        code = str(error.get("Code", "")) if isinstance(error, dict) else ""
+        if missing_is_not_found and code in _MISSING_ERROR_CODES:
+            return StorageObjectNotFoundError(f"B2 object was not found during {operation}")
+        if code in _ACCESS_ERROR_CODES:
+            return StorageAccessDeniedError(f"B2 {operation} was denied")
+        return StorageOperationError(f"B2 {operation} failed")
 
     @staticmethod
     def _validate_key(object_key: str) -> None:
         if not object_key or len(object_key) > 1024:
-            raise ValueError("Invalid R2 object key")
+            raise ValueError("Invalid B2 object key")
         if object_key.startswith("/") or ".." in object_key.split("/"):
-            raise ValueError("Invalid R2 object key")
+            raise ValueError("Invalid B2 object key")

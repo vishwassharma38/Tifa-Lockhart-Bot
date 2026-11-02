@@ -45,7 +45,7 @@ def build_status_embed(report: StatusReport) -> discord.Embed:
         inline=True,
     )
     embed.add_field(name="Supabase", value=report.supabase.label, inline=False)
-    embed.add_field(name="R2 storage", value=report.r2.label, inline=False)
+    embed.add_field(name="B2 storage", value=report.storage.label, inline=False)
     embed.add_field(name="Collection", value=report.collection_state, inline=False)
     embed.set_footer(text="Phase 1 foundation")
     return embed

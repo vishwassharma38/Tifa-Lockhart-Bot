@@ -88,6 +88,8 @@ create table if not exists public.media_items (
     width integer,
     height integer,
     duration_seconds double precision,
+    -- Historical column names are retained so the Phase 1 schema and media
+    -- identity stay stable. They store the private B2 bucket and object key.
     r2_bucket text,
     r2_object_key text,
     verification_status text not null default 'verified',

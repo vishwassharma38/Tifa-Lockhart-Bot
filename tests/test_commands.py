@@ -42,7 +42,7 @@ def test_status_embed_reports_dependency_states() -> None:
         app_version="1.2.3",
         app_env="test",
         supabase=DependencyStatus.verified(),
-        r2=DependencyStatus.unavailable(),
+        storage=DependencyStatus.unavailable(),
     )
     embed = build_status_embed(report)
     fields = {field.name: field.value for field in embed.fields}
@@ -50,7 +50,7 @@ def test_status_embed_reports_dependency_states() -> None:
     assert fields["Discord"] == "Connected"
     assert fields["Version"] == "1.2.3 (test)"
     assert fields["Supabase"] == "Connected / verified"
-    assert fields["R2 storage"] == "Unavailable"
+    assert fields["B2 storage"] == "Unavailable"
     assert fields["Collection"] == COLLECTION_NOT_IMPLEMENTED
 
 
@@ -60,14 +60,14 @@ def test_status_embed_distinguishes_unchecked_and_unconfigured() -> None:
         app_version="1.0.0",
         app_env="development",
         supabase=DependencyStatus.not_checked(),
-        r2=DependencyStatus.not_configured(),
+        storage=DependencyStatus.not_configured(),
     )
     embed = build_status_embed(report)
     fields = {field.name: field.value for field in embed.fields}
 
     assert fields["Discord"] == "Disconnected / starting"
     assert fields["Supabase"] == "Configured, not checked"
-    assert fields["R2 storage"] == "Not configured"
+    assert fields["B2 storage"] == "Not configured"
     assert fields["Collection"] == "Not implemented in Phase 1"
 
 

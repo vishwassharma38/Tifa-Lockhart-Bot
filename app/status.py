@@ -12,7 +12,7 @@ from app.health.status import DependencyStatus, StatusReport
 
 if TYPE_CHECKING:
     from app.db.client import SupabaseDatabase
-    from app.storage.r2 import R2Storage
+    from app.storage.base import ObjectStorage
 
 log = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ class StatusService:
         self,
         settings: Settings,
         database: SupabaseDatabase,
-        storage: R2Storage,
+        storage: ObjectStorage,
         *,
         check_timeout: float = 5.0,
     ) -> None:
@@ -34,7 +34,7 @@ class StatusService:
         self._check_timeout = check_timeout
 
     async def collect(self, *, discord_connected: bool) -> StatusReport:
-        supabase, r2 = await asyncio.gather(
+        supabase, storage = await asyncio.gather(
             self._safe_check(self._database.verify(timeout=self._check_timeout)),
             self._safe_check(self._storage.verify(timeout=self._check_timeout)),
         )
@@ -43,7 +43,7 @@ class StatusService:
             app_version=self._settings.app_version,
             app_env=self._settings.app_env,
             supabase=supabase,
-            r2=r2,
+            storage=storage,
         )
 
     @staticmethod

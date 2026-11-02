@@ -6,7 +6,7 @@ A personal, automated media-discovery, acquisition, preservation, and delivery s
 **Runtime:** Python 3.11.8
 **Discord integration:** `discord.py` 2.x
 **Database:** Supabase PostgreSQL
-**Media storage:** Private Cloudflare R2 bucket
+**Media storage:** Private Backblaze B2 bucket (S3-compatible API)
 **Deployment target:** Render Web Service (Phase 7)
 
 > **V1 pipeline:** Discover -> inspect -> verify -> acquire -> deduplicate -> preserve -> record -> deliver.
@@ -20,15 +20,15 @@ Phase 1 provides the application foundation:
 - Typed environment configuration and secret redaction in logs.
 - Discord gateway client with `/about` and `/status`.
 - Supabase client initialization and checked-in initial SQL migration.
-- Private Cloudflare R2 client initialization and a safe upload/download verification utility.
+- Private Backblaze B2 client initialization and a safe upload/download verification utility.
 - `GET /healthz` HTTP endpoint bound to `0.0.0.0:$PORT`.
-- Single-process startup and graceful shutdown of Discord, HTTP, Supabase, and R2 resources.
+- Single-process startup and graceful shutdown of Discord, HTTP, Supabase, and B2 resources.
 - Unit tests that mock all external services by default.
 
 Not implemented yet (later V1 phases):
 
 - Reddit collection, Brave discovery, recursive crawling, classification, and The Dumpster.
-- Media acquisition, media validation, SHA-256 deduplication, and R2 media uploads.
+- Media acquisition, media validation, SHA-256 deduplication, and B2 media uploads.
 - Scheduled jobs, daily digest, and publication tracking.
 - `/start`, `/stop`, `/save`, `/random`, and `/stats`.
 - Render deployment and acceptance testing.
@@ -41,9 +41,11 @@ V1 runs as one Python process:
 
 - Discord Gateway client and application commands.
 - HTTP health endpoint.
-- Shared configuration, Supabase, and R2 clients.
+- Shared configuration, Supabase, and Backblaze B2 clients.
 
-The local filesystem is temporary working space only. Durable metadata belongs in Supabase and media belongs in R2. Phase 1 does not download or store real media.
+The local filesystem is temporary working space only. Durable metadata belongs in Supabase and media belongs in Backblaze B2. Phase 1 does not download or store real media.
+
+Object storage is accessed through the provider-independent `ObjectStorage` interface in `app/storage/base.py`. `B2Storage` is the current implementation; the rest of the application uses the neutral interface and the `create_storage` factory, so a future provider change does not require changing application workflows.
 
 ```text
 app/
@@ -57,14 +59,15 @@ app/
   db/
     client.py             Supabase client initialization and query health check
   storage/
-    r2.py                 Private R2 S3-compatible adapter
+    base.py               Provider-independent storage interface and errors
+    b2.py                 Private Backblaze B2 S3-compatible adapter
   health/
     server.py             /healthz aiohttp server
     status.py             Shared dependency status models
 migrations/
   001_initial_schema.sql  Initial Phase 1 schema
 scripts/
-  verify_r2.py            Safe temporary upload/download/delete check
+  verify_b2.py            Safe temporary upload/download/delete check
 tests/                    Unit tests with external services mocked
 ```
 
@@ -74,7 +77,7 @@ tests/                    Unit tests with external services mocked
 - Git
 - A Discord application, bot token, and a private test server
 - A Supabase project (PostgreSQL)
-- A Cloudflare R2 bucket and S3-compatible credentials
+- A Backblaze B2 bucket and a bucket-scoped S3-compatible application key
 - Credentials and IDs supplied by the project owner; none are committed to the repository
 
 The project is pinned to Python 3.11 for this implementation. Do not use Python 3.12-only syntax or dependencies here.
@@ -172,25 +175,38 @@ order by table_name;
 
 The repository does not apply migrations to a live project automatically, and no live migration should be considered verified until you run it and check the result yourself.
 
-### 7. Create the private R2 bucket and credentials
+### 7. Create the private Backblaze B2 bucket and credentials
 
-1. Create a Cloudflare R2 bucket. Keep it private; do not enable public access, public development URLs, or a public custom domain.
-2. Create an R2 API token scoped to the bucket with Object Read & Write access.
-3. Set:
-   - `R2_ENDPOINT_URL` to `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`
-   - `R2_ACCESS_KEY_ID`
-   - `R2_SECRET_ACCESS_KEY`
-   - `R2_BUCKET_NAME`
-   - `R2_REGION=auto`
-4. Verify the credentials and bucket with the safe temporary-object check:
+1. Create a Backblaze account, enable B2 Cloud Storage, and review Backblaze's current free allowance and billing terms. This repository does not create an account or configure storage for you.
+2. Create a B2 bucket and keep it private. Do not enable public bucket access, a public custom domain, or public object URLs. A Backblaze B2 account is tied to one region, and the bucket's S3 endpoint reflects that region.
+3. In the bucket details, note the bucket region and S3 endpoint. The endpoint format is `https://s3.<region>.backblazeb2.com`. For example, a bucket in `us-west-004` uses `https://s3.us-west-004.backblazeb2.com`. Do not use an endpoint from another region, and do not use `auto` as the region.
+4. Create an application key scoped to this bucket. Do not use the master application key. Grant the minimum capabilities needed by Phase 1: List All Bucket Names (required for SDK compatibility with bucket-restricted keys), List Files, Read Files, Write Files, and Delete Files. The verification utility needs write, read, and delete access to its temporary object; `/status` checks bucket access with a `HeadBucket` request.
+5. Record the Application Key ID as `B2_KEY_ID` and the Application Key secret as `B2_APPLICATION_KEY`. Backblaze shows the application key only when it is created.
+6. Configure these values in `.env`:
+   - `B2_ENDPOINT_URL` - the bucket's S3 endpoint, such as `https://s3.us-west-004.backblazeb2.com`
+   - `B2_REGION` - the region from the endpoint and bucket details, such as `us-west-004`
+   - `B2_BUCKET_NAME` - the private bucket name
+   - `B2_KEY_ID` - the application key ID
+   - `B2_APPLICATION_KEY` - the application key secret
+7. Verify the credentials and bucket with the safe temporary-object check:
 
 ```powershell
-python -m scripts.verify_r2
+python -m scripts.verify_b2
 ```
 
-This uploads a tiny text object under `healthchecks/`, downloads and compares it, then deletes only that generated object. It never uploads real media and never creates a public URL. The `/status` health check also performs a bucket-level `HeadBucket` request, so the R2 token must permit bucket read/list access; if `/status` reports R2 unavailable while `verify_r2` succeeds, check the token's bucket permissions.
+This uploads a tiny text object under `healthchecks/`, downloads and compares the bytes, then deletes only that generated object. It never uploads real media and never creates a public URL. The `/status` health check also performs a bucket-level `HeadBucket` request, so the application key must permit bucket access; if `/status` reports B2 unavailable while `verify_b2` succeeds, check the key's List Files/List Bucket Names capabilities.
 
-If Supabase or R2 settings are completely absent, the application starts in a documented degraded mode and `/status` reports the service as not configured. If only part of a service's settings is present, startup fails with a clear configuration error rather than pretending the service is available.
+Common B2 configuration errors:
+
+- `B2_ENDPOINT_URL must match B2_REGION` - the endpoint and region belong to different buckets or regions. Copy both from the same bucket's details.
+- `403` / `AccessDenied` - the application key is missing a required capability or is scoped to a different bucket.
+- `InvalidAccessKeyId` or `SignatureDoesNotMatch` - `B2_KEY_ID` and `B2_APPLICATION_KEY` are swapped, truncated, or from different keys.
+- `NoSuchBucket` or `404` - the bucket name is wrong or the endpoint points at another region.
+- Connection errors or timeouts - check the network, the endpoint URL, and whether the bucket's region changed. Storage operations have bounded timeouts and do not block the asyncio event loop.
+
+If Supabase or B2 settings are completely absent, the application starts in a documented degraded mode and `/status` reports the service as not configured. If only part of a service's settings is present, startup fails with a clear configuration error rather than pretending the service is available. Missing B2 credentials never prevent the process from starting.
+
+The `media_items` table keeps the historical column names `r2_bucket` and `r2_object_key` so the Phase 1 database schema and media identity remain unchanged. Those columns now store the private B2 bucket name and object key, and the SHA-256 content-addressing and deduplication rules are unchanged.
 
 ### 8. Run the application locally
 
@@ -198,16 +214,16 @@ If Supabase or R2 settings are completely absent, the application starts in a do
 python -m app.main
 ```
 
-The application requires `DISCORD_TOKEN` to connect to Discord. It starts the health endpoint first, initializes configured Supabase and R2 clients, then starts the Discord client. Startup failures clean up resources that were already started.
+The application requires `DISCORD_TOKEN` to connect to Discord. It starts the health endpoint first, initializes configured Supabase and B2 clients, then starts the Discord client. Startup failures clean up resources that were already started.
 
-The process stays online while Discord is connected. Stop it with `Ctrl+C`; the Discord client, HTTP runner, Supabase client, and R2 client are closed during shutdown.
+The process stays online while Discord is connected. Stop it with `Ctrl+C`; the Discord client, HTTP runner, Supabase client, and B2 client are closed during shutdown.
 
 ### 9. Test `/about` and `/status`
 
 In the configured Discord server:
 
 - `/about` shows the bot name, purpose, version from `APP_VERSION`, and developer `SoftwareFromVish`.
-- `/status` shows the Discord connection state, version/environment, Supabase state, R2 state, and a clear statement that collection is not implemented in Phase 1.
+- `/status` shows the Discord connection state, version/environment, Supabase state, B2 storage state, and a clear statement that collection is not implemented in Phase 1.
 
 Dependency states are reported truthfully:
 
@@ -232,7 +248,7 @@ Expected response:
 {"status": "ok"}
 ```
 
-The endpoint is served on `0.0.0.0:$PORT`, returns HTTP 200 while the process is alive, and deliberately reveals no configuration or dependency details. It does not fail merely because Supabase, R2, Reddit, or Brave is unavailable.
+The endpoint is served on `0.0.0.0:$PORT`, returns HTTP 200 while the process is alive, and deliberately reveals no configuration or dependency details. It does not fail merely because Supabase, B2, Reddit, or Brave is unavailable.
 
 ### 11. Run tests and checks
 
@@ -244,7 +260,7 @@ Always use the project's virtual environment:
 & ".\.venv\Scripts\python.exe" -m ruff format --check .
 ```
 
-Tests do not require real Discord, Supabase, or R2 credentials. External services are mocked. No destructive integration tests are run against live services.
+Tests do not require real Discord, Supabase, or B2 credentials. External services are mocked. No destructive integration tests are run against live services.
 
 ## Configuration reference
 
@@ -264,11 +280,11 @@ The Phase 1 settings are:
 | `DISCORD_SAVES_CHANNEL_ID` | Future manual-save destination | empty |
 | `SUPABASE_URL` | Supabase project URL | empty |
 | `SUPABASE_SERVICE_ROLE_KEY` | Server-only Supabase service-role key | empty |
-| `R2_ENDPOINT_URL` | R2 S3-compatible endpoint | empty |
-| `R2_ACCESS_KEY_ID` | R2 access key ID | empty |
-| `R2_SECRET_ACCESS_KEY` | R2 secret access key | empty |
-| `R2_BUCKET_NAME` | Private bucket name | empty |
-| `R2_REGION` | R2 signing region | `auto` |
+| `B2_ENDPOINT_URL` | B2 S3-compatible endpoint; must match the bucket region | empty |
+| `B2_REGION` | B2 bucket region, such as `us-west-004` | empty |
+| `B2_BUCKET_NAME` | Private B2 bucket name | empty |
+| `B2_KEY_ID` | B2 application key ID | empty |
+| `B2_APPLICATION_KEY` | B2 application key secret | empty |
 
 `REDDIT_ACCESS_APPROVED=false` and `BRAVE_HTML_ENABLED=false` remain in `.env.example` as future-phase safety gates. The other Reddit, Brave, and operating-limit values in the template are reserved for later phases and are not used by Phase 1.
 
@@ -276,7 +292,7 @@ The Phase 1 settings are:
 
 - Never commit `.env`, tokens, service-role keys, passwords, private keys, or signed URLs.
 - Logs redact known configured secrets and common credential patterns. Do not add logging that dumps environment variables, configuration objects, request headers, signed URLs, or full SDK exception payloads.
-- Keep the R2 bucket private. Phase 1 creates no public objects and uploads no real media.
+- Keep the B2 bucket private. Phase 1 creates no public objects and uploads no real media.
 - RLS is enabled on every Phase 1 table with no public policies. The service-role key bypasses RLS, so keep it server-side only.
 - Respect platform policies, site terms, robots directives, copyright, takedown requests, and rate limits in later phases. Do not bypass authentication, paywalls, DRM, CAPTCHAs, anti-bot controls, or access restrictions.
 - A private Discord server does not automatically grant redistribution rights.
@@ -284,8 +300,9 @@ The Phase 1 settings are:
 ## Troubleshooting
 
 - **`DISCORD_TOKEN is required`** - set the bot token in `.env` before running.
-- **Partial Supabase/R2 configuration error** - set all fields for that service or leave all of them empty for degraded mode.
-- **`/status` shows Unavailable** - check that the Supabase migration was applied and that the R2 bucket exists, the token has bucket access, and the endpoint is correct.
+- **Partial Supabase/B2 configuration error** - set all fields for that service or leave all of them empty for degraded mode.
+- **`/status` shows Unavailable** - check that the Supabase migration was applied, that the B2 bucket exists, that the application key has bucket access, and that the endpoint and region both match the bucket.
+- **`B2_ENDPOINT_URL must match B2_REGION`** - copy the endpoint and region from the same bucket's details. The region is the second label of `s3.<region>.backblazeb2.com`.
 - **Slash commands are missing** - confirm the bot was invited with `applications.commands`; allow up to an hour for global sync or set `DISCORD_GUILD_ID` for immediate guild sync.
 - **Port already in use** - change `PORT` or stop the other process. The health endpoint binds to `0.0.0.0`.
 
@@ -293,7 +310,7 @@ The Phase 1 settings are:
 
 The locked V1 blueprint defines the implementation sequence:
 
-1. Foundation: configuration, logging, Discord client, Supabase, R2, health endpoint. **Current.**
+1. Foundation: configuration, logging, Discord client, Supabase, Backblaze B2, health endpoint. **Current.**
 2. First Reddit-to-Discord vertical slice.
 3. Media reliability, metadata, and provenance.
 4. Reddit automation and Discord controls.

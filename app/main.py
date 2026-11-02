@@ -16,7 +16,7 @@ from app.db.client import SupabaseDatabase
 from app.health.server import HealthServer
 from app.logging_config import configure_logging
 from app.status import StatusService
-from app.storage.r2 import R2Storage
+from app.storage import ObjectStorage, create_storage
 
 log = logging.getLogger(__name__)
 
@@ -30,13 +30,13 @@ class Application:
         *,
         bot_factory: Callable[[], Any] | None = None,
         database: SupabaseDatabase | None = None,
-        storage: R2Storage | None = None,
+        storage: ObjectStorage | None = None,
         health_server: Any | None = None,
         install_signal_handlers: bool = True,
     ) -> None:
         self.settings = settings
         self._database = database or SupabaseDatabase.from_settings(settings)
-        self._storage = storage or R2Storage.from_settings(settings)
+        self._storage = storage or create_storage(settings)
         self._status_service = StatusService(settings, self._database, self._storage)
         self._bot_factory = bot_factory or (lambda: TifaBot(settings, self._status_service))
         self._health_server = health_server or HealthServer(settings.port)
@@ -131,7 +131,7 @@ class Application:
     def _initialize_optional_services(self) -> None:
         for name, service in (
             ("Supabase", self._database),
-            ("R2", self._storage),
+            ("B2", self._storage),
         ):
             try:
                 initialized = service.initialize()
@@ -150,7 +150,7 @@ class Application:
     async def _stop_resources(self) -> None:
         await self._close_bot()
         await self._close_service("Supabase", self._database.close)
-        await self._close_service("R2", self._storage.close)
+        await self._close_service("B2", self._storage.close)
         try:
             await self._health_server.stop()
         except Exception as exc:

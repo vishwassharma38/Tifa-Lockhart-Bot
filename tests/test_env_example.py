@@ -17,11 +17,11 @@ REQUIRED_KEYS = {
     "DISCORD_SAVES_CHANNEL_ID",
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
-    "R2_ENDPOINT_URL",
-    "R2_ACCESS_KEY_ID",
-    "R2_SECRET_ACCESS_KEY",
-    "R2_BUCKET_NAME",
-    "R2_REGION",
+    "B2_ENDPOINT_URL",
+    "B2_REGION",
+    "B2_BUCKET_NAME",
+    "B2_KEY_ID",
+    "B2_APPLICATION_KEY",
     "REDDIT_ACCESS_APPROVED",
     "BRAVE_HTML_ENABLED",
     "MAX_MEDIA_BYTES",
@@ -53,13 +53,19 @@ def test_template_contains_only_placeholders_and_safe_defaults() -> None:
     assert values["OWNER_DISCORD_ID"] == ""
     assert values["SUPABASE_URL"] == ""
     assert values["SUPABASE_SERVICE_ROLE_KEY"] == ""
-    assert values["R2_ENDPOINT_URL"] == ""
-    assert values["R2_ACCESS_KEY_ID"] == ""
-    assert values["R2_SECRET_ACCESS_KEY"] == ""
-    assert values["R2_BUCKET_NAME"] == ""
+    assert values["B2_ENDPOINT_URL"] == ""
+    assert values["B2_REGION"] == ""
+    assert values["B2_BUCKET_NAME"] == ""
+    assert values["B2_KEY_ID"] == ""
+    assert values["B2_APPLICATION_KEY"] == ""
     assert values["REDDIT_ACCESS_APPROVED"] == "false"
     assert values["BRAVE_HTML_ENABLED"] == "false"
     assert values["MAX_MEDIA_BYTES"] == "10000000"
+
+
+def test_template_does_not_contain_obsolete_r2_settings() -> None:
+    values = parse_env_file()
+    assert not {key for key in values if key.startswith("R2_")}
 
 
 def test_env_is_ignored_but_template_is_tracked() -> None:

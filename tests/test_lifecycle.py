@@ -203,3 +203,46 @@ async def test_partial_service_configuration_fails_before_health_server_starts(
         await app.start()
 
     assert health.started == 0
+
+
+async def test_partial_b2_configuration_fails_before_health_server_starts(
+    make_settings,
+) -> None:
+    settings = make_settings(B2_ENDPOINT_URL="https://s3.us-west-004.backblazeb2.com")
+    health = FakeHealthServer()
+    app = Application(
+        settings,
+        bot_factory=FakeBot,
+        database=FakeService(),
+        storage=FakeService(),
+        health_server=health,
+        install_signal_handlers=False,
+    )
+
+    with pytest.raises(ConfigurationError, match="B2_REGION"):
+        await app.start()
+
+    assert health.started == 0
+
+
+async def test_unconfigured_b2_storage_does_not_prevent_startup(make_settings) -> None:
+    settings = make_settings()
+    health = FakeHealthServer()
+    bot = FakeBot()
+    app = Application(
+        settings,
+        bot_factory=lambda: bot,
+        health_server=health,
+        install_signal_handlers=False,
+    )
+
+    await app.start()
+    await asyncio.sleep(0)
+
+    assert health.started == 1
+    assert bot.started is True
+
+    await app.stop()
+
+    assert bot.closed == 1
+    assert health.stopped == 1

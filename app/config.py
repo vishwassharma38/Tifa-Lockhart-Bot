@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -14,6 +15,7 @@ VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+_B2_REGION_PATTERN = re.compile(r"^[a-z]{2}-[a-z]+-\d{3}$")
 
 
 class ConfigurationError(ValueError):
@@ -68,6 +70,24 @@ def _url_is_valid(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+def _b2_region_is_valid(value: str) -> bool:
+    return bool(_B2_REGION_PATTERN.fullmatch(value))
+
+
+def _b2_endpoint_error(endpoint: str, region: str) -> str | None:
+    parsed = urlparse(endpoint)
+    if parsed.scheme != "https" or not parsed.netloc:
+        return "B2_ENDPOINT_URL must be a valid https URL"
+    if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
+        return "B2_ENDPOINT_URL must not include a path, query, or fragment"
+
+    if region and _b2_region_is_valid(region):
+        expected_host = f"s3.{region}.backblazeb2.com"
+        if parsed.netloc != expected_host:
+            return "B2_ENDPOINT_URL must match B2_REGION using https://s3.<region>.backblazeb2.com"
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Validated application settings read from environment variables."""
@@ -84,11 +104,11 @@ class Settings:
     saves_channel_id: int | None
     supabase_url: str
     supabase_service_role_key: str
-    r2_endpoint_url: str
-    r2_access_key_id: str
-    r2_secret_access_key: str
-    r2_bucket_name: str
-    r2_region: str
+    b2_endpoint_url: str
+    b2_region: str
+    b2_bucket_name: str
+    b2_key_id: str
+    b2_application_key: str
     reddit_access_approved: bool
     brave_html_enabled: bool
 
@@ -123,11 +143,11 @@ class Settings:
             saves_channel_id=_parse_optional_int(env, "DISCORD_SAVES_CHANNEL_ID"),
             supabase_url=_read(env, "SUPABASE_URL"),
             supabase_service_role_key=_read(env, "SUPABASE_SERVICE_ROLE_KEY"),
-            r2_endpoint_url=_read(env, "R2_ENDPOINT_URL"),
-            r2_access_key_id=_read(env, "R2_ACCESS_KEY_ID"),
-            r2_secret_access_key=_read(env, "R2_SECRET_ACCESS_KEY"),
-            r2_bucket_name=_read(env, "R2_BUCKET_NAME"),
-            r2_region=_read(env, "R2_REGION", "auto") or "auto",
+            b2_endpoint_url=_read(env, "B2_ENDPOINT_URL"),
+            b2_region=_read(env, "B2_REGION"),
+            b2_bucket_name=_read(env, "B2_BUCKET_NAME"),
+            b2_key_id=_read(env, "B2_KEY_ID"),
+            b2_application_key=_read(env, "B2_APPLICATION_KEY"),
             reddit_access_approved=_parse_bool(env, "REDDIT_ACCESS_APPROVED"),
             brave_html_enabled=_parse_bool(env, "BRAVE_HTML_ENABLED"),
         )
@@ -141,13 +161,14 @@ class Settings:
         return bool(self.supabase_url and self.supabase_service_role_key)
 
     @property
-    def r2_configured(self) -> bool:
+    def b2_configured(self) -> bool:
         return all(
             (
-                self.r2_endpoint_url,
-                self.r2_access_key_id,
-                self.r2_secret_access_key,
-                self.r2_bucket_name,
+                self.b2_endpoint_url,
+                self.b2_region,
+                self.b2_bucket_name,
+                self.b2_key_id,
+                self.b2_application_key,
             )
         )
 
@@ -159,8 +180,8 @@ class Settings:
             for value in (
                 self.discord_token,
                 self.supabase_service_role_key,
-                self.r2_access_key_id,
-                self.r2_secret_access_key,
+                self.b2_key_id,
+                self.b2_application_key,
             )
             if value
         )
@@ -171,7 +192,7 @@ class Settings:
             f"env={self.app_env} version={self.app_version} "
             f"discord={'configured' if self.discord_configured else 'not_configured'} "
             f"supabase={'configured' if self.supabase_configured else 'not_configured'} "
-            f"r2={'configured' if self.r2_configured else 'not_configured'}"
+            f"b2={'configured' if self.b2_configured else 'not_configured'}"
         )
 
     def validate_runtime(self) -> None:
@@ -219,21 +240,24 @@ class Settings:
         if self.supabase_url and not _url_is_valid(self.supabase_url):
             errors.append("SUPABASE_URL must be a valid http(s) URL")
 
-        r2_fields = (
-            self.r2_endpoint_url,
-            self.r2_access_key_id,
-            self.r2_secret_access_key,
-            self.r2_bucket_name,
+        b2_fields = (
+            self.b2_endpoint_url,
+            self.b2_region,
+            self.b2_bucket_name,
+            self.b2_key_id,
+            self.b2_application_key,
         )
-        if any(r2_fields) and not all(r2_fields):
+        if any(b2_fields) and not all(b2_fields):
             errors.append(
-                "R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and "
-                "R2_BUCKET_NAME must be configured together"
+                "B2_ENDPOINT_URL, B2_REGION, B2_BUCKET_NAME, B2_KEY_ID, and "
+                "B2_APPLICATION_KEY must be configured together"
             )
-        if self.r2_endpoint_url and not _url_is_valid(self.r2_endpoint_url):
-            errors.append("R2_ENDPOINT_URL must be a valid http(s) URL")
-        if not self.r2_region:
-            errors.append("R2_REGION must not be empty")
+        if self.b2_region and not _b2_region_is_valid(self.b2_region):
+            errors.append("B2_REGION must be a Backblaze region identifier such as us-west-004")
+        if self.b2_endpoint_url:
+            endpoint_error = _b2_endpoint_error(self.b2_endpoint_url, self.b2_region)
+            if endpoint_error:
+                errors.append(endpoint_error)
 
         if errors:
             raise ConfigurationError("Invalid service configuration: " + "; ".join(errors))

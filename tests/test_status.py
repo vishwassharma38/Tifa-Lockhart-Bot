@@ -48,7 +48,7 @@ async def test_status_service_collects_truthful_dependency_states(make_settings)
     assert report.app_version == "4.5.6"
     assert report.app_env == "staging"
     assert report.supabase.state is ServiceState.VERIFIED
-    assert report.r2.state is ServiceState.UNAVAILABLE
+    assert report.storage.state is ServiceState.UNAVAILABLE
     assert report.collection_state == COLLECTION_NOT_IMPLEMENTED
     assert database.timeouts == [3.0]
     assert storage.timeouts == [3.0]
@@ -68,4 +68,4 @@ async def test_status_service_converts_check_exceptions_to_unavailable(make_sett
     assert report.discord_connected is False
     assert report.discord_label == "Disconnected / starting"
     assert report.supabase.state is ServiceState.UNAVAILABLE
-    assert report.r2.state is ServiceState.NOT_CONFIGURED
+    assert report.storage.state is ServiceState.NOT_CONFIGURED

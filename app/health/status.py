@@ -55,7 +55,7 @@ class StatusReport:
     app_version: str
     app_env: str
     supabase: DependencyStatus
-    r2: DependencyStatus
+    storage: DependencyStatus
     collection_state: str = COLLECTION_NOT_IMPLEMENTED
 
     @property

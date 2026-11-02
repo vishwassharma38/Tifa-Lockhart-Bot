@@ -51,7 +51,7 @@ The following decisions define the initial release and should not be re-opened d
 | Exact duplicate detection    | SHA-256                                                                                                                          |
 | Similar-image detection      | Optional perceptual hash for still images; similarity is a review signal, not an automatic destructive merge                     |
 | Metadata database            | Supabase PostgreSQL                                                                                                              |
-| Binary media storage         | Cloudflare R2, private bucket, S3-compatible access                                                                              |
+| Binary media storage         | Backblaze B2, private bucket, S3-compatible access                                                                              |
 | Uncertain discoveries        | The Dumpster, represented as a staging status in the database                                                                    |
 | Platform collection schedule | Approximately hourly                                                                                                             |
 | Brave discovery schedule     | Every 8 hours (inside the agreed 6–12-hour range)                                                                                |
@@ -96,7 +96,7 @@ These are configuration defaults, not permission to exceed a site's own limits. 
 7. Media extraction and download for the supported V1 formats.
 8. A strict 10 MB-per-file ceiling.
 9. SHA-256 deduplication and optional still-image perceptual hashing.
-10. Private Cloudflare R2 storage and Supabase metadata persistence.
+10. Private Backblaze B2 storage and Supabase metadata persistence.
 11. Discord media-file delivery with creator and source attribution.
 12. Manual URL saving through `/save`.
 13. Random archive retrieval, status, statistics, and project information commands.
@@ -132,7 +132,7 @@ flowchart TD
     H -->|Uncertain| J[The Dumpster]
     H -->|Irrelevant| K[Rejected / ignored]
     I --> L[Validation, Size Check, SHA-256]
-    L --> M[Cloudflare R2]
+    L --> M[Backblaze B2]
     L --> N[Supabase PostgreSQL]
     J --> N
     M --> O[Discord Publisher]
@@ -160,7 +160,7 @@ flowchart TD
 | Media extractor           | Identify original media files and supported source-specific media variants; avoid thumbnail-only fallbacks                |
 | Media downloader          | Stream and validate supported media within the hard size ceiling                                                          |
 | Deduplicator              | Compute SHA-256, check existing assets, and optionally calculate image perceptual hashes                                  |
-| R2 storage adapter        | Store immutable media objects in the private bucket                                                                       |
+| B2 storage adapter        | Store immutable media objects in the private bucket                                                                       |
 | Repository/database layer | Persist discoveries, media records, source provenance, job runs, and publications in Supabase                             |
 | Discord publisher         | Upload actual files, attach attribution, route by category, and track publication status                                  |
 | Discord command layer     | Expose the V1 command set and invoke application services                                                                 |
@@ -178,7 +178,7 @@ V1 runs as **one Render Web Service and one Python application process**. That p
 
 This keeps the Discord bot and scheduler in the same service that UptimeRobot monitors. Do not split the scheduler or bot into a separate worker in V1: a ping to a separate web service would not keep a separate worker active.
 
-The local filesystem is temporary working space only. Media that must survive a restart is stored in R2; metadata and job state are stored in Supabase.
+The local filesystem is temporary working space only. Media that must survive a restart is stored in B2; metadata and job state are stored in Supabase.
 
 ## 5. Source strategy and discovery
 
@@ -373,7 +373,7 @@ The system's normal media workflow is:
 4. Download the bytes.
 5. Validate type and size.
 6. Compute hashes and check duplicates.
-7. Store the file in R2.
+7. Store the file in B2.
 8. Commit metadata and source provenance to Supabase.
 9. Queue the verified asset for Discord delivery.
 
@@ -396,7 +396,7 @@ The hard maximum is **10,000,000 bytes per individual media file**.
 - Check `Content-Length` before downloading when available.
 - Stream the response and stop as soon as the byte counter exceeds the limit.
 - For `yt-dlp`-assisted sources, configure the maximum-file-size constraint and verify the final downloaded size before accepting the asset.
-- If a file exceeds the limit, mark it `oversize`/`skipped`; do not upload it to R2 or Discord.
+- If a file exceeds the limit, mark it `oversize`/`skipped`; do not upload it to B2 or Discord.
 - Preserve the source URL and a concise skip reason in the database.
 
 Do not silently compress or transcode an oversized original to force it under the limit. The owner may change the global limit in a later version, but V1 uses the limit above.
@@ -431,7 +431,7 @@ Compute SHA-256 over the final validated file bytes. The SHA-256 value is unique
 
 When an asset with the same SHA-256 already exists:
 
-- Do not store a second physical copy in R2.
+- Do not store a second physical copy in B2.
 - Do not create a second media asset record.
 - Add the new source/post/creator/provenance record to the existing asset's source list.
 - Do not automatically publish the exact same asset again to the discoveries channel.
@@ -454,9 +454,9 @@ Supabase is the source of truth for structured data. Store metadata and object r
 
 V1 should use schema migrations checked into the repository. The application connects through the Supabase Python client or a controlled PostgreSQL connection; all secrets stay in environment variables.
 
-### 10.2 Cloudflare R2 — media objects
+### 10.2 Backblaze B2 — media objects
 
-R2 stores the actual media files in a **private bucket**. V1 object keys are content-addressed and independent of classification, so reclassifying an item does not require moving the object.
+B2 stores the actual media files in a **private bucket**. V1 object keys are content-addressed and independent of classification, so reclassifying an item does not require moving the object.
 
 Object-key pattern:
 
@@ -474,11 +474,11 @@ Storage rules:
 
 - Bucket access is private; do not expose an open public bucket in V1.
 - Store bucket name, object key, MIME type, size, and SHA-256 in Supabase.
-- Use the S3-compatible R2 endpoint and credentials from environment variables.
+- Use the S3-compatible B2 endpoint and credentials from environment variables.
 - Upload only after the file passes validation and duplicate checks.
 - Do not apply an automatic object-expiration lifecycle rule in V1.
 - Retain archived objects until the owner explicitly removes them or a rights/access issue requires removal.
-- Discord publishing fetches the private object through the bot's R2 client and uploads it as an attachment; the bot does not need to expose the R2 object publicly.
+- Discord publishing fetches the private object through the bot's B2 client and uploads it as an attachment; the bot does not need to expose the B2 object publicly.
 
 ### 10.3 Core database tables
 
@@ -528,6 +528,8 @@ One record per unique physical media file.
 | `favorite`                                          | Boolean, default false                                                                |
 | `download_status`                                   | `stored`, `failed`, or `skipped`                                                      |
 | `created_at`, `downloaded_at`                       | Lifecycle timestamps                                                                  |
+
+The historical column names `r2_bucket` and `r2_object_key` are retained so the Phase 1 schema and content-addressed media identity stay stable. They store the private Backblaze B2 bucket name and object key; the SHA-256 uniqueness and deduplication rules are unchanged.
 
 #### `media_sources`
 
@@ -587,7 +589,7 @@ Persist the last successful digest window/cursor and its completion time. A dige
 - Use foreign keys for discoveries, media items, sources, and publications.
 - Use indexes for normalized URL, SHA-256, status, category, discovered/downloaded timestamps, and publication status.
 - Use transactions when committing related database changes.
-- Do not mark a media item as stored until the R2 upload has succeeded and its object key is known.
+- Do not mark a media item as stored until the B2 upload has succeeded and its object key is known.
 - On partial failures, keep enough state to resume without duplicating the file or Discord post.
 
 ## 11. Discord server and delivery
@@ -649,7 +651,7 @@ All commands are Discord application/slash commands. Commands operate only in th
 | `/start`  | None                                     | Sets the persistent collection-enabled flag to true. Resumes scheduled Reddit collection and web discovery. It does not reconnect/disconnect the Discord bot because the bot remains online.                                                                                            |
 | `/stop`   | None                                     | Sets the persistent collection-enabled flag to false. Pauses automated source collection and discovery. It does not disconnect the bot. Already stored items may still be delivered by the daily digest; manual `/save`, `/random`, `/status`, `/stats`, and `/about` remain available. |
 | `/save`   | `url` (required)                         | Acquires a supported public media URL/post and publishes the actual file to `#saves` immediately.                                                                                                                                                                                       |
-| `/random` | None                                     | Selects one random verified archived asset, retrieves its file from R2, and sends it with attribution in the command channel.                                                                                                                                                           |
+| `/random` | None                                     | Selects one random verified archived asset, retrieves its file from B2, and sends it with attribution in the command channel.                                                                                                                                                           |
 | `/status` | None                                     | Shows Discord connection state, collection enabled/paused state, last successful Reddit and Brave runs, last digest, current backlog, and latest job error if any.                                                                                                                      |
 | `/stats`  | `period`: `week`, `month`, or `lifetime` | Shows total unique archived assets and total successful media delivery events for the selected period; show image/video breakdown where metadata permits.                                                                                                                               |
 | `/about`  | None                                     | Shows bot name, purpose, V1 version, developer (`SoftwareFromVish`), and configured developer/contact/project links. Do not invent unavailable contact information.                                                                                                                     |
@@ -705,7 +707,7 @@ Use APScheduler's asyncio scheduler with timezone `Asia/Kolkata`. Jobs must have
 | HTML parsing                 | BeautifulSoup4 with `lxml`                                                                    |
 | Scheduler                    | APScheduler (`AsyncIOScheduler`)                                                              |
 | Database                     | Supabase PostgreSQL using the Supabase Python client or controlled PostgreSQL access          |
-| Object storage               | Cloudflare R2 through its S3-compatible API (`boto3`, called off the event loop where needed) |
+| Object storage               | Backblaze B2 through its S3-compatible API (`boto3`, called off the event loop where needed) |
 | Video acquisition            | `yt-dlp` for supported public Reddit video paths only where permitted                         |
 | Image metadata               | Pillow                                                                                        |
 | Perceptual hash              | ImageHash or equivalent optional library                                                      |
@@ -743,7 +745,7 @@ tifa-lockhart-bot/
 │   │   ├── hashing.py          # SHA-256 and optional perceptual hash
 │   │   └── metadata.py         # Image/video technical metadata
 │   ├── storage/
-│   │   ├── r2.py               # R2 object storage adapter
+│   │   ├── b2.py               # B2 object storage adapter
 │   │   └── temp_files.py       # Temporary file management
 │   ├── db/
 │   │   ├── client.py           # Supabase/database client
@@ -816,12 +818,12 @@ BRAVE_SEARCH_INTERVAL_HOURS=8
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 
-# Cloudflare R2
-R2_ENDPOINT_URL=
-R2_ACCESS_KEY_ID=
-R2_SECRET_ACCESS_KEY=
-R2_BUCKET_NAME=
-R2_REGION=auto
+# Backblaze B2
+B2_ENDPOINT_URL=
+B2_REGION=
+B2_BUCKET_NAME=
+B2_KEY_ID=
+B2_APPLICATION_KEY=
 
 # Limits
 MAX_MEDIA_BYTES=10000000
@@ -865,7 +867,7 @@ This is a keep-awake strategy, **not an uptime guarantee**. Render can restart a
 Render's free web-service filesystem is ephemeral. Therefore:
 
 - Never use local disk as the permanent archive.
-- Store media in R2 and metadata/state in Supabase.
+- Store media in B2 and metadata/state in Supabase.
 - Use local disk only for bounded temporary downloads and clean it up.
 - Persist the collection-enabled flag, queued discoveries, publication state, and digest state outside the process.
 
@@ -881,7 +883,7 @@ Every source and every media item must fail independently wherever possible:
 - A Brave parser failure does not stop Reddit collection.
 - A 401/403 page abandons only its traversal path.
 - An oversized file does not abort its parent job.
-- A failed R2 upload leaves the database record recoverable and must not be marked stored.
+- A failed B2 upload leaves the database record recoverable and must not be marked stored.
 - A Discord upload failure leaves the publication pending/failed and eligible for a later retry.
 - A daily digest continues with other assets when one attachment fails.
 
@@ -929,10 +931,10 @@ Build one end-to-end vertical slice first, then add discovery breadth. The purpo
 - Set up structured logging and graceful shutdown.
 - Create the Discord client and register the V1 slash commands.
 - Create the Supabase project and initial SQL migrations.
-- Create the private R2 bucket and verify upload/download operations.
+- Create the private B2 bucket and verify upload/download operations.
 - Add the `/healthz` HTTP endpoint.
 
-**Exit condition:** application starts locally, connects to Discord, connects to Supabase/R2, and responds to `/status` and `/about`.
+**Exit condition:** application starts locally, connects to Discord, connects to Supabase/B2, and responds to `/status` and `/about`.
 
 ### Phase 2 — One working Reddit-to-Discord vertical slice
 
@@ -941,11 +943,11 @@ Build one end-to-end vertical slice first, then add discovery breadth. The purpo
 - Extract one original supported image/video file.
 - Enforce type and size limits.
 - Compute SHA-256 and deduplicate.
-- Upload the file to R2.
+- Upload the file to B2.
 - Store metadata and source attribution in Supabase.
 - Upload the actual file to `#saves` or a test discoveries channel with attribution.
 
-**Exit condition:** one real, eligible Reddit candidate can travel from source to R2, database, and Discord without relying on an external preview.
+**Exit condition:** one real, eligible Reddit candidate can travel from source to B2, database, and Discord without relying on an external preview.
 
 ### Phase 3 — Media reliability and archive metadata
 
@@ -954,9 +956,9 @@ Build one end-to-end vertical slice first, then add discovery breadth. The purpo
 - Add media metadata extraction.
 - Add source-provenance records for duplicate discoveries.
 - Add optional perceptual hashes for still images.
-- Add failure recovery for partial R2/database operations.
+- Add failure recovery for partial B2/database operations.
 
-**Exit condition:** multiple supported media items process reliably, duplicates do not create duplicate R2 objects, and every stored file has traceable provenance.
+**Exit condition:** multiple supported media items process reliably, duplicates do not create duplicate B2 objects, and every stored file has traceable provenance.
 
 ### Phase 4 — Reddit automation and controls
 
@@ -993,7 +995,7 @@ Build one end-to-end vertical slice first, then add discovery breadth. The purpo
 - Configure environment variables and health checks.
 - Configure UptimeRobot against `/healthz`.
 - Verify scheduler timing in `Asia/Kolkata`.
-- Test Render restart recovery and persistence through Supabase/R2.
+- Test Render restart recovery and persistence through Supabase/B2.
 - Validate upload failures, rate limits, crawler budgets, and blocked paths.
 
 **Exit condition:** the deployed application recovers from restarts, keeps its durable state, publishes according to schedule, and exposes clear status/errors.
@@ -1007,7 +1009,7 @@ V1 is ready for release only when all applicable checks below pass.
 - [ ] Bot starts and connects to the configured Discord server.
 - [ ] `/healthz` returns HTTP 200 and exposes no secrets.
 - [ ] Supabase migrations create all required tables, indexes, and uniqueness constraints.
-- [ ] R2 bucket is private and the application can upload and retrieve objects.
+- [ ] B2 bucket is private and the application can upload and retrieve objects.
 - [ ] No durable state depends on Render's local filesystem.
 
 ### Reddit and acquisition
@@ -1035,7 +1037,7 @@ V1 is ready for release only when all applicable checks below pass.
 - [ ] SHA-256 exact duplicates reuse the stored object and retain new source attribution.
 - [ ] Optional perceptual hashes only flag similar still images; they do not destructively merge assets.
 - [ ] Original source URL and creator attribution are recorded where available.
-- [ ] R2 object key follows the content-addressed V1 layout.
+- [ ] B2 object key follows the content-addressed V1 layout.
 - [ ] Temporary files are cleaned up after processing.
 
 ### Discord and automation
@@ -1067,8 +1069,8 @@ When deployed and enabled, Tifa Lockhart Bot operates as follows:
 3. The crawler inspects eligible public pages and follows relevant outbound links up to six levels, while enforcing all URL, domain, timing, response, concurrency, and safety limits.
 4. The relevance classifier sends strong matches to verification, uncertain findings to The Dumpster, and irrelevant candidates to rejection.
 5. The media pipeline locates original supported files, validates their true format and size, computes hashes, and skips files above 10 MB.
-6. Exact duplicates reuse the existing R2 object while preserving each distinct source and creator record.
-7. New media files are stored in the private R2 bucket; metadata and source history are stored in Supabase.
+6. Exact duplicates reuse the existing B2 object while preserving each distinct source and creator record.
+7. New media files are stored in the private B2 bucket; metadata and source history are stored in Supabase.
 8. At 4:00 AM IST, the digest publishes verified, not-yet-published media as actual Discord file attachments with source and creator attribution.
 9. A user can invoke `/save <url>` at any time to process a supported public URL and immediately publish its actual file(s) to `#saves`.
 10. `/random`, `/status`, `/stats`, and `/about` provide archive retrieval and visibility; `/start` and `/stop` control automatic collection without disconnecting the bot.
