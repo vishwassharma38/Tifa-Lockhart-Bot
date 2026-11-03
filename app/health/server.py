@@ -10,8 +10,15 @@ log = logging.getLogger(__name__)
 
 
 async def healthz(_request: web.Request) -> web.Response:
-    """Liveness endpoint; intentionally reveals no secrets or dependency details."""
-    return web.json_response({"status": "ok"}, headers={"Cache-Control": "no-store"})
+    """Liveness endpoint; intentionally reveals no secrets or dependency details.
+
+    The response describes process liveness only. Dependency health is exposed
+    through the Discord ``/status`` command, never through this endpoint.
+    """
+    return web.json_response(
+        {"status": "ok", "scope": "liveness"},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def create_health_app() -> web.Application:

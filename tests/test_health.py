@@ -11,7 +11,7 @@ async def test_healthz_returns_minimal_ok_response() -> None:
 
         assert response.status == 200
         assert response.headers["Cache-Control"] == "no-store"
-        assert await response.json() == {"status": "ok"}
+        assert await response.json() == {"status": "ok", "scope": "liveness"}
 
 
 async def test_unknown_path_returns_404() -> None:

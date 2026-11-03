@@ -126,6 +126,7 @@ def test_provider_neutral_storage_migration_is_safe_and_present() -> None:
 
     assert "001_initial_schema.sql" in names
     assert "002_provider_neutral_storage_columns.sql" in names
+    assert "003_harden_updated_at_function_search_path.sql" in names
 
     sql = read_migration("002_provider_neutral_storage_columns.sql")
     lowered = sql.lower()
@@ -138,3 +139,11 @@ def test_provider_neutral_storage_migration_is_safe_and_present() -> None:
     assert "drop column" not in lowered
     assert "delete from" not in lowered
     assert "truncate" not in lowered
+
+
+def test_updated_at_function_search_path_is_hardened() -> None:
+    sql = read_migration("003_harden_updated_at_function_search_path.sql")
+
+    assert "create or replace function public.set_tifa_updated_at()" in sql
+    assert "set search_path = ''" in sql
+    assert "pg_catalog.now()" in sql

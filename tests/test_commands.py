@@ -107,3 +107,97 @@ async def test_sync_uses_global_scope_when_guild_is_not_configured() -> None:
     assert count == 2
     assert tree.copied_guild is None
     assert tree.sync_calls == [None]
+
+
+class FakeResponse:
+    def __init__(self) -> None:
+        self.deferred: list[dict[str, object]] = []
+        self.messages: list[dict[str, object]] = []
+
+    async def defer(self, **kwargs: object) -> None:
+        self.deferred.append(kwargs)
+
+    async def send_message(self, **kwargs: object) -> None:
+        self.messages.append(kwargs)
+
+
+class FakeFollowup:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, object]] = []
+
+    async def send(self, *args: object, **kwargs: object) -> None:
+        self.messages.append({"args": args, **kwargs})
+
+
+class FakeInteraction:
+    def __init__(self) -> None:
+        self.response = FakeResponse()
+        self.followup = FakeFollowup()
+
+
+class FakeStatusService:
+    def __init__(
+        self, *, report: StatusReport | None = None, error: Exception | None = None
+    ) -> None:
+        self.report = report
+        self.error = error
+
+    async def collect(self, **_kwargs: object) -> StatusReport:
+        if self.error is not None:
+            raise self.error
+        assert self.report is not None
+        return self.report
+
+
+class FakeBot:
+    def __init__(self, settings, status_service: FakeStatusService) -> None:
+        self.settings = settings
+        self.status_service = status_service
+
+    def is_ready(self) -> bool:
+        return True
+
+
+async def test_about_command_sends_the_about_embed(make_settings) -> None:
+    settings = make_settings(APP_VERSION="9.8.7")
+    cog = PhaseOneCommands(FakeBot(settings, FakeStatusService()))
+    interaction = FakeInteraction()
+
+    await PhaseOneCommands.about.callback(cog, interaction)
+
+    assert len(interaction.response.messages) == 1
+    embed = interaction.response.messages[0]["embed"]
+    assert embed.title == "Tifa Lockhart Bot"
+
+
+async def test_status_command_defers_then_reports_dependency_state(make_settings) -> None:
+    report = StatusReport(
+        discord_connected=True,
+        app_version="1.2.3",
+        app_env="test",
+        supabase=DependencyStatus.verified(),
+        storage=DependencyStatus.verified(),
+    )
+    cog = PhaseOneCommands(FakeBot(make_settings(), FakeStatusService(report=report)))
+    interaction = FakeInteraction()
+
+    await PhaseOneCommands.status_command.callback(cog, interaction)
+
+    assert interaction.response.deferred == [{"ephemeral": True, "thinking": True}]
+    assert len(interaction.followup.messages) == 1
+    message = interaction.followup.messages[0]
+    assert message["ephemeral"] is True
+    assert message["embed"].title == "Tifa Lockhart Bot - Status"
+
+
+async def test_status_command_reports_failure_without_leaking_details(make_settings) -> None:
+    error = RuntimeError("secret-looking failure detail")
+    cog = PhaseOneCommands(FakeBot(make_settings(), FakeStatusService(error=error)))
+    interaction = FakeInteraction()
+
+    await PhaseOneCommands.status_command.callback(cog, interaction)
+
+    assert len(interaction.followup.messages) == 1
+    message = interaction.followup.messages[0]
+    assert message["ephemeral"] is True
+    assert "secret-looking failure detail" not in str(message)

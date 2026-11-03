@@ -68,6 +68,8 @@ migrations/
   001_initial_schema.sql  Initial Phase 1 schema
   002_provider_neutral_storage_columns.sql
                           Renames historical storage columns without data loss
+  003_harden_updated_at_function_search_path.sql
+                          Pins the updated_at trigger function search path
 scripts/
   verify_b2.py            Safe temporary upload/download/delete check
 tests/                    Unit tests with external services mocked
@@ -158,9 +160,9 @@ Command registration behavior:
 1. Create a Supabase project.
 2. Set `SUPABASE_URL` to the project API URL.
 3. Set `SUPABASE_SERVICE_ROLE_KEY` to the server-side service-role key. This key bypasses Row Level Security and must never be exposed to browsers, clients, logs, or source control.
-4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If `001_initial_schema.sql` has already been applied to your project, do not edit or rerun it; apply `002_provider_neutral_storage_columns.sql` only. If you use your own PostgreSQL migration tooling, apply the files in numeric order and record their versions there.
+4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If `001_initial_schema.sql` has already been applied to your project, do not edit or rerun it; apply `002_provider_neutral_storage_columns.sql` and then `003_harden_updated_at_function_search_path.sql`. If you use your own PostgreSQL migration tooling, apply the files in numeric order and record their versions there.
 
-The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. They use UUID keys, `timestamptz`, foreign keys, uniqueness constraints including SHA-256 uniqueness, status checks, indexes, singleton state rows, and Row Level Security with no public policies. `001` creates the initial schema. `002` renames the historical `r2_bucket` and `r2_object_key` columns to `storage_bucket` and `storage_object_key` in place, renames the related uniqueness constraint, preserves existing rows, and does not drop or recreate `media_items`. The migrations do not delete data or store media binaries in PostgreSQL.
+The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. They use UUID keys, `timestamptz`, foreign keys, uniqueness constraints including SHA-256 uniqueness, status checks, indexes, singleton state rows, and Row Level Security with no public policies. `001` creates the initial schema. `002` renames the historical `r2_bucket` and `r2_object_key` columns to `storage_bucket` and `storage_object_key` in place, renames the related uniqueness constraint, preserves existing rows, and does not drop or recreate `media_items`. `003` hardens the shared `updated_at` trigger function with an empty `search_path` and a schema-qualified `pg_catalog.now()`. The migrations do not delete data or store media binaries in PostgreSQL.
 
 Verify the tables after applying:
 
@@ -186,7 +188,17 @@ where table_schema = 'public'
 order by column_name;
 ```
 
-If only `r2_bucket` and `r2_object_key` are returned, `002` has not been applied yet.
+If only `r2_bucket` and `r2_object_key` are returned, `002` has not been applied yet. After applying `003`, confirm the trigger function uses the hardened search path:
+
+```sql
+select p.proconfig
+from pg_proc p
+join pg_namespace n on n.oid = p.pronamespace
+where n.nspname = 'public'
+  and p.proname = 'set_tifa_updated_at';
+```
+
+The result should include `search_path=` (an empty search path). If it does not, `003` has not been applied yet.
 
 ### 7. Create the private Backblaze B2 bucket and credentials
 
@@ -266,10 +278,10 @@ Invoke-RestMethod -Uri "http://127.0.0.1:10000/healthz"
 Expected response:
 
 ```json
-{"status": "ok"}
+{"status": "ok", "scope": "liveness"}
 ```
 
-The endpoint is served on `0.0.0.0:$PORT`, returns HTTP 200 while the process is alive, and deliberately reveals no configuration or dependency details. It does not fail merely because Supabase, B2, Reddit, or Brave is unavailable.
+The endpoint is served on `0.0.0.0:$PORT`, returns HTTP 200 while the process and event loop are alive, and deliberately reveals no configuration or dependency details. It reports liveness only, not full system health; dependency state is available through the Discord `/status` command. The endpoint does not fail merely because Supabase, B2, Reddit, or Brave is unavailable.
 
 ### 11. Run tests and checks
 
