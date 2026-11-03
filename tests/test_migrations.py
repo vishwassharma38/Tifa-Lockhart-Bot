@@ -127,6 +127,7 @@ def test_provider_neutral_storage_migration_is_safe_and_present() -> None:
     assert "001_initial_schema.sql" in names
     assert "002_provider_neutral_storage_columns.sql" in names
     assert "003_harden_updated_at_function_search_path.sql" in names
+    assert "004_phase2_test_discovery_publication.sql" in names
 
     sql = read_migration("002_provider_neutral_storage_columns.sql")
     lowered = sql.lower()
@@ -147,3 +148,16 @@ def test_updated_at_function_search_path_is_hardened() -> None:
     assert "create or replace function public.set_tifa_updated_at()" in sql
     assert "set search_path = ''" in sql
     assert "pg_catalog.now()" in sql
+
+
+def test_phase2_test_discovery_publication_purpose_is_additive() -> None:
+    sql = read_migration("004_phase2_test_discovery_publication.sql")
+    lowered = sql.lower()
+
+    assert "test_discovery" in lowered
+    assert "drop constraint if exists publications_purpose_check" in lowered
+    assert "add constraint publications_purpose_check" in lowered
+    assert "drop table" not in lowered
+    assert "drop column" not in lowered
+    assert "delete from" not in lowered
+    assert "truncate" not in lowered

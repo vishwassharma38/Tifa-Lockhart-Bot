@@ -109,6 +109,9 @@ class Settings:
     b2_bucket_name: str
     b2_key_id: str
     b2_application_key: str
+    reddit_client_id: str
+    reddit_client_secret: str
+    reddit_user_agent: str
     reddit_access_approved: bool
     brave_html_enabled: bool
 
@@ -148,6 +151,9 @@ class Settings:
             b2_bucket_name=_read(env, "B2_BUCKET_NAME"),
             b2_key_id=_read(env, "B2_KEY_ID"),
             b2_application_key=_read(env, "B2_APPLICATION_KEY"),
+            reddit_client_id=_read(env, "REDDIT_CLIENT_ID"),
+            reddit_client_secret=_read(env, "REDDIT_CLIENT_SECRET"),
+            reddit_user_agent=_read(env, "REDDIT_USER_AGENT"),
             reddit_access_approved=_parse_bool(env, "REDDIT_ACCESS_APPROVED"),
             brave_html_enabled=_parse_bool(env, "BRAVE_HTML_ENABLED"),
         )
@@ -182,6 +188,7 @@ class Settings:
                 self.supabase_service_role_key,
                 self.b2_key_id,
                 self.b2_application_key,
+                self.reddit_client_secret,
             )
             if value
         )

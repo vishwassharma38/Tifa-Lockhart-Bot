@@ -47,6 +47,13 @@ class SupabaseDatabase:
     def configured(self) -> bool:
         return bool(self._url and self._service_role_key)
 
+    @property
+    def client(self) -> Any:
+        """Return the initialized client or fail without exposing configuration."""
+        if self._client is None:
+            raise DatabaseInitializationError("Supabase client is not initialized")
+        return self._client
+
     def initialize(self) -> bool:
         """Create the client if configured. Returns whether a client exists."""
         if not self.configured:

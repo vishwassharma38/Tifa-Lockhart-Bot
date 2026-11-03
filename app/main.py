@@ -51,6 +51,11 @@ class Application:
         self._loop_signals: list[signal.Signals] = []
         self._previous_signal_handlers: dict[signal.Signals, Any] = {}
 
+    @property
+    def bot(self) -> Any | None:
+        """Expose the started Discord client for controlled integration entry points."""
+        return self._bot
+
     async def run(self) -> None:
         try:
             await self.start()

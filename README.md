@@ -2,7 +2,7 @@
 
 A personal, automated media-discovery, acquisition, preservation, and delivery system dedicated to Tifa Lockhart.
 
-**Current implementation:** Phase 1 - Foundation
+**Current implementation:** Phase 2 - Controlled Reddit-to-Discord vertical slice
 **Runtime:** Python 3.11.8
 **Discord integration:** `discord.py` 2.x
 **Database:** Supabase PostgreSQL
@@ -11,9 +11,9 @@ A personal, automated media-discovery, acquisition, preservation, and delivery s
 
 > **V1 pipeline:** Discover -> inspect -> verify -> acquire -> deduplicate -> preserve -> record -> deliver.
 
-The complete, authoritative specification for V1 is [Tifa_Lockhart_Bot_V1_Blueprint.md](Tifa_Lockhart_Bot_V1_Blueprint.md). This README documents the Phase 1 implementation and its local setup.
+The complete, authoritative specification for V1 is [Tifa_Lockhart_Bot_V1_Blueprint.md](Tifa_Lockhart_Bot_V1_Blueprint.md). This README documents the Phase 1 foundation and the Phase 2 controlled vertical slice.
 
-## Phase 1 status
+## Implementation status
 
 Phase 1 provides the application foundation:
 
@@ -25,15 +25,25 @@ Phase 1 provides the application foundation:
 - Single-process startup and graceful shutdown of Discord, HTTP, Supabase, and B2 resources.
 - Unit tests that mock all external services by default.
 
+Phase 2 adds one controlled Reddit-to-Discord acquisition path:
+
+- PRAW-backed submission lookup behind the explicit `REDDIT_ACCESS_APPROVED` gate.
+- Normalized Reddit candidates with truthful title, body, author, profile, and source attribution.
+- Direct image/video acquisition with streaming downloads, actual signature checks, extension checks, and a hard 10,000,000-byte ceiling.
+- SHA-256 deduplication before upload and content-addressed private B2 keys (`assets/<first-two-hex>/<sha256>.<ext>`).
+- Supabase discovery, media, source, and publication records through a repository layer.
+- Actual Discord file attachment publication, with failure recording and retained archived media.
+- A development-only `scripts/phase2_run.py` entry point for one submission at a time.
+
 Not implemented yet (later V1 phases):
 
-- Reddit collection, Brave discovery, recursive crawling, classification, and The Dumpster.
-- Media acquisition, media validation, SHA-256 deduplication, and B2 media uploads.
-- Scheduled jobs, daily digest, and publication tracking.
+- Reddit galleries, Reddit-hosted video, preview extraction, and recursive crawling.
+- Brave discovery, classification, and The Dumpster.
+- Scheduled jobs, daily digest, and general publication tracking.
 - `/start`, `/stop`, `/save`, `/random`, and `/stats`.
-- Render deployment and acceptance testing.
+- Render deployment and full acceptance testing.
 
-Only `/about` and `/status` are registered in Phase 1. The other commands are not registered and will not claim to work.
+Only `/about` and `/status` are registered as slash commands. The other commands are not registered and will not claim to work. Phase 2 is exercised through `scripts/phase2_run.py`, not a slash command.
 
 ## Architecture
 
@@ -43,7 +53,7 @@ V1 runs as one Python process:
 - HTTP health endpoint.
 - Shared configuration, Supabase, and Backblaze B2 clients.
 
-The local filesystem is temporary working space only. Durable metadata belongs in Supabase and media belongs in Backblaze B2. Phase 1 does not download or store real media.
+The local filesystem is temporary working space only. Durable metadata belongs in Supabase and media belongs in Backblaze B2. Phase 2 downloads one asset to a temporary directory and removes that directory after the run.
 
 Object storage is accessed through the provider-independent `ObjectStorage` interface in `app/storage/base.py`. `B2Storage` is the current implementation; the rest of the application uses the neutral interface and the `create_storage` factory, so a future provider change does not require changing application workflows.
 
@@ -56,8 +66,18 @@ app/
   bot/
     client.py             discord.py client and command sync
     commands.py           /about and /status
+    publisher.py          Actual Discord file attachment publication
   db/
     client.py             Supabase client initialization and query health check
+    repository.py         Phase 2 discovery, media, source, and publication writes
+  reddit/
+    connector.py          Gated PRAW lookup and candidate normalization
+    models.py             Typed Reddit candidate and URL normalization
+  media/
+    validation.py         Signature checks, size ceiling, object keys
+    fetcher.py            Streaming bounded media download
+  pipeline/
+    phase2.py             One-submission orchestration and result statuses
   storage/
     base.py               Provider-independent storage interface and errors
     b2.py                 Private Backblaze B2 S3-compatible adapter
@@ -70,8 +90,11 @@ migrations/
                           Renames historical storage columns without data loss
   003_harden_updated_at_function_search_path.sql
                           Pins the updated_at trigger function search path
+  004_phase2_test_discovery_publication.sql
+                          Adds the test_discovery publication purpose
 scripts/
   verify_b2.py            Safe temporary upload/download/delete check
+  phase2_run.py           Controlled one-submission Phase 2 run
 tests/                    Unit tests with external services mocked
 ```
 
@@ -147,7 +170,7 @@ Edit `.env` with your own values. `.env` is ignored by Git and must never be com
 3. No privileged Gateway intents are required for the Phase 1 slash commands. The client uses the default intents.
 4. Invite the bot to your private test server with the `bot` and `applications.commands` scopes. Grant the minimum permissions needed for Phase 1: View Channels, Send Messages, Embed Links, and Attach Files.
 5. Copy the server (guild) ID into `DISCORD_GUILD_ID` if you want immediate development-guild command registration. Copy your Discord user ID into `OWNER_DISCORD_ID`.
-6. Optionally fill `DISCORD_DISCOVERIES_CHANNEL_ID` and `DISCORD_SAVES_CHANNEL_ID` now. They are validated but are not used until later phases.
+6. Fill `DISCORD_DISCOVERIES_CHANNEL_ID` for the Phase 2 controlled destination. `DISCORD_SAVES_CHANNEL_ID` remains reserved for a later phase.
 
 Command registration behavior:
 
@@ -160,9 +183,9 @@ Command registration behavior:
 1. Create a Supabase project.
 2. Set `SUPABASE_URL` to the project API URL.
 3. Set `SUPABASE_SERVICE_ROLE_KEY` to the server-side service-role key. This key bypasses Row Level Security and must never be exposed to browsers, clients, logs, or source control.
-4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If `001_initial_schema.sql` has already been applied to your project, do not edit or rerun it; apply `002_provider_neutral_storage_columns.sql` and then `003_harden_updated_at_function_search_path.sql`. If you use your own PostgreSQL migration tooling, apply the files in numeric order and record their versions there.
+4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If `001_initial_schema.sql` has already been applied to your project, do not edit or rerun it; apply `002_provider_neutral_storage_columns.sql`, then `003_harden_updated_at_function_search_path.sql`, then `004_phase2_test_discovery_publication.sql`. If you use your own PostgreSQL migration tooling, apply the files in numeric order and record their versions there.
 
-The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. They use UUID keys, `timestamptz`, foreign keys, uniqueness constraints including SHA-256 uniqueness, status checks, indexes, singleton state rows, and Row Level Security with no public policies. `001` creates the initial schema. `002` renames the historical `r2_bucket` and `r2_object_key` columns to `storage_bucket` and `storage_object_key` in place, renames the related uniqueness constraint, preserves existing rows, and does not drop or recreate `media_items`. `003` hardens the shared `updated_at` trigger function with an empty `search_path` and a schema-qualified `pg_catalog.now()`. The migrations do not delete data or store media binaries in PostgreSQL.
+The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. They use UUID keys, `timestamptz`, foreign keys, uniqueness constraints including SHA-256 uniqueness, status checks, indexes, singleton state rows, and Row Level Security with no public policies. `001` creates the initial schema. `002` renames the historical `r2_bucket` and `r2_object_key` columns to `storage_bucket` and `storage_object_key` in place, renames the related uniqueness constraint, preserves existing rows, and does not drop or recreate `media_items`. `003` hardens the shared `updated_at` trigger function with an empty `search_path` and a schema-qualified `pg_catalog.now()`. `004` replaces the publication-purpose check constraint with an additive superset that includes `test_discovery`. The migrations do not delete data or store media binaries in PostgreSQL.
 
 Verify the tables after applying:
 
@@ -198,7 +221,14 @@ where n.nspname = 'public'
   and p.proname = 'set_tifa_updated_at';
 ```
 
-The result should include `search_path=` (an empty search path). If it does not, `003` has not been applied yet.
+The result should include `search_path=` (an empty search path). If it does not, `003` has not been applied yet. After applying `004`, confirm the publication-purpose constraint includes `test_discovery`:
+
+```sql
+select pg_get_constraintdef(oid)
+from pg_constraint
+where conrelid = 'public.publications'::regclass
+  and conname = 'publications_purpose_check';
+```
 
 ### 7. Create the private Backblaze B2 bucket and credentials
 
@@ -267,7 +297,27 @@ Dependency states are reported truthfully:
 
 `/status` never prints tokens, service-role keys, signed URLs, channel IDs, or internal exception messages.
 
-### 10. Call `/healthz`
+### 10. Run one controlled Phase 2 acquisition
+
+Phase 2 is deliberately a one-submission development run, not an automated collection loop. It requires:
+
+- `REDDIT_ACCESS_APPROVED=true`.
+- Authorized `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, and `REDDIT_USER_AGENT` values.
+- `DISCORD_DISCOVERIES_CHANNEL_ID` set to the private destination channel.
+- Supabase configured, with migrations `001` through `004` applied.
+- Private B2 configured.
+
+Run one submission by ID or permalink:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -m scripts.phase2_run --submission abc123
+```
+
+The command starts the Discord client, waits for readiness, fetches exactly one Reddit submission, downloads one direct image or video asset, validates the actual bytes and size, computes SHA-256, deduplicates, uploads to the private B2 `assets/` prefix, writes Supabase metadata and attribution, sends a real Discord file attachment, and exits. It prints the result as JSON. It exits `0` for `published` or `duplicate`, and nonzero for skipped, failed, or recoverable results.
+
+Phase 2 intentionally rejects Reddit galleries, `v.redd.it` video, preview hosts, Reddit page URLs, and unsupported extensions with explicit reasons. If Discord delivery fails after the B2 upload, the archived object is retained and the publication is recorded as failed; do not delete or re-upload it. If a database write fails after the B2 upload, the result is `recoverable` and includes the `sha256` and `object_key` so the object can be reconciled without re-downloading. Missing or unapproved Reddit credentials fail clearly before PRAW is constructed.
+
+### 11. Call `/healthz`
 
 With the default local port from `.env.example`:
 
@@ -283,7 +333,7 @@ Expected response:
 
 The endpoint is served on `0.0.0.0:$PORT`, returns HTTP 200 while the process and event loop are alive, and deliberately reveals no configuration or dependency details. It reports liveness only, not full system health; dependency state is available through the Discord `/status` command. The endpoint does not fail merely because Supabase, B2, Reddit, or Brave is unavailable.
 
-### 11. Run tests and checks
+### 12. Run tests and checks
 
 Always use the project's virtual environment:
 
@@ -302,7 +352,7 @@ GitHub Actions runs the same checks through `.github/workflows/ci.yml` on every 
 
 ## Configuration reference
 
-The Phase 1 settings are:
+The implemented settings are:
 
 | Variable | Purpose | Safe default |
 |---|---|---|
@@ -323,15 +373,19 @@ The Phase 1 settings are:
 | `B2_BUCKET_NAME` | Private B2 bucket name | empty |
 | `B2_KEY_ID` | B2 application key ID | empty |
 | `B2_APPLICATION_KEY` | B2 application key secret | empty |
+| `REDDIT_ACCESS_APPROVED` | Explicit gate for authorized Reddit API access | `false` |
+| `REDDIT_CLIENT_ID` | Authorized Reddit OAuth client ID | empty |
+| `REDDIT_CLIENT_SECRET` | Authorized Reddit OAuth client secret | empty |
+| `REDDIT_USER_AGENT` | Truthful Reddit API user agent | empty |
 
-`REDDIT_ACCESS_APPROVED=false` and `BRAVE_HTML_ENABLED=false` remain in `.env.example` as future-phase safety gates. The other Reddit, Brave, and operating-limit values in the template are reserved for later phases and are not used by Phase 1.
+`BRAVE_HTML_ENABLED=false` remains in `.env.example` as a future-phase safety gate. Other Brave and operating-limit values in the template are reserved for later phases. Phase 2 requires all three Reddit credential values and `REDDIT_ACCESS_APPROVED=true`; otherwise the controlled run fails before contacting Reddit.
 
 ## Security and responsible collection
 
 - Never commit `.env`, tokens, service-role keys, passwords, private keys, or signed URLs.
 - Logs redact known configured secrets and common credential patterns. Do not add logging that dumps environment variables, configuration objects, request headers, signed URLs, or full SDK exception payloads.
-- Keep the B2 bucket private. Phase 1 creates no public objects and uploads no real media.
-- RLS is enabled on every Phase 1 table with no public policies. The service-role key bypasses RLS, so keep it server-side only.
+- Keep the B2 bucket private. Phase 2 uploads real media only to the private `assets/` prefix and never creates public object URLs.
+- RLS is enabled on every table with no public policies. The service-role key bypasses RLS, so keep it server-side only.
 - Respect platform policies, site terms, robots directives, copyright, takedown requests, and rate limits in later phases. Do not bypass authentication, paywalls, DRM, CAPTCHAs, anti-bot controls, or access restrictions.
 - A private Discord server does not automatically grant redistribution rights.
 
@@ -343,14 +397,18 @@ The Phase 1 settings are:
 - **`B2_ENDPOINT_URL must match B2_REGION`** - copy the endpoint and region from the same bucket's details. The region is the second label of `s3.<region>.backblazeb2.com`. For example, EU Central uses `B2_REGION=eu-central-003` with `B2_ENDPOINT_URL=https://s3.eu-central-003.backblazeb2.com`.
 - **`verify_b2` exits nonzero with a cleanup failure** - the temporary object may still exist. Confirm the application key has Delete Files access and add a lifecycle rule for the `healthchecks/` prefix if historical versions should expire. Do not delete the bucket or the `assets/` prefix to work around this error.
 - **Slash commands are missing** - confirm the bot was invited with `applications.commands`; allow up to an hour for global sync or set `DISCORD_GUILD_ID` for immediate guild sync.
+- **Phase 2 run reports `reddit_access_not_approved`** - set `REDDIT_ACCESS_APPROVED=true` only after you have authorized Reddit API access and reviewed the platform terms.
+- **Phase 2 run reports `reddit_credentials_missing`** - set all three Reddit credential values; the connector intentionally fails before constructing PRAW when any are absent.
+- **Phase 2 run reports `destination_not_configured`** - set `DISCORD_DISCOVERIES_CHANNEL_ID` and confirm the bot can view and send in that private channel.
+- **Phase 2 run reports `publication_record_failed_recoverable`** - apply migration `004`; the `test_discovery` publication purpose must be allowed by the database constraint.
 - **Port already in use** - change `PORT` or stop the other process. The health endpoint binds to `0.0.0.0`.
 
 ## Development roadmap
 
 The locked V1 blueprint defines the implementation sequence:
 
-1. Foundation: configuration, logging, Discord client, Supabase, Backblaze B2, health endpoint. **Current.**
-2. First Reddit-to-Discord vertical slice.
+1. Foundation: configuration, logging, Discord client, Supabase, Backblaze B2, health endpoint. **Complete.**
+2. First Reddit-to-Discord vertical slice. **Current.**
 3. Media reliability, metadata, and provenance.
 4. Reddit automation and Discord controls.
 5. Brave discovery and controlled crawler, only if permitted.
