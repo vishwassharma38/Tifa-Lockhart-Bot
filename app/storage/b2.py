@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import logging
 import uuid
@@ -222,6 +223,20 @@ class B2Storage:
         except StorageObjectNotFoundError:
             return False
         return True
+
+    async def verify_object(
+        self, object_key: str, *, sha256: str, size_bytes: int, timeout: float | None = None
+    ) -> bool:
+        """Verify actual stored bytes; HEAD metadata alone is not trusted."""
+        if size_bytes < 1 or size_bytes > 10_000_000:
+            return False
+        try:
+            data = await self.download_bytes(object_key, max_bytes=size_bytes, timeout=timeout)
+        except StorageError:
+            return False
+        return len(data) == size_bytes and hmac.compare_digest(
+            hashlib.sha256(data).hexdigest(), sha256
+        )
 
     async def download_bytes(
         self,

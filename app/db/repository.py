@@ -41,6 +41,10 @@ class MediaRepository:
         self._database = database
         self._to_thread = to_thread
 
+    @property
+    def configured(self) -> bool:
+        return self._database.configured
+
     def _client(self) -> Any:
         if not self._database.configured:
             raise RepositoryError("Supabase is not configured")
@@ -49,6 +53,199 @@ class MediaRepository:
             return self._database.client
         except Exception as exc:
             raise RepositoryError(f"Supabase client unavailable ({type(exc).__name__})") from None
+
+    async def get_runtime_state(self) -> dict[str, Any]:
+        return await self._to_thread(self._runtime_state_sync)
+
+    def _runtime_state_sync(self) -> dict[str, Any]:
+        rows = self._rows(
+            self._client().table("runtime_state").select("*").eq("id", 1).limit(1).execute()
+        )
+        return rows[0] if rows else {"id": 1, "collection_enabled": False}
+
+    async def set_collection_enabled(self, enabled: bool) -> dict[str, Any]:
+        return await self._to_thread(self._set_collection_enabled_sync, enabled)
+
+    def _set_collection_enabled_sync(self, enabled: bool) -> dict[str, Any]:
+        rows = self._rows(
+            self._client()
+            .table("runtime_state")
+            .upsert(
+                {
+                    "id": 1,
+                    "collection_enabled": enabled,
+                    "collection_changed_at": datetime.now(tz=UTC).isoformat(),
+                },
+                on_conflict="id",
+            )
+            .execute()
+        )
+        return rows[0] if rows else self._runtime_state_sync()
+
+    async def create_job_run(self, config: dict[str, Any]) -> str:
+        return await self._to_thread(self._create_job_run_sync, config)
+
+    def _create_job_run_sync(self, config: dict[str, Any]) -> str:
+        rows = self._rows(
+            self._client()
+            .table("job_runs")
+            .insert(
+                {"job_type": "reddit_collection", "outcome": "running", "config_snapshot": config}
+            )
+            .execute()
+        )
+        if not rows:
+            raise RepositoryError("Job run insert returned no row")
+        return str(rows[0]["id"])
+
+    async def finish_job_run(
+        self, job_id: str, counters: dict[str, Any], outcome: str, error: str | None = None
+    ) -> None:
+        await self._to_thread(self._finish_job_run_sync, job_id, counters, outcome, error)
+
+    def _finish_job_run_sync(
+        self, job_id: str, counters: dict[str, Any], outcome: str, error: str | None
+    ) -> None:
+        payload = {
+            **counters,
+            "outcome": outcome,
+            "error_summary": error,
+            "finished_at": datetime.now(tz=UTC).isoformat(),
+        }
+        self._client().table("job_runs").update(payload).eq("id", job_id).execute()
+
+    async def mark_interrupted_jobs(self) -> None:
+        await self._to_thread(self._mark_interrupted_sync)
+
+    def _mark_interrupted_sync(self) -> None:
+        rows = self._rows(
+            self._client()
+            .table("job_runs")
+            .select("id")
+            .eq("job_type", "reddit_collection")
+            .eq("outcome", "running")
+            .execute()
+        )
+        for row in rows:
+            self._client().table("job_runs").update(
+                {
+                    "outcome": "failed",
+                    "error_summary": "interrupted_by_restart",
+                    "finished_at": datetime.now(tz=UTC).isoformat(),
+                }
+            ).eq("id", row["id"]).execute()
+
+    async def latest_reddit_runs(self, limit: int = 2) -> list[dict[str, Any]]:
+        return await self._to_thread(self._latest_reddit_runs_sync, limit)
+
+    async def operational_counts(self) -> dict[str, Any]:
+        return await self._to_thread(self._operational_counts_sync)
+
+    def _operational_counts_sync(self) -> dict[str, Any]:
+        client = self._client()
+        queued = (
+            client.table("discoveries")
+            .select("id", count="exact")
+            .eq("status", "queued")
+            .limit(1)
+            .execute()
+        )
+        dumpster = (
+            client.table("discoveries")
+            .select("id", count="exact")
+            .eq("status", "dumpster")
+            .limit(1)
+            .execute()
+        )
+        state = self._runtime_state_sync()
+        return {
+            "queued": int(getattr(queued, "count", None) or 0),
+            "dumpster": int(getattr(dumpster, "count", None) or 0),
+            "last_digest_success_at": state.get("last_digest_success_at"),
+        }
+
+    async def mark_reddit_success(self) -> None:
+        await self._to_thread(self._mark_reddit_success_sync)
+
+    def _mark_reddit_success_sync(self) -> None:
+        self._client().table("runtime_state").update(
+            {"last_reddit_success_at": datetime.now(tz=UTC).isoformat()}
+        ).eq("id", 1).execute()
+
+    def _latest_reddit_runs_sync(self, limit: int) -> list[dict[str, Any]]:
+        return self._rows(
+            self._client()
+            .table("job_runs")
+            .select("*")
+            .eq("job_type", "reddit_collection")
+            .order("started_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+
+    async def random_asset(self) -> dict[str, Any] | None:
+        return await self._to_thread(self._random_asset_sync)
+
+    def _random_asset_sync(self) -> dict[str, Any] | None:
+        rows = self._rows(
+            self._client()
+            .table("media_items")
+            .select("*")
+            .eq("verification_status", "verified")
+            .eq("download_status", "stored")
+            .limit(500)
+            .execute()
+        )
+        import random
+
+        return random.choice(rows) if rows else None
+
+    async def source_for_media(self, media_item_id: str) -> dict[str, Any] | None:
+        return await self._to_thread(self._source_for_media_sync, media_item_id)
+
+    def _source_for_media_sync(self, media_item_id: str) -> dict[str, Any] | None:
+        rows = self._rows(
+            self._client()
+            .table("media_sources")
+            .select("*")
+            .eq("media_item_id", media_item_id)
+            .order("discovered_at")
+            .limit(1)
+            .execute()
+        )
+        return rows[0] if rows else None
+
+    async def asset_stats(self, start: str | None = None) -> dict[str, int]:
+        return await self._to_thread(self._asset_stats_sync, start)
+
+    def _asset_stats_sync(self, start: str | None) -> dict[str, int]:
+        client = self._client()
+
+        def count_assets(media_type: str | None = None) -> int:
+            query = (
+                client.table("media_items")
+                .select("id", count="exact")
+                .eq("verification_status", "verified")
+                .eq("download_status", "stored")
+            )
+            if start:
+                query = query.gte("created_at", start)
+            if media_type:
+                query = query.eq("media_type", media_type)
+            response = query.limit(1).execute()
+            return int(getattr(response, "count", None) or 0)
+
+        pubs = client.table("publications").select("id", count="exact").eq("status", "published")
+        if start:
+            pubs = pubs.gte("published_at", start)
+        publication_response = pubs.limit(1).execute()
+        return {
+            "total": count_assets(),
+            "image": count_assets("image"),
+            "animation": count_assets("animation"),
+            "video": count_assets("video"),
+            "delivered": int(getattr(publication_response, "count", None) or 0),
+        }
 
     @staticmethod
     def _rows(response: Any) -> list[dict[str, Any]]:

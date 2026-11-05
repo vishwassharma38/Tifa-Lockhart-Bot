@@ -41,6 +41,7 @@ log = logging.getLogger(__name__)
 
 
 class Phase2Status(StrEnum):
+    ARCHIVED = "archived"
     PUBLISHED = "published"
     DUPLICATE = "duplicate"
     SKIPPED = "skipped"
@@ -135,11 +136,18 @@ class Phase2Pipeline:
         _candidate, results = await self._execute(submission_reference)
         return results
 
+    async def process_candidate(
+        self, candidate: RedditCandidate, *, publish: bool = True
+    ) -> list[Phase2Result]:
+        """Process an already normalized submission through the shared asset pipeline."""
+        _candidate, results = await self._process_candidate(candidate, publish=publish)
+        return results
+
     async def _execute(
         self,
         submission_reference: str,
     ) -> tuple[RedditCandidate | None, list[Phase2Result]]:
-        if not self._settings.discoveries_channel_id:
+        if not self._publication_channel_id:
             return None, [Phase2Result(Phase2Status.FAILED, "destination_not_configured")]
 
         try:
@@ -154,6 +162,11 @@ class Phase2Pipeline:
             log.warning("Reddit candidate fetch failed (%s)", type(exc).__name__)
             return None, [Phase2Result(Phase2Status.FAILED, "reddit_fetch_failed")]
 
+        return await self._process_candidate(candidate, publish=True)
+
+    async def _process_candidate(
+        self, candidate: RedditCandidate, *, publish: bool
+    ) -> tuple[RedditCandidate, list[Phase2Result]]:
         assets = candidate.assets
         if not assets:
             details = {}
@@ -186,7 +199,9 @@ class Phase2Pipeline:
                     )
                     continue
                 seen_assets.add(asset.asset_key)
-                results.append(await self._process_asset(candidate, asset, temp_dir))
+                results.append(
+                    await self._process_asset(candidate, asset, temp_dir, publish=publish)
+                )
             return candidate, results
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -196,6 +211,8 @@ class Phase2Pipeline:
         candidate: RedditCandidate,
         asset: MediaAsset,
         temp_dir: Path,
+        *,
+        publish: bool = True,
     ) -> Phase2Result:
         downloaded = await self._download(asset, temp_dir)
         if isinstance(downloaded, Phase2Result):
@@ -314,6 +331,15 @@ class Phase2Pipeline:
                 duplicate=True,
             )
 
+        if not publish:
+            return Phase2Result(
+                Phase2Status.ARCHIVED,
+                "archived_for_future_digest",
+                submission_id=candidate.submission_id,
+                sha256=sha256,
+                object_key=object_key,
+                media_item_id=media_item_id,
+            )
         return await self._publish(
             candidate,
             sha256=sha256,
@@ -392,8 +418,13 @@ class Phase2Pipeline:
         if callable(object_exists):
             try:
                 if await object_exists(object_key):
-                    log.info("Reusing existing B2 object %s", object_key)
-                    return
+                    verify_object = getattr(self._storage, "verify_object", None)
+                    if callable(verify_object) and await verify_object(
+                        object_key, sha256=downloaded.sha256, size_bytes=downloaded.size_bytes
+                    ):
+                        log.info("Verified existing B2 object %s", object_key)
+                        return
+                    log.warning("Existing B2 object failed byte verification; replacing it")
             except Exception as exc:
                 log.warning(
                     "B2 object existence check failed (%s); attempting upload",
@@ -407,12 +438,17 @@ class Phase2Pipeline:
                 downloaded.path,
                 downloaded.media.mime_type,
             )
-            return
-        await self._storage.upload_bytes(
-            object_key,
-            downloaded.read_bytes(),
-            downloaded.media.mime_type,
-        )
+        else:
+            await self._storage.upload_bytes(
+                object_key,
+                downloaded.read_bytes(),
+                downloaded.media.mime_type,
+            )
+        verify_object = getattr(self._storage, "verify_object", None)
+        if not callable(verify_object) or not await verify_object(
+            object_key, sha256=downloaded.sha256, size_bytes=downloaded.size_bytes
+        ):
+            raise RuntimeError("Stored object failed byte integrity verification")
 
     def _media_payload(
         self,
@@ -617,7 +653,7 @@ class Phase2Pipeline:
         media_item_id: str,
         filename: str,
     ) -> Phase2Result:
-        channel_id = int(self._settings.discoveries_channel_id or 0)
+        channel_id = self._publication_channel_id
         try:
             publication = await self._repository.create_publication(
                 media_item_id,
@@ -696,6 +732,14 @@ class Phase2Pipeline:
             media_item_id=media_item_id,
             message_id=message_id,
         )
+
+    @property
+    def _publication_channel_id(self) -> int:
+        if self._publication_purpose == "manual_save":
+            return int(
+                self._settings.saves_channel_id or self._settings.discoveries_channel_id or 0
+            )
+        return int(self._settings.discoveries_channel_id or 0)
 
     async def _safe_fail_publication(self, publication_id: str) -> None:
         try:

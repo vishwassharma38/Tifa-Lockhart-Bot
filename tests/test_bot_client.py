@@ -20,7 +20,7 @@ async def test_setup_hook_registers_phase_one_commands(make_settings) -> None:
     try:
         await bot.setup_hook()
         names = {command.name for command in bot.tree.get_commands()}
-        assert names == {"about", "status"}
+        assert names == {"about", "status", "start", "stop", "save", "random", "stats"}
     finally:
         await bot.close()
 
@@ -80,6 +80,6 @@ async def test_setup_hook_survives_command_sync_failure(
     try:
         await bot.setup_hook()
         names = {command.name for command in bot.tree.get_commands()}
-        assert names == {"about", "status"}
+        assert names == {"about", "status", "start", "stop", "save", "random", "stats"}
     finally:
         await bot.close()

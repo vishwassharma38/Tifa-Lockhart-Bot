@@ -212,6 +212,15 @@ class FakeStorage:
         del timeout
         return object_key in self.objects
 
+    async def verify_object(
+        self, object_key: str, *, sha256: str, size_bytes: int, timeout: float | None = None
+    ) -> bool:
+        del timeout
+        import hashlib
+
+        data = self.objects.get(object_key, b"")
+        return len(data) == size_bytes and hashlib.sha256(data).hexdigest() == sha256
+
     async def upload_file(
         self,
         object_key: str,

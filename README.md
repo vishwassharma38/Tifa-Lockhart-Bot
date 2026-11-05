@@ -2,7 +2,7 @@
 
 A personal, automated media-discovery, acquisition, preservation, and delivery system dedicated to Tifa Lockhart.
 
-**Current implementation:** Phase 2 - Controlled Reddit-to-Discord vertical slice
+**Current implementation:** Phase 4 - Reddit collection and persistent Discord controls
 **Runtime:** Python 3.11.8
 **Discord integration:** `discord.py` 2.x
 **Database:** Supabase PostgreSQL
@@ -11,7 +11,7 @@ A personal, automated media-discovery, acquisition, preservation, and delivery s
 
 > **V1 pipeline:** Discover -> inspect -> verify -> acquire -> deduplicate -> preserve -> record -> deliver.
 
-The complete, authoritative specification for V1 is [Tifa_Lockhart_Bot_V1_Blueprint.md](Tifa_Lockhart_Bot_V1_Blueprint.md). This README documents the Phase 1 foundation and the Phase 2 controlled vertical slice.
+The complete V1 specification is [Tifa_Lockhart_Bot_V1_Blueprint.md](Tifa_Lockhart_Bot_V1_Blueprint.md). This README documents the current implementation through Phase 4.
 
 ## Implementation status
 
@@ -25,25 +25,33 @@ Phase 1 provides the application foundation:
 - Single-process startup and graceful shutdown of Discord, HTTP, Supabase, and B2 resources.
 - Unit tests that mock all external services by default.
 
-Phase 2 adds one controlled Reddit-to-Discord acquisition path:
+Phase 2 and Phase 3 provide the shared Reddit-to-archive media pipeline:
 
 - PRAW-backed submission lookup behind the explicit `REDDIT_ACCESS_APPROVED` gate.
 - Normalized Reddit candidates with truthful title, body, author, profile, and source attribution.
-- Direct image/video acquisition with streaming downloads, actual signature checks, extension checks, and a hard 10,000,000-byte ceiling.
+- Direct images, supported galleries, and Reddit-hosted video acquisition with streaming downloads, actual signature checks, extension checks, and a hard 10,000,000-byte ceiling.
 - SHA-256 deduplication before upload and content-addressed private B2 keys (`assets/<first-two-hex>/<sha256>.<ext>`).
 - Supabase discovery, media, source, and publication records through a repository layer.
 - Actual Discord file attachment publication, with failure recording and retained archived media.
 - A development-only `scripts/phase2_run.py` entry point for one submission at a time.
 
+Phase 4 adds scheduled discovery and controls:
+
+- Broad PRAW searches through `r/all` for the five configured phrases, sorted newest first, with a global configurable cap of 100 unique submissions per hourly run.
+- Automated collection archives through the shared media pipeline without immediately publishing to Discord. `/save` publishes immediately.
+- Hourly scheduling in `Asia/Kolkata`, persistent pause/start state, one in-process overlapping-run guard, run counters in Supabase, and interrupted-run recovery.
+- `/start`, `/stop`, `/save`, `/random`, `/stats`, `/about`, and `/status` slash commands.
+- `REDDIT_ENABLED` and `REDDIT_ACCESS_APPROVED` both gate automated Reddit access. Approval defaults to false and must reflect actual authorization; valid credentials do not grant approval.
+- Media URL resolution blocks non-public destinations, including redirect destinations. Existing B2 objects are downloaded and checked against expected size and SHA-256 before reuse.
+- Scheduled collection skips standalone Reddit-hosted video because yt-dlp performs segmented requests outside the public-only media resolver. Manual `/save` retains the existing Phase 3 video path.
+
 Not implemented yet (later V1 phases):
 
-- Reddit galleries, Reddit-hosted video, preview extraction, and recursive crawling.
+- Daily digest scheduling and digest workflow.
 - Brave discovery, classification, and The Dumpster.
-- Scheduled jobs, daily digest, and general publication tracking.
-- `/start`, `/stop`, `/save`, `/random`, and `/stats`.
 - Render deployment and full acceptance testing.
 
-Only `/about` and `/status` are registered as slash commands. The other commands are not registered and will not claim to work. Phase 2 is exercised through `scripts/phase2_run.py`, not a slash command.
+`/start` and `/stop` require the configured `OWNER_DISCORD_ID`. They persist desired state; the Discord client and health endpoint remain online while collection is paused. `/status` reports effective collection gating. `scripts/phase2_run.py` remains available for controlled one-submission testing.
 
 ## Architecture
 
@@ -69,9 +77,10 @@ app/
     publisher.py          Actual Discord file attachment publication
   db/
     client.py             Supabase client initialization and query health check
-    repository.py         Phase 2 discovery, media, source, and publication writes
+    repository.py         Discovery, media, source, publication, state, and job-run queries
   reddit/
-    connector.py          Gated PRAW lookup and candidate normalization
+    connector.py          Gated PRAW lookup, broad search, and normalization
+    collector.py          Bounded scheduled collection and job-run accounting
     models.py             Typed Reddit candidate and URL normalization
   media/
     validation.py         Signature checks, size ceiling, object keys
@@ -92,6 +101,10 @@ migrations/
                           Pins the updated_at trigger function search path
   004_phase2_test_discovery_publication.sql
                           Adds the test_discovery publication purpose
+  005_phase3_per_asset_source_provenance.sql
+                          Adds per-asset gallery source attribution
+  006_phase4_reddit_collection.sql
+                          Adds persistent collection counters and state timestamp
 scripts/
   verify_b2.py            Safe temporary upload/download/delete check
   phase2_run.py           Controlled one-submission Phase 2 run
@@ -167,10 +180,10 @@ Edit `.env` with your own values. `.env` is ignored by Git and must never be com
 
 1. Create an application in the Discord Developer Portal, then add a bot.
 2. Copy the bot token into `DISCORD_TOKEN` in `.env`.
-3. No privileged Gateway intents are required for the Phase 1 slash commands. The client uses the default intents.
+3. No privileged Gateway intents are required for the slash commands. The client uses the default intents.
 4. Invite the bot to your private test server with the `bot` and `applications.commands` scopes. Grant the minimum permissions needed for Phase 1: View Channels, Send Messages, Embed Links, and Attach Files.
 5. Copy the server (guild) ID into `DISCORD_GUILD_ID` if you want immediate development-guild command registration. Copy your Discord user ID into `OWNER_DISCORD_ID`.
-6. Fill `DISCORD_DISCOVERIES_CHANNEL_ID` for the Phase 2 controlled destination. `DISCORD_SAVES_CHANNEL_ID` remains reserved for a later phase.
+6. Fill `DISCORD_DISCOVERIES_CHANNEL_ID` and `DISCORD_SAVES_CHANNEL_ID` with channels where the bot can attach files. `/save` publishes to the saves channel (falling back to discoveries).
 
 Command registration behavior:
 
@@ -183,9 +196,9 @@ Command registration behavior:
 1. Create a Supabase project.
 2. Set `SUPABASE_URL` to the project API URL.
 3. Set `SUPABASE_SERVICE_ROLE_KEY` to the server-side service-role key. This key bypasses Row Level Security and must never be exposed to browsers, clients, logs, or source control.
-4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If `001_initial_schema.sql` has already been applied to your project, do not edit or rerun it; apply `002_provider_neutral_storage_columns.sql`, then `003_harden_updated_at_function_search_path.sql`, then `004_phase2_test_discovery_publication.sql`. If you use your own PostgreSQL migration tooling, apply the files in numeric order and record their versions there.
+4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. Since migration 005 is already applied, apply `006_phase4_reddit_collection.sql` manually. It adds collection counters and state-change time; it does not recreate or delete existing tables/data.
 
-The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. They use UUID keys, `timestamptz`, foreign keys, uniqueness constraints including SHA-256 uniqueness, status checks, indexes, singleton state rows, and Row Level Security with no public policies. `001` creates the initial schema. `002` renames the historical `r2_bucket` and `r2_object_key` columns to `storage_bucket` and `storage_object_key` in place, renames the related uniqueness constraint, preserves existing rows, and does not drop or recreate `media_items`. `003` hardens the shared `updated_at` trigger function with an empty `search_path` and a schema-qualified `pg_catalog.now()`. `004` replaces the publication-purpose check constraint with an additive superset that includes `test_discovery`. The migrations do not delete data or store media binaries in PostgreSQL.
+The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. Migration 006 extends the existing `job_runs` and `runtime_state` tables in place. The migrations do not delete data or store media binaries in PostgreSQL.
 
 Verify the tables after applying:
 
@@ -286,7 +299,7 @@ The process stays online while Discord is connected. Stop it with `Ctrl+C`; the 
 In the configured Discord server:
 
 - `/about` shows the bot name, purpose, version from `APP_VERSION`, and developer `SoftwareFromVish`.
-- `/status` shows the Discord connection state, version/environment, Supabase state, B2 storage state, and a clear statement that collection is not implemented in Phase 1.
+- `/status` shows Discord, Supabase, B2, collection gates and persisted state, and latest Reddit run information.
 
 Dependency states are reported truthfully:
 
@@ -304,7 +317,7 @@ Phase 2 is deliberately a one-submission development run, not an automated colle
 - `REDDIT_ACCESS_APPROVED=true`.
 - Authorized `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, and `REDDIT_USER_AGENT` values.
 - `DISCORD_DISCOVERIES_CHANNEL_ID` set to the private destination channel.
-- Supabase configured, with migrations `001` through `004` applied.
+- Supabase configured, with migrations `001` through `005` applied.
 - Private B2 configured.
 
 Run one submission by ID or permalink:
@@ -315,9 +328,15 @@ Run one submission by ID or permalink:
 
 The command starts the Discord client, waits for readiness, fetches exactly one Reddit submission, downloads one direct image or video asset, validates the actual bytes and size, computes SHA-256, deduplicates, uploads to the private B2 `assets/` prefix, writes Supabase metadata and attribution, sends a real Discord file attachment, and exits. It prints the result as JSON. It exits `0` for `published` or `duplicate`, and nonzero for skipped, failed, or recoverable results.
 
-Phase 2 intentionally rejects Reddit galleries, `v.redd.it` video, preview hosts, Reddit page URLs, and unsupported extensions with explicit reasons. If Discord delivery fails after the B2 upload, the archived object is retained and the publication is recorded as failed; do not delete or re-upload it. If a database write fails after the B2 upload, the result is `recoverable` and includes the `sha256` and `object_key` so the object can be reconciled without re-downloading. Missing or unapproved Reddit credentials fail clearly before PRAW is constructed.
+Supported Reddit galleries and Reddit-hosted video use the same processing path. Preview hosts, Reddit page URLs, and unsupported extensions are rejected with explicit reasons. If Discord delivery fails after the B2 upload, the archived object is retained and the publication is recorded as failed.
 
-### 11. Call `/healthz`
+### 11. Enable Phase 4 collection and use commands
+
+Apply `migrations/006_phase4_reddit_collection.sql` manually in Supabase after migration 005. Set the Reddit OAuth values and truthful user agent in `.env`. Keep `REDDIT_ACCESS_APPROVED=false` until authorized API access is confirmed; set it to `true` only after that confirmation. `REDDIT_ENABLED` is an additional feature gate and defaults to `true`. Configure `REDDIT_MAX_ITEMS_PER_RUN` (default `100`) and, optionally, `REDDIT_SEARCH_PHRASES` as pipe-separated phrases. Do not copy credentials into `.env.example`.
+
+Start the application with `python -m app.main`. The scheduler checks the persisted collection state each hour at minute 0 in `Asia/Kolkata`. In Discord, `/start` and `/stop` are restricted to `OWNER_DISCORD_ID` and persist the desired state across restarts. `/status` displays that state and the effective access gates. `/save <url>` immediately archives and publishes supported Reddit media, `/random` delivers an actual verified stored attachment, `/stats week|month|lifetime` separates unique archived assets from successful deliveries, and `/about` describes the bot. Pausing collection does not disable manual save or random delivery.
+
+### 12. Call `/healthz`
 
 With the default local port from `.env.example`:
 
@@ -333,7 +352,7 @@ Expected response:
 
 The endpoint is served on `0.0.0.0:$PORT`, returns HTTP 200 while the process and event loop are alive, and deliberately reveals no configuration or dependency details. It reports liveness only, not full system health; dependency state is available through the Discord `/status` command. The endpoint does not fail merely because Supabase, B2, Reddit, or Brave is unavailable.
 
-### 12. Run tests and checks
+### 13. Run tests and checks
 
 Always use the project's virtual environment:
 
@@ -374,11 +393,13 @@ The implemented settings are:
 | `B2_KEY_ID` | B2 application key ID | empty |
 | `B2_APPLICATION_KEY` | B2 application key secret | empty |
 | `REDDIT_ACCESS_APPROVED` | Explicit gate for authorized Reddit API access | `false` |
+| `REDDIT_ENABLED` | Feature gate for Reddit API use | `true` |
+| `REDDIT_MAX_ITEMS_PER_RUN` | Global unique candidate ceiling across all phrases | `100` |
 | `REDDIT_CLIENT_ID` | Authorized Reddit OAuth client ID | empty |
 | `REDDIT_CLIENT_SECRET` | Authorized Reddit OAuth client secret | empty |
 | `REDDIT_USER_AGENT` | Truthful Reddit API user agent | empty |
 
-`BRAVE_HTML_ENABLED=false` remains in `.env.example` as a future-phase safety gate. Other Brave and operating-limit values in the template are reserved for later phases. Phase 2 requires all three Reddit credential values and `REDDIT_ACCESS_APPROVED=true`; otherwise the controlled run fails before contacting Reddit.
+`REDDIT_SEARCH_PHRASES` is a pipe-separated optional setting; defaults are `Tifa Lockhart`, `Tifa Lockhart fanart`, `Tifa cosplay`, `Tifa Lockhart cosplay`, and `Tifa Final Fantasy VII`. `/start` persists desired state, while collection also requires both Reddit gates and credentials. Applying migration 006 is required for Phase 4 runtime controls and run counters. Automated collection stores assets without publishing; `/save` publishes immediately and `/random` delivers one verified archived file.
 
 ## Security and responsible collection
 

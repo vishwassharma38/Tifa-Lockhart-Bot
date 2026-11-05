@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -21,6 +22,7 @@ from app.reddit.models import (
 )
 
 _SUPPORTED_MEDIA_EXTENSIONS = frozenset({"jpg", "jpeg", "png", "webp", "gif", "mp4", "webm"})
+log = logging.getLogger(__name__)
 _SUBMISSION_ID_PATTERN = re.compile(r"^[a-z0-9]+$", re.IGNORECASE)
 _SUBMISSION_URL_PATTERN = re.compile(
     r"(?:reddit\.com/(?:r/[^/]+/)?comments/|redd\.it/)([a-z0-9]+)",
@@ -486,6 +488,28 @@ class RedditConnector:
         self._ensure_access()
         submission_id = parse_submission_id(submission_reference)
         return await self._to_thread(self._fetch_sync, submission_id)
+
+    async def search(self, phrase: str, *, limit: int) -> list[Any]:
+        """Run a bounded broad r/all search off the event loop."""
+        self._ensure_access()
+        return await self._to_thread(self._search_sync, phrase, limit)
+
+    def _search_sync(self, phrase: str, limit: int) -> list[Any]:
+        try:
+            reddit = self._client()
+            # Materialize and normalize submissions in the worker thread too:
+            # PRAW attributes may be lazy and can issue synchronous requests.
+            normalized = []
+            for submission in reddit.subreddit("all").search(phrase, sort="new", limit=limit):
+                try:
+                    normalized.append(normalize_submission(submission))
+                except Exception as exc:
+                    log.warning("Reddit submission normalization failed (%s)", type(exc).__name__)
+            return normalized
+        except (RedditAccessNotApprovedError, RedditConfigurationError):
+            raise
+        except Exception as exc:
+            raise RedditFetchError(f"Reddit search failed ({type(exc).__name__})") from None
 
     def _fetch_sync(self, submission_id: str) -> RedditCandidate:
         client = self._client()

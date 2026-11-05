@@ -161,6 +161,16 @@ def test_phase3_per_asset_source_provenance_is_additive() -> None:
     assert "truncate" not in lowered
 
 
+def test_phase4_migration_extends_existing_runtime_and_job_tables() -> None:
+    sql = read_migration("006_phase4_reddit_collection.sql").lower()
+    assert "add column if not exists collection_changed_at" in sql
+    assert "add column if not exists discovered_count" in sql
+    assert "add column if not exists examined_count" in sql
+    assert "add column if not exists duplicate_count" in sql
+    assert "add column if not exists failed_count" in sql
+    assert "create table" not in sql
+
+
 def test_updated_at_function_search_path_is_hardened() -> None:
     sql = read_migration("003_harden_updated_at_function_search_path.sql")
 

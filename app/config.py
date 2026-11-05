@@ -115,6 +115,15 @@ class Settings:
     reddit_access_approved: bool
     brave_html_enabled: bool
     perceptual_hash_enabled: bool
+    reddit_enabled: bool = True
+    reddit_max_items_per_run: int = 100
+    reddit_search_phrases: tuple[str, ...] = (
+        "Tifa Lockhart",
+        "Tifa Lockhart fanart",
+        "Tifa cosplay",
+        "Tifa Lockhart cosplay",
+        "Tifa Final Fantasy VII",
+    )
 
     @classmethod
     def from_env(
@@ -156,6 +165,17 @@ class Settings:
             reddit_client_secret=_read(env, "REDDIT_CLIENT_SECRET"),
             reddit_user_agent=_read(env, "REDDIT_USER_AGENT"),
             reddit_access_approved=_parse_bool(env, "REDDIT_ACCESS_APPROVED"),
+            reddit_enabled=_parse_bool(env, "REDDIT_ENABLED", True),
+            reddit_max_items_per_run=_parse_int(env, "REDDIT_MAX_ITEMS_PER_RUN", 100),
+            reddit_search_phrases=tuple(
+                x.strip()
+                for x in _read(
+                    env,
+                    "REDDIT_SEARCH_PHRASES",
+                    "Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|Tifa Final Fantasy VII",
+                ).split("|")
+                if x.strip()
+            ),
             brave_html_enabled=_parse_bool(env, "BRAVE_HTML_ENABLED"),
             perceptual_hash_enabled=_parse_bool(env, "PERCEPTUAL_HASH_ENABLED"),
         )
@@ -217,6 +237,10 @@ class Settings:
             errors.append("LOG_LEVEL must be a standard logging level")
         if not 1 <= self.port <= 65535:
             errors.append("PORT must be between 1 and 65535")
+        if self.reddit_max_items_per_run < 1:
+            errors.append("REDDIT_MAX_ITEMS_PER_RUN must be positive")
+        if not self.reddit_search_phrases:
+            errors.append("REDDIT_SEARCH_PHRASES must contain at least one phrase")
         try:
             ZoneInfo(self.timezone)
         except (ZoneInfoNotFoundError, ValueError):

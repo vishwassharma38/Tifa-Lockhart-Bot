@@ -377,3 +377,32 @@ async def test_approved_connector_fetches_and_normalizes(make_settings) -> None:
             "user_agent": "test-user-agent",
         }
     ]
+
+
+async def test_broad_search_uses_r_all_new_sort_and_worker_thread(make_settings) -> None:
+    calls = []
+
+    class SearchSubreddit:
+        def search(self, phrase, *, sort, limit):
+            calls.append(("search", phrase, sort, limit))
+            return [FakeSubmission()]
+
+    class SearchReddit:
+        def subreddit(self, name):
+            calls.append(("subreddit", name))
+            return SearchSubreddit()
+
+    def worker(function, *args, **kwargs):
+        calls.append(("worker", function.__name__))
+        return immediate_thread(function, *args, **kwargs)
+
+    connector = RedditConnector(
+        make_settings(REDDIT_ACCESS_APPROVED="true", **REDDIT_ENV),
+        reddit_factory=lambda **_kwargs: SearchReddit(),
+        to_thread=worker,
+    )
+    candidates = await connector.search("Tifa cosplay", limit=17)
+    assert candidates[0].submission_id == "abc123"
+    assert ("subreddit", "all") in calls
+    assert ("search", "Tifa cosplay", "new", 17) in calls
+    assert ("worker", "_search_sync") in calls

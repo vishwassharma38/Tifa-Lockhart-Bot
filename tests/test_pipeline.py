@@ -181,6 +181,19 @@ class FakeStorage:
         self.downloads: list[str] = []
         self.deleted: list[str] = []
 
+    async def verify_object(
+        self, object_key: str, *, sha256: str, size_bytes: int, timeout: float | None = None
+    ) -> bool:
+        del timeout
+        import hashlib
+
+        return any(
+            key == object_key
+            and len(data) == size_bytes
+            and hashlib.sha256(data).hexdigest() == sha256
+            for key, data, _content_type in self.uploads
+        )
+
     async def upload_bytes(
         self,
         object_key: str,

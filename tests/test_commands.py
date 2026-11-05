@@ -3,12 +3,11 @@ from __future__ import annotations
 from app.bot.client import sync_application_commands
 from app.bot.commands import (
     ABOUT_PURPOSE,
-    PhaseOneCommands,
+    PhaseFourCommands,
     build_about_embed,
     build_status_embed,
 )
 from app.health.status import (
-    COLLECTION_NOT_IMPLEMENTED,
     DependencyStatus,
     StatusReport,
 )
@@ -24,7 +23,7 @@ def test_about_embed_contains_required_facts(make_settings) -> None:
     assert "Tifa Lockhart" in ABOUT_PURPOSE
     assert fields["Version"] == "9.8.7"
     assert fields["Developer"] == "SoftwareFromVish"
-    assert embed.url is None
+    assert embed.url == "https://github.com/vishwassharma38/Tifa-Lockhart-Bot"
     assert "http" not in ABOUT_PURPOSE
 
 
@@ -51,7 +50,7 @@ def test_status_embed_reports_dependency_states() -> None:
     assert fields["Version"] == "1.2.3 (test)"
     assert fields["Supabase"] == "Connected / verified"
     assert fields["B2 storage"] == "Unavailable"
-    assert fields["Collection"] == COLLECTION_NOT_IMPLEMENTED
+    assert fields["Collection"] == "Persisted state unavailable"
 
 
 def test_status_embed_distinguishes_unchecked_and_unconfigured() -> None:
@@ -68,12 +67,12 @@ def test_status_embed_distinguishes_unchecked_and_unconfigured() -> None:
     assert fields["Discord"] == "Disconnected / starting"
     assert fields["Supabase"] == "Configured, not checked"
     assert fields["B2 storage"] == "Not configured"
-    assert fields["Collection"] == "Not implemented in Phase 1"
+    assert fields["Collection"] == "Persisted state unavailable"
 
 
-def test_phase_one_registers_only_status_and_about() -> None:
-    names = {command.name for command in PhaseOneCommands.__cog_app_commands__}
-    assert names == {"about", "status"}
+def test_phase_four_commands_are_registered_once() -> None:
+    names = {command.name for command in PhaseFourCommands.__cog_app_commands__}
+    assert names == {"about", "status", "start", "stop", "save", "random", "stats"}
 
 
 class FakeTree:
@@ -117,8 +116,8 @@ class FakeResponse:
     async def defer(self, **kwargs: object) -> None:
         self.deferred.append(kwargs)
 
-    async def send_message(self, **kwargs: object) -> None:
-        self.messages.append(kwargs)
+    async def send_message(self, *args: object, **kwargs: object) -> None:
+        self.messages.append({"args": args, **kwargs})
 
 
 class FakeFollowup:
@@ -130,9 +129,10 @@ class FakeFollowup:
 
 
 class FakeInteraction:
-    def __init__(self) -> None:
+    def __init__(self, user_id: int = 1) -> None:
         self.response = FakeResponse()
         self.followup = FakeFollowup()
+        self.user = type("User", (), {"id": user_id})()
 
 
 class FakeStatusService:
@@ -160,14 +160,53 @@ class FakeBot:
 
 async def test_about_command_sends_the_about_embed(make_settings) -> None:
     settings = make_settings(APP_VERSION="9.8.7")
-    cog = PhaseOneCommands(FakeBot(settings, FakeStatusService()))
+    cog = PhaseFourCommands(FakeBot(settings, FakeStatusService()))
     interaction = FakeInteraction()
 
-    await PhaseOneCommands.about.callback(cog, interaction)
+    await PhaseFourCommands.about.callback(cog, interaction)
 
     assert len(interaction.response.messages) == 1
     embed = interaction.response.messages[0]["embed"]
     assert embed.title == "Tifa Lockhart Bot"
+
+
+async def test_start_is_owner_only_and_persists_collection_state(make_settings) -> None:
+    class Repository:
+        enabled = False
+
+        async def set_collection_enabled(self, enabled):
+            self.enabled = enabled
+            return {"collection_enabled": enabled}
+
+    class Collector:
+        block_reason = "Reddit access approval has not been confirmed"
+
+    bot = FakeBot(make_settings(OWNER_DISCORD_ID="1"), FakeStatusService())
+    bot.repository = Repository()
+    bot.collector = Collector()
+    cog = PhaseFourCommands(bot)
+    forbidden = FakeInteraction(user_id=2)
+    await PhaseFourCommands.start_collection.callback(cog, forbidden)
+    assert bot.repository.enabled is False
+    assert "restricted" in forbidden.response.messages[0]["args"][0]
+
+    owner = FakeInteraction(user_id=1)
+    await PhaseFourCommands.start_collection.callback(cog, owner)
+    assert bot.repository.enabled is True
+    assert "blocked" in owner.followup.messages[0]["args"][0]
+
+
+async def test_stop_persists_paused_state(make_settings) -> None:
+    class Repository:
+        async def set_collection_enabled(self, enabled):
+            return {"collection_enabled": enabled}
+
+    bot = FakeBot(make_settings(OWNER_DISCORD_ID="1"), FakeStatusService())
+    bot.repository = Repository()
+    cog = PhaseFourCommands(bot)
+    interaction = FakeInteraction(user_id=1)
+    await PhaseFourCommands.stop_collection.callback(cog, interaction)
+    assert "paused" in interaction.followup.messages[0]["args"][0]
 
 
 async def test_status_command_defers_then_reports_dependency_state(make_settings) -> None:
@@ -178,10 +217,10 @@ async def test_status_command_defers_then_reports_dependency_state(make_settings
         supabase=DependencyStatus.verified(),
         storage=DependencyStatus.verified(),
     )
-    cog = PhaseOneCommands(FakeBot(make_settings(), FakeStatusService(report=report)))
+    cog = PhaseFourCommands(FakeBot(make_settings(), FakeStatusService(report=report)))
     interaction = FakeInteraction()
 
-    await PhaseOneCommands.status_command.callback(cog, interaction)
+    await PhaseFourCommands.status_command.callback(cog, interaction)
 
     assert interaction.response.deferred == [{"ephemeral": True, "thinking": True}]
     assert len(interaction.followup.messages) == 1
@@ -192,10 +231,10 @@ async def test_status_command_defers_then_reports_dependency_state(make_settings
 
 async def test_status_command_reports_failure_without_leaking_details(make_settings) -> None:
     error = RuntimeError("secret-looking failure detail")
-    cog = PhaseOneCommands(FakeBot(make_settings(), FakeStatusService(error=error)))
+    cog = PhaseFourCommands(FakeBot(make_settings(), FakeStatusService(error=error)))
     interaction = FakeInteraction()
 
-    await PhaseOneCommands.status_command.callback(cog, interaction)
+    await PhaseFourCommands.status_command.callback(cog, interaction)
 
     assert len(interaction.followup.messages) == 1
     message = interaction.followup.messages[0]

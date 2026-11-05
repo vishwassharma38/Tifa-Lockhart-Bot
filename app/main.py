@@ -13,6 +13,7 @@ from typing import Any
 from app.bot.client import TifaBot
 from app.config import ConfigurationError, Settings
 from app.db.client import SupabaseDatabase
+from app.db.repository import MediaRepository
 from app.health.server import HealthServer
 from app.logging_config import configure_logging
 from app.status import StatusService
@@ -38,7 +39,14 @@ class Application:
         self._database = database or SupabaseDatabase.from_settings(settings)
         self._storage = storage or create_storage(settings)
         self._status_service = StatusService(settings, self._database, self._storage)
-        self._bot_factory = bot_factory or (lambda: TifaBot(settings, self._status_service))
+        self._bot_factory = bot_factory or (
+            lambda: TifaBot(
+                settings,
+                self._status_service,
+                repository=MediaRepository(self._database),
+                storage=self._storage,
+            )
+        )
         self._health_server = health_server or HealthServer(settings.port)
         self._install_signal_handlers_enabled = install_signal_handlers
 

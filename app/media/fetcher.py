@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import ipaddress
+import socket
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +33,54 @@ __all__ = [
 
 _DEFAULT_CHUNK_SIZE = 64 * 1024
 _MAX_SIGNATURE_BYTES = 64
+
+
+def _public_ip(value: str) -> bool:
+    address = ipaddress.ip_address(value.split("%", 1)[0])
+    return address.is_global
+
+
+class _PublicResolver(aiohttp.abc.AbstractResolver):
+    """Resolve each connection only to globally routable addresses."""
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_INET
+    ) -> list[dict[str, Any]]:
+        try:
+            literal = ipaddress.ip_address(host)
+        except ValueError:
+            if (
+                not host
+                or "." not in host
+                or host.lower().endswith((".local", ".internal", ".localhost"))
+            ):
+                raise OSError("Blocked non-public media hostname") from None
+            infos = await asyncio.get_running_loop().getaddrinfo(
+                host, port, family=family, type=socket.SOCK_STREAM
+            )
+        else:
+            infos = [(family, socket.SOCK_STREAM, 6, "", (str(literal), port))]
+        results = []
+        for af, _socktype, proto, _canonname, sockaddr in infos:
+            ip = sockaddr[0]
+            if not _public_ip(ip):
+                raise OSError("Blocked non-public media destination")
+            results.append(
+                {
+                    "hostname": host,
+                    "host": ip,
+                    "port": port,
+                    "family": af,
+                    "proto": proto,
+                    "flags": 0,
+                }
+            )
+        if not results:
+            raise OSError("Media hostname did not resolve")
+        return results
+
+    async def close(self) -> None:
+        return None
 
 
 class MediaDownloadError(RuntimeError):
@@ -116,7 +167,8 @@ class MediaFetcher:
         if self._closed:
             raise MediaDownloadError("Media fetcher is closed")
         if self._session is None:
-            self._session = aiohttp.ClientSession()
+            connector = aiohttp.TCPConnector(resolver=_PublicResolver())
+            self._session = aiohttp.ClientSession(connector=connector)
             self._owns_session = True
         return self._session
 
@@ -149,6 +201,19 @@ class MediaFetcher:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise MediaDownloadError("Media URL must be a public http(s) URL")
+        if not parsed.hostname:
+            raise MediaDownloadError("Media URL must have a hostname")
+        try:
+            if parsed.hostname.lower() in {
+                "localhost",
+                "metadata.google.internal",
+            } or parsed.hostname.lower().endswith((".local", ".internal", ".localhost")):
+                raise ValueError
+            if ":" in parsed.hostname or parsed.hostname[0].isdigit():
+                if not _public_ip(parsed.hostname):
+                    raise ValueError
+        except ValueError:
+            raise MediaDownloadError("Media URL destination is not public") from None
 
         destination_dir.mkdir(parents=True, exist_ok=True)
         token = uuid.uuid4().hex
