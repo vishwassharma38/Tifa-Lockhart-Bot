@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from urllib.parse import urlparse
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -406,7 +407,13 @@ class Phase2Pipeline:
                 details={"asset_url": asset.url},
             )
         except Exception as exc:
-            log.warning("Media download failed (%s)", type(exc).__name__)
+            host = urlparse(asset.url).hostname or "invalid"
+            log.warning(
+                "Media download failed submission_id=%s asset_index=%s host=%s failure_category=%s exception_type=%s error=%s",
+                getattr(self, "_current_submission_id", "unknown"), asset.gallery_index,
+                host, getattr(exc, "category", "download_error"), type(exc).__name__,
+                str(exc)[:180],
+            )
             return Phase2Result(
                 Phase2Status.FAILED,
                 "media_download_failed",

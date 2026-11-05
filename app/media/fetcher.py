@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import random
 import socket
 import uuid
 from dataclasses import dataclass
@@ -86,6 +87,11 @@ class _PublicResolver(aiohttp.abc.AbstractResolver):
 class MediaDownloadError(RuntimeError):
     """Raised when a media file cannot be acquired safely."""
 
+    def __init__(self, message: str, *, category: str = "download_error", status_code: int | None = None, content_type: str | None = None, size_bytes: int | None = None, host: str | None = None) -> None:
+        super().__init__(message)
+        self.category, self.status_code = category, status_code
+        self.content_type, self.size_bytes, self.host = content_type, size_bytes, host
+
 
 class OversizeMediaError(MediaDownloadError):
     """Raised when a download exceeds the hard byte ceiling."""
@@ -144,6 +150,7 @@ class MediaFetcher:
         connect_timeout: float = 10.0,
         read_timeout: float = 30.0,
         max_redirects: int = 5,
+        max_attempts: int = 3,
     ) -> None:
         if chunk_size < 1:
             raise ValueError("chunk_size must be positive")
@@ -153,6 +160,7 @@ class MediaFetcher:
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
         self._max_redirects = max_redirects
+        self._max_attempts = max(1, max_attempts)
         self._closed = False
 
     async def __aenter__(self) -> MediaFetcher:
@@ -223,14 +231,35 @@ class MediaFetcher:
 
         try:
             session = self._get_session()
-            async with session.get(
-                url,
-                timeout=self._timeout(),
-                max_redirects=self._max_redirects,
-            ) as response:
+            response = None
+            for attempt in range(1, self._max_attempts + 1):
+              try:
+                request = session.get(url, timeout=self._timeout(), max_redirects=self._max_redirects, headers={"User-Agent": "TifaLockhartBot/1.0 (public media archival)", "Accept": "image/avif,image/webp,image/apng,image/*,video/*;q=0.9,*/*;q=0.8", "Referer": "https://www.reddit.com/"})
+                async with request as candidate:
+                    status = int(getattr(candidate, "status", 0) or 0)
+                    headers = getattr(candidate, "headers", None) or {}
+                    ctype = headers.get("Content-Type") or headers.get("content-type")
+                    if status == 429 or status >= 500:
+                        if attempt < self._max_attempts:
+                            retry_after = headers.get("Retry-After") or headers.get("retry-after")
+                            try:
+                                delay = min(30.0, max(0.0, float(retry_after))) if retry_after is not None else min(8.0, 0.5 * 2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                            except ValueError:
+                                delay = min(8.0, 0.5 * 2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                            await asyncio.sleep(delay)
+                            continue
+                    response = candidate
+                    if status < 200 or status >= 300:
+                        raise MediaDownloadError(f"HTTP {status}", category="http_forbidden" if status == 403 else "http_rate_limited" if status == 429 else "http_server_error" if status >= 500 else "http_error", status_code=status, content_type=str(ctype) if ctype else None, host=parsed.hostname)
+                    break
+              except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                if attempt >= self._max_attempts:
+                    raise MediaDownloadError(f"{type(exc).__name__}: {str(exc)[:180]}", category="network_error", host=parsed.hostname) from exc
+                await asyncio.sleep(min(8.0, 0.5 * 2 ** (attempt - 1)) + random.uniform(0, 0.25))
+            if response is None:
+                raise MediaDownloadError("No HTTP response", category="network_error", host=parsed.hostname)
+            async with response:
                 status = int(getattr(response, "status", 0) or 0)
-                if status < 200 or status >= 300:
-                    raise MediaDownloadError(f"Media request failed with HTTP {status}")
 
                 headers = getattr(response, "headers", None) or {}
                 declared_content_type = headers.get("Content-Type") or headers.get("content-type")
@@ -256,11 +285,11 @@ class MediaFetcher:
                         handle.write(chunk)
 
             if total == 0:
-                raise MediaDownloadError("Media response was empty")
+                raise MediaDownloadError("Media response was empty", category="empty_response", status_code=status, content_type=str(declared_content_type) if declared_content_type else None, size_bytes=0, host=parsed.hostname)
 
             media = detect_media_type(bytes(signature))
             if media is None:
-                raise UnsupportedMediaError("Downloaded bytes are not supported media")
+                raise UnsupportedMediaError("Downloaded bytes are not supported media", category="invalid_media", status_code=status, content_type=str(declared_content_type) if declared_content_type else None, size_bytes=total, host=parsed.hostname)
 
             expected_extension = extension_from_url(url)
             if expected_extension is not None and expected_extension != media.extension:
