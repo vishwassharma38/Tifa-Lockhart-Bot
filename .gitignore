@@ -74,5 +74,5 @@ temp/
 *.sqlite3
 *.db
 downloads/
-media/
+/media/
 prompt.md

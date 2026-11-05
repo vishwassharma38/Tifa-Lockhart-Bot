@@ -13,7 +13,12 @@ from urllib.parse import urlparse
 import praw
 
 from app.config import Settings
-from app.reddit.models import RedditCandidate, normalize_reddit_source_url
+from app.media.validation import normalize_extension
+from app.reddit.models import (
+    MediaAsset,
+    RedditCandidate,
+    normalize_reddit_source_url,
+)
 
 _SUPPORTED_MEDIA_EXTENSIONS = frozenset({"jpg", "jpeg", "png", "webp", "gif", "mp4", "webm"})
 _SUBMISSION_ID_PATTERN = re.compile(r"^[a-z0-9]+$", re.IGNORECASE)
@@ -62,10 +67,22 @@ def _author_name(author: Any) -> str | None:
     return cleaned
 
 
-def _extract_media_url(submission: Any) -> tuple[str | None, str | None]:
-    if bool(getattr(submission, "is_gallery", False)):
-        return None, "reddit_gallery_not_supported_in_phase2"
+def _http_url(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    cleaned = value.strip()
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return cleaned
 
+
+def _extension_for(url: str) -> str | None:
+    parsed = urlparse(url)
+    return normalize_extension(PurePosixPath(parsed.path).suffix)
+
+
+def _direct_asset(submission: Any) -> tuple[MediaAsset | None, str | None]:
     url = getattr(submission, "url", None)
     if not isinstance(url, str) or not url.strip():
         return None, "submission_has_no_media_url"
@@ -75,8 +92,6 @@ def _extract_media_url(submission: Any) -> tuple[str | None, str | None]:
         return None, "media_url_is_not_public_http"
 
     host = (parsed.hostname or "").lower()
-    if host in _REDDIT_VIDEO_HOSTS:
-        return None, "reddit_hosted_video_not_supported_in_phase2"
     if host in _PREVIEW_HOSTS:
         return None, "reddit_preview_is_not_the_original"
     if host in _REDDIT_HOSTS or "/comments/" in parsed.path:
@@ -85,7 +100,207 @@ def _extract_media_url(submission: Any) -> tuple[str | None, str | None]:
     extension = PurePosixPath(parsed.path).suffix.lower().lstrip(".")
     if extension not in _SUPPORTED_MEDIA_EXTENSIONS:
         return None, "media_url_extension_not_supported"
-    return url.strip(), None
+    if host in _REDDIT_VIDEO_HOSTS:
+        return None, "reddit_video_metadata_missing"
+
+    normalized = normalize_extension(extension) or extension
+    return (
+        MediaAsset(
+            url=url.strip(),
+            expected_media_type="video" if normalized in {"mp4", "webm"} else "image",
+            source_metadata={"extraction": "direct_url"},
+        ),
+        None,
+    )
+
+
+def _original_gallery_url(
+    metadata: dict[str, Any],
+    media_id: str,
+    extension: str | None,
+) -> str | None:
+    original = metadata.get("s")
+    if isinstance(original, dict):
+        for key in ("u", "gif", "mp4"):
+            url = _http_url(original.get(key))
+            if url is not None and urlparse(url).hostname not in _PREVIEW_HOSTS:
+                return url
+
+    # Reddit gallery entries expose preview URLs in ``s`` but the original is
+    # addressable by media ID. Construct it instead of accepting a thumbnail.
+    if extension in _SUPPORTED_MEDIA_EXTENSIONS:
+        return f"https://i.redd.it/{media_id}.{extension}"
+    return None
+
+
+def _extract_gallery(
+    submission: Any,
+    submission_id: str,
+) -> tuple[list[MediaAsset], list[dict[str, Any]], str | None]:
+    gallery_data = getattr(submission, "gallery_data", None)
+    media_metadata = getattr(submission, "media_metadata", None)
+
+    if not isinstance(gallery_data, dict):
+        return [], [{"reason": "gallery_metadata_missing"}], "gallery_metadata_missing"
+    items = gallery_data.get("items")
+    if not isinstance(items, list) or not items:
+        return [], [{"reason": "gallery_items_missing"}], "gallery_items_missing"
+    if not isinstance(media_metadata, dict):
+        return (
+            [],
+            [{"reason": "gallery_media_metadata_missing"}],
+            ("gallery_media_metadata_missing"),
+        )
+
+    assets: list[MediaAsset] = []
+    skipped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            skipped.append({"index": index, "reason": "gallery_item_malformed"})
+            continue
+
+        media_id = item.get("media_id") or item.get("id")
+        if not isinstance(media_id, str) or not media_id.strip():
+            skipped.append({"index": index, "reason": "gallery_item_missing_media_id"})
+            continue
+        media_id = media_id.strip()
+
+        metadata = media_metadata.get(media_id)
+        if not isinstance(metadata, dict):
+            skipped.append(
+                {"index": index, "media_id": media_id, "reason": "gallery_item_unavailable"}
+            )
+            continue
+        status = metadata.get("status")
+        if isinstance(status, str) and status.lower() not in {"valid", "unprocessed"}:
+            skipped.append(
+                {"index": index, "media_id": media_id, "reason": "gallery_item_not_valid"}
+            )
+            continue
+
+        declared_extension = normalize_extension(metadata.get("e"))
+        url = _original_gallery_url(metadata, media_id, declared_extension)
+        extension = declared_extension or (_extension_for(url) if url else None)
+        if extension is None or extension not in _SUPPORTED_MEDIA_EXTENSIONS:
+            skipped.append(
+                {"index": index, "media_id": media_id, "reason": "gallery_item_unsupported"}
+            )
+            continue
+        if url is None:
+            skipped.append(
+                {
+                    "index": index,
+                    "media_id": media_id,
+                    "reason": "gallery_item_original_unavailable",
+                }
+            )
+            continue
+
+        if media_id in seen or url in seen:
+            skipped.append(
+                {"index": index, "media_id": media_id, "reason": "gallery_item_duplicate"}
+            )
+            continue
+        seen.add(media_id)
+        seen.add(url)
+
+        mime_type = metadata.get("m") if isinstance(metadata.get("m"), str) else None
+        assets.append(
+            MediaAsset(
+                url=url,
+                source_media_id=media_id,
+                filename=f"reddit-{submission_id}-{index + 1}.{extension}",
+                expected_media_type="video" if extension in {"mp4", "webm"} else "image",
+                gallery_index=index,
+                source_metadata={
+                    "media_id": media_id,
+                    "gallery_index": index,
+                    "declared_extension": metadata.get("e"),
+                    "declared_mime_type": mime_type,
+                    "caption": item.get("caption"),
+                },
+            )
+        )
+
+    reason = None if assets else "no_supported_gallery_media"
+    return assets, skipped, reason
+
+
+def _reddit_video_metadata(submission: Any) -> dict[str, Any] | None:
+    for attribute in ("media", "secure_media"):
+        media = getattr(submission, attribute, None)
+        if isinstance(media, dict):
+            reddit_video = media.get("reddit_video")
+            if isinstance(reddit_video, dict):
+                return reddit_video
+    return None
+
+
+def _extract_video(
+    submission: Any,
+    submission_id: str,
+    permalink: str,
+) -> tuple[MediaAsset | None, str | None]:
+    reddit_video = _reddit_video_metadata(submission)
+    if reddit_video is None:
+        return None, "reddit_video_metadata_missing"
+
+    url = _http_url(reddit_video.get("fallback_url")) or _http_url(permalink)
+    if url is None:
+        return None, "reddit_video_not_publicly_accessible"
+
+    metadata = {
+        "is_gif": bool(reddit_video.get("is_gif", False)),
+        "width": reddit_video.get("width"),
+        "height": reddit_video.get("height"),
+        "duration": reddit_video.get("duration"),
+        "has_hls": bool(reddit_video.get("hls_url")),
+        "has_dash": bool(reddit_video.get("dash_url")),
+        "fallback_url": _http_url(reddit_video.get("fallback_url")),
+    }
+    # yt-dlp needs the Reddit post to select the separate audio and video
+    # streams; the fallback URL is often a silent video-only DASH stream.
+    download_url = _http_url(permalink) or url
+    return (
+        MediaAsset(
+            url=url,
+            source_media_id=str(reddit_video.get("dash_url") or url),
+            filename=f"reddit-{submission_id}.mp4",
+            expected_media_type="video",
+            source_metadata=metadata,
+            requires_video_download=True,
+            download_url=download_url,
+        ),
+        None,
+    )
+
+
+def _extract_assets(
+    submission: Any,
+    submission_id: str,
+    permalink: str,
+) -> tuple[list[MediaAsset], list[dict[str, Any]], str | None, str | None]:
+    """Return assets, skipped gallery entries, reason, and the Phase 2 media URL."""
+    if bool(getattr(submission, "is_gallery", False)):
+        assets, skipped, reason = _extract_gallery(submission, submission_id)
+        return assets, skipped, reason, None
+
+    if bool(getattr(submission, "is_video", False)):
+        asset, reason = _extract_video(submission, submission_id, permalink)
+        return ([asset] if asset else []), [], reason, None
+
+    raw_url = getattr(submission, "url", None)
+    host = ""
+    if isinstance(raw_url, str):
+        host = (urlparse(raw_url).hostname or "").lower()
+    if host in _REDDIT_VIDEO_HOSTS:
+        asset, reason = _extract_video(submission, submission_id, permalink)
+        return ([asset] if asset else []), [], reason, None
+
+    asset, reason = _direct_asset(submission)
+    return ([asset] if asset else []), [], reason, (asset.url if asset else None)
 
 
 def normalize_submission(submission: Any) -> RedditCandidate:
@@ -119,7 +334,9 @@ def normalize_submission(submission: Any) -> RedditCandidate:
     except (TypeError, ValueError, OSError, OverflowError):
         created_at = datetime.now(tz=UTC)
 
-    media_url, extraction_reason = _extract_media_url(submission)
+    assets, skipped_gallery, extraction_reason, media_url = _extract_assets(
+        submission, submission_id, permalink
+    )
     raw_url = getattr(submission, "url", None)
     media_metadata = {
         "submission_url": raw_url if isinstance(raw_url, str) else None,
@@ -129,7 +346,19 @@ def normalize_submission(submission: Any) -> RedditCandidate:
         "post_hint": getattr(submission, "post_hint", None),
         "reddit_created_utc": created_utc if isinstance(created_utc, (int, float)) else None,
         "extraction_reason": extraction_reason,
+        "asset_count": len(assets),
     }
+    if skipped_gallery:
+        media_metadata["skipped_gallery_items"] = skipped_gallery
+    if bool(getattr(submission, "is_video", False)):
+        reddit_video = _reddit_video_metadata(submission)
+        if reddit_video is not None:
+            media_metadata["reddit_video"] = {
+                "width": reddit_video.get("width"),
+                "height": reddit_video.get("height"),
+                "duration": reddit_video.get("duration"),
+                "is_gif": bool(reddit_video.get("is_gif", False)),
+            }
 
     return RedditCandidate(
         submission_id=submission_id,
@@ -144,6 +373,7 @@ def normalize_submission(submission: Any) -> RedditCandidate:
         media_url=media_url,
         media_metadata=media_metadata,
         extraction_reason=extraction_reason,
+        media_assets=tuple(assets),
     )
 
 

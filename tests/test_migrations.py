@@ -142,6 +142,25 @@ def test_provider_neutral_storage_migration_is_safe_and_present() -> None:
     assert "truncate" not in lowered
 
 
+def test_phase3_per_asset_source_provenance_is_additive() -> None:
+    files, _sql = read_migrations()
+    names = [path.name for path in files]
+
+    assert "005_phase3_per_asset_source_provenance.sql" in names
+
+    sql = read_migration("005_phase3_per_asset_source_provenance.sql")
+    lowered = sql.lower()
+
+    assert "add column if not exists source_media_id" in lowered
+    assert "media_item_id, normalized_source_url, source_media_id" in lowered
+    assert "source_platform" in lowered
+    assert "source_post_id" in lowered
+    assert "drop table" not in lowered
+    assert "drop column" not in lowered
+    assert "delete from" not in lowered
+    assert "truncate" not in lowered
+
+
 def test_updated_at_function_search_path_is_hardened() -> None:
     sql = read_migration("003_harden_updated_at_function_search_path.sql")
 

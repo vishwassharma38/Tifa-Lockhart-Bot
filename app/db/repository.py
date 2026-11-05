@@ -16,6 +16,19 @@ class RepositoryError(RuntimeError):
     """Raised when a repository operation cannot be completed."""
 
 
+def _is_unique_violation(exc: Exception) -> bool:
+    code = getattr(exc, "code", None)
+    if str(code) == "23505":
+        return True
+    for value in (str(exc), getattr(exc, "message", None), getattr(exc, "details", None)):
+        if not value:
+            continue
+        text = str(value).lower()
+        if "23505" in text or "duplicate key" in text or "unique constraint" in text:
+            return True
+    return False
+
+
 class MediaRepository:
     """Keep synchronous Supabase SDK calls off the asyncio event loop."""
 
@@ -105,11 +118,78 @@ class MediaRepository:
         return await self._to_thread(self._create_media_item_sync, payload)
 
     def _create_media_item_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self._client().table("media_items").insert(payload).execute()
+        try:
+            response = self._client().table("media_items").insert(payload).execute()
+        except Exception as exc:
+            sha256 = payload.get("sha256")
+            if isinstance(sha256, str) and _is_unique_violation(exc):
+                try:
+                    existing = self._get_media_by_sha256_sync(sha256)
+                except Exception:
+                    existing = None
+                if existing is not None:
+                    return {**existing, "_recovered": True}
+            raise
         rows = self._rows(response)
         if rows:
             return rows[0]
         raise RepositoryError("Media item insert returned no row")
+
+    async def update_media_item_metadata(
+        self,
+        media_item_id: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Fill non-null technical metadata without erasing existing values."""
+        return await self._to_thread(
+            self._update_media_item_metadata_sync,
+            media_item_id,
+            metadata,
+        )
+
+    def _update_media_item_metadata_sync(
+        self,
+        media_item_id: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        allowed = {
+            "width",
+            "height",
+            "duration_seconds",
+            "mime_type",
+            "extension",
+            "media_type",
+            "size_bytes",
+            "perceptual_hash",
+        }
+        payload = {
+            key: value for key, value in metadata.items() if key in allowed and value is not None
+        }
+        if not payload:
+            return {"id": media_item_id}
+        response = (
+            self._client().table("media_items").update(payload).eq("id", media_item_id).execute()
+        )
+        rows = self._rows(response)
+        return rows[0] if rows else {"id": media_item_id, **payload}
+
+    async def list_media_with_perceptual_hash(
+        self,
+        *,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return recent rows with perceptual hashes for similarity review."""
+        return await self._to_thread(self._list_perceptual_hashes_sync, limit)
+
+    def _list_perceptual_hashes_sync(self, limit: int) -> list[dict[str, Any]]:
+        response = (
+            self._client()
+            .table("media_items")
+            .select("id, perceptual_hash")
+            .limit(max(1, limit))
+            .execute()
+        )
+        return [row for row in self._rows(response) if isinstance(row.get("perceptual_hash"), str)]
 
     async def record_source(
         self,
@@ -118,6 +198,7 @@ class MediaRepository:
         *,
         discovery_id: str | None = None,
         media_url: str | None = None,
+        source_media_id: str | None = None,
     ) -> dict[str, Any]:
         return await self._to_thread(
             self._record_source_sync,
@@ -125,6 +206,7 @@ class MediaRepository:
             candidate,
             discovery_id,
             media_url,
+            source_media_id,
         )
 
     def _record_source_sync(
@@ -133,12 +215,14 @@ class MediaRepository:
         candidate: RedditCandidate,
         discovery_id: str | None,
         media_url: str | None,
+        source_media_id: str | None,
     ) -> dict[str, Any]:
         payload = {
             "media_item_id": media_item_id,
             "discovery_id": discovery_id,
             "source_platform": "reddit",
             "source_post_id": candidate.submission_id,
+            "source_media_id": source_media_id or "",
             "source_url": candidate.source_url,
             "normalized_source_url": candidate.normalized_source_url,
             "media_url": media_url or candidate.media_url,
@@ -151,7 +235,10 @@ class MediaRepository:
         response = (
             self._client()
             .table("media_sources")
-            .upsert(payload, on_conflict="media_item_id,normalized_source_url")
+            .upsert(
+                payload,
+                on_conflict="media_item_id,normalized_source_url,source_media_id",
+            )
             .execute()
         )
         rows = self._rows(response)

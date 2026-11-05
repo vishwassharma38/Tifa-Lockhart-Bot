@@ -7,6 +7,7 @@ import hmac
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import boto3
@@ -179,6 +180,48 @@ class B2Storage:
             ContentType=content_type,
             timeout=timeout,
         )
+
+    async def upload_file(
+        self,
+        object_key: str,
+        file_path: Path,
+        content_type: str,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """Upload a validated temporary file without loading it into memory."""
+        self._validate_key(object_key)
+        if not file_path.is_file():
+            raise ValueError("B2 upload file does not exist")
+        client = self._ensure_client()
+
+        def _upload() -> None:
+            with file_path.open("rb") as handle:
+                client.put_object(
+                    Bucket=self._bucket_name,
+                    Key=object_key,
+                    Body=handle,
+                    ContentType=content_type,
+                )
+
+        await self._call("upload", _upload, timeout=timeout)
+
+    async def object_exists(self, object_key: str, *, timeout: float | None = None) -> bool:
+        """Return whether a content-addressed object already exists."""
+        self._validate_key(object_key)
+        client = self._ensure_client()
+        try:
+            await self._call(
+                "head",
+                client.head_object,
+                Bucket=self._bucket_name,
+                Key=object_key,
+                timeout=timeout,
+                missing_is_not_found=True,
+            )
+        except StorageObjectNotFoundError:
+            return False
+        return True
 
     async def download_bytes(
         self,

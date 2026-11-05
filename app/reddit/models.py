@@ -20,8 +20,27 @@ def normalize_reddit_source_url(url: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class MediaAsset:
+    """One original media file extracted from a Reddit submission."""
+
+    url: str
+    source_media_id: str | None = None
+    filename: str | None = None
+    expected_media_type: str | None = None
+    gallery_index: int | None = None
+    source_metadata: dict[str, Any] = field(default_factory=dict)
+    requires_video_download: bool = False
+    download_url: str | None = None
+
+    @property
+    def asset_key(self) -> str:
+        """Stable per-submission identity used to avoid duplicate downloads."""
+        return self.source_media_id or self.url
+
+
+@dataclass(frozen=True, slots=True)
 class RedditCandidate:
-    """Normalized Reddit submission fields used by the Phase 2 pipeline."""
+    """Normalized Reddit submission fields used by the media pipeline."""
 
     submission_id: str
     permalink: str
@@ -35,6 +54,7 @@ class RedditCandidate:
     media_url: str | None
     media_metadata: dict[str, Any] = field(default_factory=dict)
     extraction_reason: str | None = None
+    media_assets: tuple[MediaAsset, ...] = ()
 
     @property
     def caption(self) -> str | None:
@@ -43,3 +63,12 @@ class RedditCandidate:
     @property
     def normalized_source_url(self) -> str:
         return normalize_reddit_source_url(self.source_url)
+
+    @property
+    def assets(self) -> tuple[MediaAsset, ...]:
+        """Return typed assets, falling back to the Phase 2 single-image field."""
+        if self.media_assets:
+            return self.media_assets
+        if self.media_url:
+            return (MediaAsset(url=self.media_url),)
+        return ()

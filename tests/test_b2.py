@@ -68,8 +68,18 @@ class FakeS3:
     def put_object(self, **kwargs: Any) -> None:
         if self.put_error is not None:
             raise self.put_error
-        self.puts.append(kwargs)
-        self.objects[kwargs["Key"]] = kwargs["Body"]
+        body = kwargs["Body"]
+        if hasattr(body, "read"):
+            body = body.read()
+        stored = {**kwargs, "Body": body}
+        self.puts.append(stored)
+        self.objects[kwargs["Key"]] = body
+
+    def head_object(self, Bucket: str, Key: str) -> dict[str, Any]:
+        del Bucket
+        if Key not in self.objects:
+            raise client_error("NoSuchKey", "The specified key does not exist", "HeadObject")
+        return {"Key": Key}
 
     def get_object(self, Bucket: str, Key: str) -> dict[str, Any]:
         del Bucket
@@ -253,6 +263,43 @@ async def test_upload_download_and_delete_use_private_operations_without_acl() -
 
     assert client.deletes == [key]
     assert key not in client.objects
+
+
+async def test_upload_file_streams_from_disk_without_public_acl(tmp_path) -> None:
+    client = FakeS3()
+    storage, _factory = make_storage(client)
+    key = "assets/ab/" + ("b" * 64) + ".mp4"
+    file_path = tmp_path / "video.mp4"
+    file_path.write_bytes(b"video-data")
+
+    await storage.upload_file(key, file_path, "video/mp4")
+
+    assert client.objects[key] == b"video-data"
+    assert client.puts[0]["Key"] == key
+    assert client.puts[0]["ContentType"] == "video/mp4"
+    assert "ACL" not in client.puts[0]
+
+
+async def test_upload_file_rejects_missing_file(tmp_path) -> None:
+    client = FakeS3()
+    storage, _factory = make_storage(client)
+
+    with pytest.raises(ValueError):
+        await storage.upload_file(
+            "assets/ab/" + ("c" * 64) + ".mp4", tmp_path / "missing.mp4", "video/mp4"
+        )
+
+
+async def test_object_exists_returns_false_for_missing_object() -> None:
+    client = FakeS3()
+    storage, _factory = make_storage(client)
+    key = "assets/ab/" + ("d" * 64) + ".png"
+
+    assert await storage.object_exists(key) is False
+
+    await storage.upload_bytes(key, b"data", "image/png")
+
+    assert await storage.object_exists(key) is True
 
 
 async def test_download_enforces_maximum_size() -> None:

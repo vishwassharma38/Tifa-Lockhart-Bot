@@ -22,6 +22,7 @@ def test_defaults_do_not_require_credentials() -> None:
     assert settings.b2_configured is False
     assert settings.reddit_access_approved is False
     assert settings.brave_html_enabled is False
+    assert settings.perceptual_hash_enabled is False
 
 
 def test_parses_phase_one_settings() -> None:
@@ -46,6 +47,7 @@ def test_parses_phase_one_settings() -> None:
             "B2_APPLICATION_KEY": "application-key",
             "REDDIT_ACCESS_APPROVED": "true",
             "BRAVE_HTML_ENABLED": "false",
+            "PERCEPTUAL_HASH_ENABLED": "true",
         },
         load_env_file=False,
     )
@@ -63,6 +65,7 @@ def test_parses_phase_one_settings() -> None:
     assert settings.b2_configured is True
     assert settings.reddit_access_approved is True
     assert settings.brave_html_enabled is False
+    assert settings.perceptual_hash_enabled is True
 
 
 @pytest.mark.parametrize(

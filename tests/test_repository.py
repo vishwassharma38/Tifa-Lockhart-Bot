@@ -47,6 +47,9 @@ class FakeQuery:
         return self
 
     def execute(self) -> FakeResponse:
+        error = self.table.errors.get(self.operation)
+        if error is not None:
+            raise error
         return FakeResponse(self.table.results.get(self.operation, []))
 
 
@@ -54,6 +57,7 @@ class FakeTable:
     def __init__(self, name: str) -> None:
         self.name = name
         self.results: dict[str, list[dict[str, object]]] = {}
+        self.errors: dict[str, Exception] = {}
         self.queries: list[FakeQuery] = []
         self.calls: list[tuple[str, object, object]] = []
 
@@ -177,6 +181,78 @@ async def test_create_media_item_inserts_exact_payload() -> None:
     assert client.table("media_items").calls == [("insert", payload, None)]
 
 
+async def test_create_media_item_recovers_concurrent_duplicate() -> None:
+    client = FakeClient()
+    client.table("media_items").errors["insert"] = RuntimeError("duplicate key")
+    client.table("media_items").results["select"] = [{"id": "existing-media", "sha256": "abc"}]
+    repository = make_repository(client)
+
+    row = await repository.create_media_item({"sha256": "abc", "download_status": "stored"})
+
+    assert row == {"id": "existing-media", "sha256": "abc", "_recovered": True}
+    assert client.table("media_items").queries[1].filters == [("sha256", "abc")]
+
+
+async def test_create_media_item_reraises_when_recovery_finds_nothing() -> None:
+    client = FakeClient()
+    client.table("media_items").errors["insert"] = RuntimeError("database unavailable")
+    repository = make_repository(client)
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await repository.create_media_item({"sha256": "abc"})
+
+
+async def test_create_media_item_does_not_recover_non_conflict_errors() -> None:
+    client = FakeClient()
+    client.table("media_items").errors["insert"] = RuntimeError("database unavailable")
+    client.table("media_items").results["select"] = [{"id": "existing-media", "sha256": "abc"}]
+    repository = make_repository(client)
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await repository.create_media_item({"sha256": "abc"})
+
+
+async def test_update_media_item_metadata_only_writes_present_safe_fields() -> None:
+    client = FakeClient()
+    client.table("media_items").results["update"] = [{"id": "media-1"}]
+    repository = make_repository(client)
+
+    row = await repository.update_media_item_metadata(
+        "media-1",
+        {
+            "width": 800,
+            "height": None,
+            "duration_seconds": 3.5,
+            "perceptual_hash": "abcd",
+            "storage_bucket": "not-allowed",
+        },
+    )
+
+    assert row == {"id": "media-1"}
+    _, payload, _ = client.table("media_items").calls[0]
+    assert payload == {
+        "width": 800,
+        "duration_seconds": 3.5,
+        "perceptual_hash": "abcd",
+    }
+    assert client.table("media_items").queries[0].filters == [("id", "media-1")]
+
+
+async def test_list_media_with_perceptual_hash_filters_empty_values() -> None:
+    client = FakeClient()
+    client.table("media_items").results["select"] = [
+        {"id": "media-1", "perceptual_hash": "abcd"},
+        {"id": "media-2", "perceptual_hash": None},
+        {"id": "media-3"},
+    ]
+    repository = make_repository(client)
+
+    rows = await repository.list_media_with_perceptual_hash(limit=10)
+
+    assert rows == [{"id": "media-1", "perceptual_hash": "abcd"}]
+    assert client.table("media_items").queries[0].limit_value == 10
+
+
 async def test_record_source_upserts_reddit_attribution() -> None:
     client = FakeClient()
     client.table("media_sources").results["upsert"] = [{"id": "source-1"}]
@@ -188,15 +264,17 @@ async def test_record_source_upserts_reddit_attribution() -> None:
         candidate,
         discovery_id="discovery-1",
         media_url="https://i.redd.it/example.png",
+        source_media_id="gallery-media-1",
     )
 
     assert row == {"id": "source-1"}
     operation, payload, on_conflict = client.table("media_sources").calls[0]
     assert operation == "upsert"
-    assert on_conflict == "media_item_id,normalized_source_url"
+    assert on_conflict == "media_item_id,normalized_source_url,source_media_id"
     assert payload["media_item_id"] == "media-1"
     assert payload["discovery_id"] == "discovery-1"
     assert payload["source_post_id"] == "abc123"
+    assert payload["source_media_id"] == "gallery-media-1"
     assert payload["source_url"] == candidate.source_url
     assert payload["media_url"] == "https://i.redd.it/example.png"
     assert payload["creator_name"] == "artist_name"

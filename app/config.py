@@ -114,6 +114,7 @@ class Settings:
     reddit_user_agent: str
     reddit_access_approved: bool
     brave_html_enabled: bool
+    perceptual_hash_enabled: bool
 
     @classmethod
     def from_env(
@@ -156,6 +157,7 @@ class Settings:
             reddit_user_agent=_read(env, "REDDIT_USER_AGENT"),
             reddit_access_approved=_parse_bool(env, "REDDIT_ACCESS_APPROVED"),
             brave_html_enabled=_parse_bool(env, "BRAVE_HTML_ENABLED"),
+            perceptual_hash_enabled=_parse_bool(env, "PERCEPTUAL_HASH_ENABLED"),
         )
 
     @property

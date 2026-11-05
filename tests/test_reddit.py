@@ -102,8 +102,8 @@ def test_normalize_submission_leaves_missing_attribution_missing(author) -> None
 @pytest.mark.parametrize(
     ("overrides", "reason"),
     [
-        ({"is_gallery": True}, "reddit_gallery_not_supported_in_phase2"),
-        ({"url": "https://v.redd.it/abc"}, "reddit_hosted_video_not_supported_in_phase2"),
+        ({"is_gallery": True}, "gallery_metadata_missing"),
+        ({"url": "https://v.redd.it/abc"}, "reddit_video_metadata_missing"),
         (
             {"url": "https://preview.redd.it/abc.jpg"},
             "reddit_preview_is_not_the_original",
@@ -123,6 +123,112 @@ def test_normalize_submission_records_clear_skip_reasons(overrides, reason) -> N
 
     assert candidate.media_url is None
     assert candidate.extraction_reason == reason
+
+
+def test_gallery_uses_original_assets_and_keeps_per_item_ids() -> None:
+    submission = FakeSubmission(
+        is_gallery=True,
+        url="https://www.reddit.com/gallery/abc123",
+        gallery_data={
+            "items": [
+                {"media_id": "one", "caption": "first"},
+                {"media_id": "two"},
+                {"media_id": "three"},
+                {"media_id": "missing"},
+                {"media_id": "bad"},
+            ]
+        },
+        media_metadata={
+            "one": {
+                "status": "valid",
+                "e": "png",
+                "m": "image/png",
+                "s": {
+                    "u": "https://i.redd.it/one.png",
+                    "x": "https://preview.redd.it/one.png",
+                },
+            },
+            "two": {
+                "status": "valid",
+                "e": "jpg",
+                "s": {
+                    "u": "https://i.redd.it/two.jpg",
+                    "x": "https://preview.redd.it/two.jpg",
+                },
+            },
+            "three": {
+                "status": "valid",
+                "e": "png",
+                "s": {"u": "https://preview.redd.it/three.png?width=640"},
+            },
+            "bad": {"status": "failed", "e": "png", "s": {"u": "https://i.redd.it/bad.png"}},
+        },
+    )
+
+    candidate = normalize_submission(submission)
+
+    assert candidate.media_url is None
+    assert [asset.source_media_id for asset in candidate.media_assets] == [
+        "one",
+        "two",
+        "three",
+    ]
+    assert [asset.url for asset in candidate.media_assets] == [
+        "https://i.redd.it/one.png",
+        "https://i.redd.it/two.jpg",
+        "https://i.redd.it/three.png",
+    ]
+    assert [asset.gallery_index for asset in candidate.media_assets] == [0, 1, 2]
+    assert candidate.media_assets[0].filename == "reddit-abc123-1.png"
+    assert candidate.media_metadata["skipped_gallery_items"] == [
+        {"index": 3, "media_id": "missing", "reason": "gallery_item_unavailable"},
+        {"index": 4, "media_id": "bad", "reason": "gallery_item_not_valid"},
+    ]
+
+
+def test_reddit_hosted_video_uses_public_fallback_and_requires_download() -> None:
+    submission = FakeSubmission(
+        is_video=True,
+        url="https://v.redd.it/abc123",
+        media={
+            "reddit_video": {
+                "fallback_url": "https://v.redd.it/abc123/CMAF_720.mp4?source=fallback",
+                "dash_url": "https://v.redd.it/abc123/DASHPlaylist.mpd",
+                "hls_url": "https://v.redd.it/abc123/HLSPlaylist.m3u8",
+                "width": 1280,
+                "height": 720,
+                "duration": 12,
+                "is_gif": False,
+            }
+        },
+    )
+
+    candidate = normalize_submission(submission)
+
+    assert candidate.media_url is None
+    assert len(candidate.media_assets) == 1
+    asset = candidate.media_assets[0]
+    assert asset.url == "https://v.redd.it/abc123/CMAF_720.mp4?source=fallback"
+    assert asset.download_url == "https://www.reddit.com/r/TifaLockhart/comments/abc123/a_post/"
+    assert asset.requires_video_download is True
+    assert asset.expected_media_type == "video"
+    assert asset.source_media_id == "https://v.redd.it/abc123/DASHPlaylist.mpd"
+
+
+def test_gallery_without_supported_items_reports_reason() -> None:
+    candidate = normalize_submission(
+        FakeSubmission(
+            is_gallery=True,
+            gallery_data={"items": [{"media_id": "one"}]},
+            media_metadata={"one": {"status": "valid", "e": "txt"}},
+        )
+    )
+
+    assert candidate.media_assets == ()
+    assert candidate.extraction_reason == "no_supported_gallery_media"
+    assert candidate.media_metadata["skipped_gallery_items"] == [
+        {"index": 0, "media_id": "one", "reason": "gallery_item_unsupported"}
+    ]
 
 
 async def test_gate_disabled_makes_no_praw_call(make_settings) -> None:

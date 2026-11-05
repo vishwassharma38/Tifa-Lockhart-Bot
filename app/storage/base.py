@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from app.health.status import DependencyStatus
@@ -79,6 +80,17 @@ class ObjectStorage(Protocol):
         *,
         timeout: float | None = None,
     ) -> None: ...
+
+    async def upload_file(
+        self,
+        object_key: str,
+        file_path: Path,
+        content_type: str,
+        *,
+        timeout: float | None = None,
+    ) -> None: ...
+
+    async def object_exists(self, object_key: str, *, timeout: float | None = None) -> bool: ...
 
     async def download_bytes(
         self,
