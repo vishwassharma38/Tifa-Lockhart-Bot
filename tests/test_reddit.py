@@ -141,7 +141,7 @@ def test_gallery_uses_original_assets_and_keeps_per_item_ids() -> None:
         media_metadata={
             "one": {
                 "status": "valid",
-                "e": "png",
+                "e": "Image",
                 "m": "image/png",
                 "s": {
                     "u": "https://i.redd.it/one.png",
@@ -150,7 +150,8 @@ def test_gallery_uses_original_assets_and_keeps_per_item_ids() -> None:
             },
             "two": {
                 "status": "valid",
-                "e": "jpg",
+                "e": "Image",
+                "m": "image/jpeg",
                 "s": {
                     "u": "https://i.redd.it/two.jpg",
                     "x": "https://preview.redd.it/two.jpg",
@@ -158,10 +159,16 @@ def test_gallery_uses_original_assets_and_keeps_per_item_ids() -> None:
             },
             "three": {
                 "status": "valid",
-                "e": "png",
+                "e": "Image",
+                "m": "image/png",
                 "s": {"u": "https://preview.redd.it/three.png?width=640"},
             },
-            "bad": {"status": "failed", "e": "png", "s": {"u": "https://i.redd.it/bad.png"}},
+            "bad": {
+                "status": "failed",
+                "e": "Image",
+                "m": "image/png",
+                "s": {"u": "https://i.redd.it/bad.png"},
+            },
         },
     )
 
@@ -183,6 +190,98 @@ def test_gallery_uses_original_assets_and_keeps_per_item_ids() -> None:
     assert candidate.media_metadata["skipped_gallery_items"] == [
         {"index": 3, "media_id": "missing", "reason": "gallery_item_unavailable"},
         {"index": 4, "media_id": "bad", "reason": "gallery_item_not_valid"},
+    ]
+    assert candidate.media_metadata["gallery_diagnostics"] == {
+        "total_entries": 5,
+        "supported_entries": 3,
+        "skipped_entries": 2,
+        "skipped_items": candidate.media_metadata["skipped_gallery_items"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("category", "mime", "expected"),
+    [
+        ("Image", "image/jpeg", "jpg"),
+        ("Image", "image/png", "png"),
+        ("AnimatedImage", "image/gif", "gif"),
+    ],
+)
+def test_gallery_resolves_real_reddit_category_and_mime(category, mime, expected) -> None:
+    candidate = normalize_submission(
+        FakeSubmission(
+            is_gallery=True,
+            gallery_data={"items": [{"media_id": "realid", "caption": "caption"}]},
+            media_metadata={
+                "realid": {
+                    "status": "valid",
+                    "e": category,
+                    "m": mime,
+                    "s": {"u": "https://preview.redd.it/x?width=640"},
+                }
+            },
+        )
+    )
+    asset = candidate.media_assets[0]
+    assert asset.url == f"https://i.redd.it/realid.{expected}"
+    assert asset.source_media_id == "realid"
+    assert asset.source_metadata["caption"] == "caption"
+
+
+@pytest.mark.parametrize(
+    ("metadata", "reason"),
+    [
+        ({"status": "valid", "e": "Image"}, "gallery_item_missing_mime_type"),
+        ({"status": "valid", "e": "Image", "m": "image/bmp"}, "gallery_item_unsupported_mime_type"),
+        ({"status": "failed", "e": "Image", "m": "image/png"}, "gallery_item_not_valid"),
+        (
+            {"status": "valid", "e": "RedditVideo", "m": "video/mp4"},
+            "gallery_item_reddit_video_unsupported",
+        ),
+        (
+            {"status": "valid", "e": "Unknown", "m": "image/png"},
+            "gallery_item_unsupported_category",
+        ),
+    ],
+)
+def test_gallery_reports_specific_unsupported_reasons(metadata, reason) -> None:
+    candidate = normalize_submission(
+        FakeSubmission(
+            is_gallery=True,
+            gallery_data={"items": [{"media_id": "item"}]},
+            media_metadata={"item": metadata},
+        )
+    )
+    assert candidate.media_assets == ()
+    assert candidate.media_metadata["skipped_gallery_items"][0]["reason"] == reason
+
+
+def test_gallery_missing_id_and_mixed_order_and_preview_rejection() -> None:
+    candidate = normalize_submission(
+        FakeSubmission(
+            is_gallery=True,
+            gallery_data={"items": [{"media_id": "a"}, {}, {"media_id": "b"}]},
+            media_metadata={
+                "a": {
+                    "status": "valid",
+                    "e": "Image",
+                    "m": "image/png",
+                    "s": {"u": "https://preview.redd.it/a.png"},
+                },
+                "b": {
+                    "status": "valid",
+                    "e": "Image",
+                    "m": "image/jpeg",
+                    "s": {"u": "https://preview.redd.it/b.jpg"},
+                },
+            },
+        )
+    )
+    assert [asset.source_media_id for asset in candidate.media_assets] == ["a", "b"]
+    assert [asset.gallery_index for asset in candidate.media_assets] == [0, 2]
+    assert all(asset.url.startswith("https://i.redd.it/") for asset in candidate.media_assets)
+    assert candidate.media_metadata["skipped_gallery_items"] == [
+        {"index": 1, "reason": "gallery_item_missing_media_id"}
     ]
 
 
@@ -220,14 +319,14 @@ def test_gallery_without_supported_items_reports_reason() -> None:
         FakeSubmission(
             is_gallery=True,
             gallery_data={"items": [{"media_id": "one"}]},
-            media_metadata={"one": {"status": "valid", "e": "txt"}},
+            media_metadata={"one": {"status": "valid", "e": "Image", "m": "image/bmp"}},
         )
     )
 
     assert candidate.media_assets == ()
     assert candidate.extraction_reason == "no_supported_gallery_media"
     assert candidate.media_metadata["skipped_gallery_items"] == [
-        {"index": 0, "media_id": "one", "reason": "gallery_item_unsupported"}
+        {"index": 0, "media_id": "one", "reason": "gallery_item_unsupported_mime_type"}
     ]
 
 

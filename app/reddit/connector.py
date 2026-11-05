@@ -29,6 +29,13 @@ _SUBMISSION_URL_PATTERN = re.compile(
 _REDDIT_HOSTS = frozenset({"reddit.com", "www.reddit.com", "old.reddit.com", "redd.it"})
 _PREVIEW_HOSTS = frozenset({"preview.redd.it", "external-preview.redd.it"})
 _REDDIT_VIDEO_HOSTS = frozenset({"v.redd.it"})
+_GALLERY_MIME_EXTENSIONS = {
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
 
 
 class RedditAccessNotApprovedError(RuntimeError):
@@ -121,10 +128,9 @@ def _original_gallery_url(
 ) -> str | None:
     original = metadata.get("s")
     if isinstance(original, dict):
-        for key in ("u", "gif", "mp4"):
-            url = _http_url(original.get(key))
-            if url is not None and urlparse(url).hostname not in _PREVIEW_HOSTS:
-                return url
+        url = _http_url(original.get("u"))
+        if url is not None and (urlparse(url).hostname or "").lower() == "i.redd.it":
+            return url
 
     # Reddit gallery entries expose preview URLs in ``s`` but the original is
     # addressable by media ID. Construct it instead of accepting a thumbnail.
@@ -180,14 +186,49 @@ def _extract_gallery(
             )
             continue
 
-        declared_extension = normalize_extension(metadata.get("e"))
-        url = _original_gallery_url(metadata, media_id, declared_extension)
-        extension = declared_extension or (_extension_for(url) if url else None)
-        if extension is None or extension not in _SUPPORTED_MEDIA_EXTENSIONS:
+        category = metadata.get("e")
+        if category == "RedditVideo":
             skipped.append(
-                {"index": index, "media_id": media_id, "reason": "gallery_item_unsupported"}
+                {
+                    "index": index,
+                    "media_id": media_id,
+                    "reason": "gallery_item_reddit_video_unsupported",
+                }
             )
             continue
+        mime_value = metadata.get("m")
+        mime_type = (
+            mime_value.split(";", 1)[0].strip().lower() if isinstance(mime_value, str) else ""
+        )
+        extension = _GALLERY_MIME_EXTENSIONS.get(mime_type)
+        if not isinstance(mime_value, str) or not mime_value.strip():
+            skipped.append(
+                {"index": index, "media_id": media_id, "reason": "gallery_item_missing_mime_type"}
+            )
+            continue
+        if category not in {"Image", "AnimatedImage"}:
+            skipped.append(
+                {
+                    "index": index,
+                    "media_id": media_id,
+                    "reason": "gallery_item_unsupported_category",
+                }
+            )
+            continue
+        if (
+            extension is None
+            or (category == "AnimatedImage" and extension != "gif")
+            or (category == "Image" and extension == "gif")
+        ):
+            skipped.append(
+                {
+                    "index": index,
+                    "media_id": media_id,
+                    "reason": "gallery_item_unsupported_mime_type",
+                }
+            )
+            continue
+        url = _original_gallery_url(metadata, media_id, extension)
         if url is None:
             skipped.append(
                 {
@@ -206,7 +247,6 @@ def _extract_gallery(
         seen.add(media_id)
         seen.add(url)
 
-        mime_type = metadata.get("m") if isinstance(metadata.get("m"), str) else None
         assets.append(
             MediaAsset(
                 url=url,
@@ -217,7 +257,7 @@ def _extract_gallery(
                 source_metadata={
                     "media_id": media_id,
                     "gallery_index": index,
-                    "declared_extension": metadata.get("e"),
+                    "declared_category": category,
                     "declared_mime_type": mime_type,
                     "caption": item.get("caption"),
                 },
@@ -350,6 +390,16 @@ def normalize_submission(submission: Any) -> RedditCandidate:
     }
     if skipped_gallery:
         media_metadata["skipped_gallery_items"] = skipped_gallery
+    if bool(getattr(submission, "is_gallery", False)):
+        media_metadata["gallery_diagnostics"] = {
+            "total_entries": len(getattr(submission, "gallery_data", {}).get("items", []))
+            if isinstance(getattr(submission, "gallery_data", None), dict)
+            and isinstance(getattr(submission, "gallery_data", {}).get("items"), list)
+            else 0,
+            "supported_entries": len(assets),
+            "skipped_entries": len(skipped_gallery),
+            "skipped_items": skipped_gallery,
+        }
     if bool(getattr(submission, "is_video", False)):
         reddit_video = _reddit_video_metadata(submission)
         if reddit_video is not None:

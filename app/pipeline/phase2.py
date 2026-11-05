@@ -156,11 +156,16 @@ class Phase2Pipeline:
 
         assets = candidate.assets
         if not assets:
+            details = {}
+            diagnostics = candidate.media_metadata.get("gallery_diagnostics")
+            if isinstance(diagnostics, dict):
+                details["gallery"] = diagnostics
             return candidate, [
                 Phase2Result(
                     Phase2Status.SKIPPED,
                     candidate.extraction_reason or "no_supported_media",
                     submission_id=candidate.submission_id,
+                    details=details,
                 )
             ]
 
