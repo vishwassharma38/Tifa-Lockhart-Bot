@@ -398,6 +398,7 @@ class Phase2Pipeline:
         url_selection = asset.source_metadata.get("url_selection") or asset.source_metadata.get(
             "extraction", "unknown"
         )
+        url_selection_reason = asset.source_metadata.get("url_selection_reason", "unknown")
         if asset.requires_video_download:
             try:
                 return await self._video_downloader.download(
@@ -464,7 +465,7 @@ class Phase2Pipeline:
         except MediaDownloadError as exc:
             host = urlparse(asset.url).hostname or "invalid"
             log.warning(
-                "Media download failed run_id=%s submission_id=%s asset_id=%s asset_index=%s host=%s url_fingerprint=%s url_selection=%s failure_category=%s status=%s exception_type=%s error=%s retry=false final=true",
+                "Media download failed run_id=%s submission_id=%s asset_id=%s asset_index=%s host=%s url_fingerprint=%s url_selection=%s url_selection_reason=%s failure_category=%s status=%s exception_type=%s error=%s retry=false final=true",
                 collection_run_id or "unknown",
                 candidate.submission_id,
                 safe_asset_id,
@@ -472,6 +473,7 @@ class Phase2Pipeline:
                 host,
                 url_fingerprint,
                 url_selection,
+                url_selection_reason,
                 exc.category,
                 exc.status_code,
                 type(exc.original_exception or exc).__name__,
@@ -486,6 +488,7 @@ class Phase2Pipeline:
                     "asset_index": asset_index,
                     "host": host,
                     "url_selection": url_selection,
+                    "url_selection_reason": url_selection_reason,
                     "failure_category": exc.category,
                     "status_code": exc.status_code,
                     "exception_type": type(exc.original_exception or exc).__name__,
@@ -494,7 +497,7 @@ class Phase2Pipeline:
         except Exception as exc:
             host = urlparse(asset.url).hostname or "invalid"
             log.warning(
-                "Media download failed run_id=%s submission_id=%s asset_id=%s asset_index=%s host=%s url_fingerprint=%s url_selection=%s failure_category=download_error exception_type=%s error=%s retry=false final=true",
+                "Media download failed run_id=%s submission_id=%s asset_id=%s asset_index=%s host=%s url_fingerprint=%s url_selection=%s url_selection_reason=%s failure_category=download_error exception_type=%s error=%s retry=false final=true",
                 collection_run_id or "unknown",
                 candidate.submission_id,
                 safe_asset_id,
@@ -502,6 +505,7 @@ class Phase2Pipeline:
                 host,
                 url_fingerprint,
                 url_selection,
+                url_selection_reason,
                 type(exc).__name__,
                 str(exc)[:180],
             )
@@ -514,6 +518,7 @@ class Phase2Pipeline:
                     "asset_index": asset_index,
                     "host": host,
                     "url_selection": url_selection,
+                    "url_selection_reason": url_selection_reason,
                     "failure_category": "download_error",
                     "exception_type": type(exc).__name__,
                 },

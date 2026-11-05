@@ -183,12 +183,17 @@ def test_gallery_uses_original_assets_and_keeps_per_item_ids() -> None:
     assert [asset.url for asset in candidate.media_assets] == [
         "https://i.redd.it/one.png",
         "https://i.redd.it/two.jpg",
-        "https://i.redd.it/three.png",
+        "https://preview.redd.it/three.png?width=640",
     ]
     assert [asset.gallery_index for asset in candidate.media_assets] == [0, 1, 2]
+    assert [asset.source_metadata["url_selection"] for asset in candidate.media_assets] == [
+        "reddit_metadata_s_u",
+        "reddit_metadata_s_u",
+        "reddit_metadata_s_u",
+    ]
     assert candidate.media_assets[0].filename == "reddit-abc123-1.png"
     assert candidate.media_metadata["skipped_gallery_items"] == [
-        {"index": 3, "media_id": "missing", "reason": "gallery_item_unavailable"},
+        {"index": 3, "media_id": "missing", "reason": "gallery_item_metadata_missing"},
         {"index": 4, "media_id": "bad", "reason": "gallery_item_not_valid"},
     ]
     assert candidate.media_metadata["gallery_diagnostics"] == {
@@ -217,13 +222,14 @@ def test_gallery_resolves_real_reddit_category_and_mime(category, mime, expected
                     "status": "valid",
                     "e": category,
                     "m": mime,
-                    "s": {"u": "https://preview.redd.it/x?width=640"},
+                    "s": {"u": f"https://preview.redd.it/realid.{expected}?width=640"},
                 }
             },
         )
     )
     asset = candidate.media_assets[0]
-    assert asset.url == f"https://i.redd.it/realid.{expected}"
+    assert asset.url == f"https://preview.redd.it/realid.{expected}?width=640"
+    assert asset.source_metadata["url_selection"] == "reddit_metadata_s_u"
     assert asset.source_media_id == "realid"
     assert asset.source_metadata["caption"] == "caption"
 
@@ -279,9 +285,148 @@ def test_gallery_missing_id_and_mixed_order_and_preview_rejection() -> None:
     )
     assert [asset.source_media_id for asset in candidate.media_assets] == ["a", "b"]
     assert [asset.gallery_index for asset in candidate.media_assets] == [0, 2]
-    assert all(asset.url.startswith("https://i.redd.it/") for asset in candidate.media_assets)
+    assert [asset.url for asset in candidate.media_assets] == [
+        "https://preview.redd.it/a.png",
+        "https://preview.redd.it/b.jpg",
+    ]
+    assert all(
+        asset.source_metadata["url_selection"] == "reddit_metadata_s_u"
+        for asset in candidate.media_assets
+    )
     assert candidate.media_metadata["skipped_gallery_items"] == [
         {"index": 1, "reason": "gallery_item_missing_media_id"}
+    ]
+
+
+def test_gallery_missing_s_u_uses_explicit_fallback() -> None:
+    candidate = normalize_submission(
+        FakeSubmission(
+            is_gallery=True,
+            gallery_data={"items": [{"media_id": "fallback"}]},
+            media_metadata={
+                "fallback": {"status": "valid", "e": "Image", "m": "image/jpeg", "s": {}}
+            },
+        )
+    )
+
+    asset = candidate.media_assets[0]
+    assert asset.url == "https://i.redd.it/fallback.jpg"
+    assert asset.source_metadata["url_selection"] == "gallery_id_fallback"
+    assert asset.source_metadata["url_selection_reason"] == "metadata_s_u_missing"
+
+
+def test_gallery_decodes_html_escaped_query_without_changing_percent_encoding() -> None:
+    candidate = normalize_submission(
+        FakeSubmission(
+            is_gallery=True,
+            gallery_data={"items": [{"media_id": "encoded"}]},
+            media_metadata={
+                "encoded": {
+                    "status": "valid",
+                    "e": "Image",
+                    "m": "image/jpeg",
+                    "s": {"u": "https://preview.redd.it/a%2Fb.jpg?width=640&amp;s=abc%2Fdef"},
+                }
+            },
+        )
+    )
+
+    asset = candidate.media_assets[0]
+    assert asset.url == "https://preview.redd.it/a%2Fb.jpg?width=640&s=abc%2Fdef"
+    assert asset.source_metadata["url_selection"] == "reddit_metadata_s_u"
+
+
+def test_gallery_distinguishes_missing_malformed_and_invalid_entries() -> None:
+    candidate = normalize_submission(
+        FakeSubmission(
+            is_gallery=True,
+            gallery_data={
+                "items": [
+                    {"media_id": "missing"},
+                    {"media_id": "malformed"},
+                    {"media_id": "bad_url"},
+                    {},
+                    {"media_id": "malformed_s"},
+                ]
+            },
+            media_metadata={
+                "malformed": "not-an-object",
+                "bad_url": {
+                    "status": "valid",
+                    "e": "Image",
+                    "m": "image/png",
+                    "s": {"u": "javascript:alert(1)"},
+                },
+                "malformed_s": {
+                    "status": "valid",
+                    "e": "Image",
+                    "m": "image/png",
+                    "s": "not-an-object",
+                },
+            },
+        )
+    )
+
+    assert len(candidate.media_assets) == 2
+    asset = candidate.media_assets[0]
+    assert asset.url == "https://i.redd.it/bad_url.png"
+    assert asset.source_metadata["url_selection"] == "gallery_id_fallback"
+    assert asset.source_metadata["url_selection_reason"] == "metadata_s_u_invalid_url"
+    malformed_s_asset = candidate.media_assets[1]
+    assert malformed_s_asset.url == "https://i.redd.it/malformed_s.png"
+    assert malformed_s_asset.source_metadata["url_selection_reason"] == "metadata_s_malformed"
+    assert candidate.media_metadata["skipped_gallery_items"] == [
+        {"index": 0, "media_id": "missing", "reason": "gallery_item_metadata_missing"},
+        {"index": 1, "media_id": "malformed", "reason": "gallery_item_metadata_malformed"},
+        {"index": 3, "reason": "gallery_item_missing_media_id"},
+    ]
+
+
+def test_gallery_mixed_items_preserve_order_and_original_indexes() -> None:
+    candidate = normalize_submission(
+        FakeSubmission(
+            is_gallery=True,
+            gallery_data={
+                "items": [
+                    {"media_id": "first"},
+                    {"media_id": "missing"},
+                    {"media_id": "third"},
+                    {"media_id": "fourth"},
+                ]
+            },
+            media_metadata={
+                "first": {
+                    "status": "valid",
+                    "e": "Image",
+                    "m": "image/png",
+                    "s": {"u": "https://i.redd.it/first.png"},
+                },
+                "third": {"status": "valid", "e": "Image", "m": "image/jpeg"},
+                "fourth": {
+                    "status": "valid",
+                    "e": "Image",
+                    "m": "image/jpeg",
+                    "s": {"u": "https://preview.redd.it/fourth.jpg?width=800"},
+                },
+            },
+        )
+    )
+
+    assert [asset.url for asset in candidate.media_assets] == [
+        "https://i.redd.it/first.png",
+        "https://i.redd.it/third.jpg",
+        "https://preview.redd.it/fourth.jpg?width=800",
+    ]
+    assert [asset.source_metadata["url_selection"] for asset in candidate.media_assets] == [
+        "reddit_metadata_s_u",
+        "gallery_id_fallback",
+        "reddit_metadata_s_u",
+    ]
+    assert [asset.gallery_index for asset in candidate.media_assets] == [0, 2, 3]
+    assert [asset.filename for asset in candidate.media_assets] == [
+        "reddit-abc123-1.png",
+        "reddit-abc123-3.jpg",
+        "reddit-abc123-4.jpg",
     ]
 
 

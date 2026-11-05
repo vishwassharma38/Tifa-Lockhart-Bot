@@ -7,9 +7,10 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from html import unescape
 from pathlib import PurePosixPath
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import praw
 
@@ -30,6 +31,7 @@ _SUBMISSION_URL_PATTERN = re.compile(
 )
 _REDDIT_HOSTS = frozenset({"reddit.com", "www.reddit.com", "old.reddit.com", "redd.it"})
 _PREVIEW_HOSTS = frozenset({"preview.redd.it", "external-preview.redd.it"})
+_GALLERY_MEDIA_HOSTS = frozenset({"i.redd.it", "preview.redd.it"})
 _REDDIT_VIDEO_HOSTS = frozenset({"v.redd.it"})
 _GALLERY_MIME_EXTENSIONS = {
     "image/jpeg": "jpg",
@@ -80,7 +82,10 @@ def _http_url(value: Any) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     cleaned = value.strip()
-    parsed = urlparse(cleaned)
+    try:
+        parsed = urlparse(cleaned)
+    except ValueError:
+        return None
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
     return cleaned
@@ -123,33 +128,38 @@ def _direct_asset(submission: Any) -> tuple[MediaAsset | None, str | None]:
     )
 
 
-def _original_gallery_url(
+def _gallery_media_url(
     metadata: dict[str, Any],
     media_id: str,
     extension: str | None,
-) -> str | None:
+) -> tuple[str | None, str, str]:
     original = metadata.get("s")
-    if isinstance(original, dict):
-        url = _http_url(original.get("u"))
-        if url is not None and (urlparse(url).hostname or "").lower() == "i.redd.it":
-            return url
+    if original is None:
+        fallback_reason = "metadata_s_missing"
+    elif not isinstance(original, dict):
+        fallback_reason = "metadata_s_malformed"
+    else:
+        value = original.get("u")
+        if value is None or value == "":
+            fallback_reason = "metadata_s_u_missing"
+        elif not isinstance(value, str):
+            fallback_reason = "metadata_s_u_malformed"
+        else:
+            # Reddit URLs may be HTML-escaped by intermediate representations.
+            # Decode entities while preserving percent-encoded path/query data.
+            url = _http_url(unescape(value.strip()))
+            if url is None:
+                fallback_reason = "metadata_s_u_invalid_url"
+            elif (urlparse(url).hostname or "").lower() in _GALLERY_MEDIA_HOSTS:
+                return url, "reddit_metadata_s_u", "metadata_s_u_available"
+            else:
+                fallback_reason = "metadata_s_u_unsupported_host"
 
-    # Reddit gallery entries expose preview URLs in ``s`` but the original is
-    # addressable by media ID. Construct it instead of accepting a thumbnail.
+    # Preserve the legacy ID-based fallback when Reddit provides no usable s.u.
     if extension in _SUPPORTED_MEDIA_EXTENSIONS:
-        return f"https://i.redd.it/{media_id}.{extension}"
-    return None
-
-
-def _gallery_url_source(metadata: dict[str, Any]) -> str:
-    source = metadata.get("s")
-    original_url = source.get("u") if isinstance(source, dict) else None
-    if (
-        isinstance(original_url, str)
-        and (urlparse(original_url).hostname or "").lower() == "i.redd.it"
-    ):
-        return "reddit_original_s_u"
-    return "gallery_id_fallback"
+        encoded_id = quote(media_id, safe="")
+        return f"https://i.redd.it/{encoded_id}.{extension}", "gallery_id_fallback", fallback_reason
+    return None, "unavailable", "fallback_extension_unsupported"
 
 
 def _extract_gallery(
@@ -186,10 +196,15 @@ def _extract_gallery(
             continue
         media_id = media_id.strip()
 
-        metadata = media_metadata.get(media_id)
+        if media_id not in media_metadata:
+            skipped.append(
+                {"index": index, "media_id": media_id, "reason": "gallery_item_metadata_missing"}
+            )
+            continue
+        metadata = media_metadata[media_id]
         if not isinstance(metadata, dict):
             skipped.append(
-                {"index": index, "media_id": media_id, "reason": "gallery_item_unavailable"}
+                {"index": index, "media_id": media_id, "reason": "gallery_item_metadata_malformed"}
             )
             continue
         status = metadata.get("status")
@@ -241,7 +256,7 @@ def _extract_gallery(
                 }
             )
             continue
-        url = _original_gallery_url(metadata, media_id, extension)
+        url, url_selection, url_selection_reason = _gallery_media_url(metadata, media_id, extension)
         if url is None:
             skipped.append(
                 {
@@ -270,7 +285,8 @@ def _extract_gallery(
                 source_metadata={
                     "media_id": media_id,
                     "gallery_index": index,
-                    "url_selection": _gallery_url_source(metadata),
+                    "url_selection": url_selection,
+                    "url_selection_reason": url_selection_reason,
                     "declared_category": category,
                     "declared_mime_type": mime_type,
                     "caption": item.get("caption"),
