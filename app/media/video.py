@@ -14,6 +14,7 @@ from app.media.validation import (
     MAX_MEDIA_BYTES,
     detect_media_type,
     extension_from_url,
+    ftyp_signature_size,
 )
 
 log = logging.getLogger(__name__)
@@ -149,6 +150,9 @@ class VideoDownloader:
 
         with path.open("rb") as handle:
             signature = handle.read(64)
+            needed = ftyp_signature_size(signature)
+            if needed is not None and needed > len(signature):
+                signature += handle.read(needed - len(signature))
         media = detect_media_type(signature)
         if media is None or media.extension not in _VIDEO_EXTENSIONS:
             raise VideoDownloadError("Downloaded video is not a supported mp4 or webm file")

@@ -8,6 +8,9 @@ from pathlib import PurePosixPath
 from urllib.parse import unquote, urlparse
 
 MAX_MEDIA_BYTES = 10_000_000
+# The ftyp box is normally small. This bounds signature buffering for unusual
+# files with many compatible brands while still allowing complete parsing.
+MAX_FTYP_BOX_BYTES = 4096
 
 SUPPORTED_EXTENSIONS = frozenset({"jpg", "jpeg", "png", "webp", "gif", "mp4", "webm"})
 IMAGE_EXTENSIONS = frozenset({"jpg", "jpeg", "png", "webp"})
@@ -70,8 +73,8 @@ def media_info_for_mime_type(mime_type: str | None) -> MediaInfo | None:
     return _BY_MIME.get(base)
 
 
-def _ftyp_brands(header: bytes) -> frozenset[bytes] | None:
-    """Parse a complete leading ISO BMFF File Type Box, if present."""
+def ftyp_signature_size(header: bytes) -> int | None:
+    """Return a safe declared ftyp size to read, if a supported box is present."""
     if len(header) < 8 or header[4:8] != b"ftyp":
         return None
 
@@ -79,7 +82,7 @@ def _ftyp_brands(header: bytes) -> frozenset[bytes] | None:
     box_header_size = 8
     if box_size == 1:
         if len(header) < 16:
-            return None
+            return 16
         box_size = int.from_bytes(header[8:16], "big")
         box_header_size = 16
     elif box_size == 0:
@@ -89,10 +92,20 @@ def _ftyp_brands(header: bytes) -> frozenset[bytes] | None:
     brand_data_start = box_header_size + 8  # major_brand and minor_version
     if (
         box_size < brand_data_start
-        or box_size > len(header)
+        or box_size > MAX_FTYP_BOX_BYTES
         or (box_size - brand_data_start) % 4 != 0
     ):
         return None
+    return box_size
+
+
+def _ftyp_brands(header: bytes) -> frozenset[bytes] | None:
+    """Parse a complete leading ISO BMFF File Type Box, if present."""
+    box_size = ftyp_signature_size(header)
+    if box_size is None or box_size > len(header):
+        return None
+    box_header_size = 16 if int.from_bytes(header[:4], "big") == 1 else 8
+    brand_data_start = box_header_size + 8  # major_brand and minor_version
 
     brands = {header[box_header_size : box_header_size + 4]}
     brands.update(
@@ -102,8 +115,16 @@ def _ftyp_brands(header: bytes) -> frozenset[bytes] | None:
     return frozenset(brands)
 
 
-_AVIF_BRANDS = frozenset({b"avif", b"avis", b"avio"})
-_HEIF_BRANDS = frozenset({b"heic", b"heix", b"mif1", b"mif2", b"msf1", b"msf2"})
+_AVIF_BRANDS = frozenset({b"avif", b"avis", b"avio", b"MA1A", b"MA1B"})
+_HEIF_BRANDS = frozenset(
+    {
+        # Structural and codec-specific HEIF brands.
+        b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs",
+        b"mif1", b"mif2", b"msf1", b"msf2", b"avci", b"avcs", b"vvic", b"vvis",
+        b"jpeg", b"jpgs", b"evbi", b"evbs", b"evmi", b"evms", b"1pic", b"pred",
+        b"j2ki", b"j2is", b"jxsi", b"jxss",
+    }
+)
 
 
 def _iso_bmff_image_format(header: bytes) -> str | None:

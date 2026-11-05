@@ -15,9 +15,11 @@ from app.media.fetcher import (
     UnsupportedMediaError,
 )
 from app.media.validation import (
+    MAX_FTYP_BOX_BYTES,
     _iso_bmff_image_format,
     build_object_key,
     detect_media_type,
+    ftyp_signature_size,
     sanitize_filename,
 )
 
@@ -124,7 +126,7 @@ def _ftyp(major_brand: bytes, *compatible_brands: bytes) -> bytes:
     )
 
 
-@pytest.mark.parametrize("brand", [b"avif", b"avis", b"avio"])
+@pytest.mark.parametrize("brand", [b"avif", b"avis", b"avio", b"MA1A", b"MA1B"])
 def test_iso_bmff_avif_major_brands_are_recognized_as_unsupported(brand: bytes) -> None:
     header = _ftyp(brand, b"mif1")
 
@@ -132,7 +134,7 @@ def test_iso_bmff_avif_major_brands_are_recognized_as_unsupported(brand: bytes) 
     assert detect_media_type(header) is None
 
 
-@pytest.mark.parametrize("brand", [b"avif", b"avis", b"avio"])
+@pytest.mark.parametrize("brand", [b"avif", b"avis", b"avio", b"MA1A", b"MA1B"])
 def test_iso_bmff_avif_compatible_brands_are_recognized(brand: bytes) -> None:
     header = _ftyp(b"mif1", brand)
 
@@ -141,7 +143,14 @@ def test_iso_bmff_avif_compatible_brands_are_recognized(brand: bytes) -> None:
 
 
 @pytest.mark.parametrize(
-    "brand", [b"heic", b"heix", b"mif1", b"mif2", b"msf1", b"msf2"]
+    "brand",
+    [
+        b"heic", b"heix", b"mif1", b"mif2", b"msf1", b"msf2",
+        b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs",
+        b"vvic", b"vvis", b"jpeg", b"avci", b"avcs",
+        b"1pic", b"evbi", b"evbs", b"evmi", b"evms", b"jpgs", b"pred",
+        b"j2ki", b"j2is", b"jxsi", b"jxss",
+    ],
 )
 def test_iso_bmff_heif_major_brands_are_recognized_as_unsupported(brand: bytes) -> None:
     header = _ftyp(brand)
@@ -151,7 +160,14 @@ def test_iso_bmff_heif_major_brands_are_recognized_as_unsupported(brand: bytes) 
 
 
 @pytest.mark.parametrize(
-    "brand", [b"heic", b"heix", b"mif1", b"mif2", b"msf1", b"msf2"]
+    "brand",
+    [
+        b"heic", b"heix", b"mif1", b"mif2", b"msf1", b"msf2",
+        b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs",
+        b"vvic", b"vvis", b"jpeg", b"avci", b"avcs",
+        b"1pic", b"evbi", b"evbs", b"evmi", b"evms", b"jpgs", b"pred",
+        b"j2ki", b"j2is", b"jxsi", b"jxss",
+    ],
 )
 def test_iso_bmff_heif_compatible_brands_are_recognized(brand: bytes) -> None:
     header = _ftyp(b"isom", brand)
@@ -174,8 +190,59 @@ def test_iso_bmff_extended_size_ftyp_is_parsed() -> None:
     assert detect_media_type(header).extension == "mp4"
 
 
+def test_iso_bmff_large_ftyp_boxes_are_parsed_with_bounded_sizes() -> None:
+    compatible_brands = [b"xxxx"] * 20 + [b"avif"]
+    standard_header = _ftyp(b"isom", *compatible_brands)
+    assert len(standard_header) > 64
+    assert ftyp_signature_size(standard_header[:64]) == len(standard_header)
+    assert _iso_bmff_image_format(standard_header) == "avif"
+
+    extended_size = 24 + 4 * 20
+    extended_header = (
+        struct.pack(">I4sQ4sI", 1, b"ftyp", extended_size, b"isom", 0)
+        + b"".join([b"xxxx"] * 19 + [b"hevc"])
+    )
+    assert ftyp_signature_size(extended_header[:64]) == extended_size
+    assert _iso_bmff_image_format(extended_header) == "heif"
+
+
+def test_iso_bmff_ftyp_read_size_is_bounded_at_configured_limit() -> None:
+    compatible_brands = [b"xxxx"] * ((MAX_FTYP_BOX_BYTES - 16) // 4 - 1) + [b"MA1A"]
+    at_limit = _ftyp(b"isom", *compatible_brands)
+    assert len(at_limit) == MAX_FTYP_BOX_BYTES
+    assert ftyp_signature_size(at_limit[:64]) == MAX_FTYP_BOX_BYTES
+    assert _iso_bmff_image_format(at_limit) == "avif"
+
+    above_limit = struct.pack(
+        ">I4s4sI", MAX_FTYP_BOX_BYTES + 4, b"ftyp", b"isom", 0
+    ) + b"xxxx" * ((MAX_FTYP_BOX_BYTES - 16) // 4)
+    assert ftyp_signature_size(above_limit[:64]) is None
+    assert _iso_bmff_image_format(above_limit) is None
+    assert detect_media_type(above_limit) is None
+
+
+def test_iso_bmff_truncated_and_invalid_extended_sizes_do_not_request_more() -> None:
+    truncated_extended_header = b"\x00\x00\x00\x01ftyp" + b"\x00" * 6
+    assert ftyp_signature_size(truncated_extended_header) == 16
+    assert _iso_bmff_image_format(truncated_extended_header) is None
+
+    invalid_sizes = [
+        struct.pack(">I4sQ4sI", 1, b"ftyp", 20, b"isom", 0),
+        struct.pack(">I4sQ4sI", 1, b"ftyp", MAX_FTYP_BOX_BYTES + 1, b"isom", 0),
+        struct.pack(">I4sQ4sI", 1, b"ftyp", MAX_FTYP_BOX_BYTES + 4, b"isom", 0),
+    ]
+    assert all(ftyp_signature_size(header) is None for header in invalid_sizes)
+
+
 def test_iso_bmff_brand_matching_does_not_search_unrelated_bytes() -> None:
     header = _ftyp(b"isom", b"xxxx") + b"avifheicmif1"
+
+    assert _iso_bmff_image_format(header) is None
+    assert detect_media_type(header) == detect_media_type(MP4_BYTES)
+
+
+def test_iso_bmff_unknown_brands_remain_mp4() -> None:
+    header = _ftyp(b"isom", b"mp41", b"xxxx")
 
     assert _iso_bmff_image_format(header) is None
     assert detect_media_type(header) == detect_media_type(MP4_BYTES)
@@ -234,6 +301,19 @@ async def test_download_streams_bytes_computes_sha_and_validates(tmp_path: Path)
     assert session.calls[0][1]["max_redirects"] == 5
     assert session.responses[0].closed
     assert session.responses[0].enter_count == 1
+
+
+async def test_download_reads_large_ftyp_before_classifying(tmp_path: Path) -> None:
+    data = _ftyp(b"isom", *([b"xxxx"] * 20), b"avif") + b"image-data"
+    session = FakeSession(FakeResponse([data]))
+    fetcher = MediaFetcher(session=session)
+
+    with pytest.raises(UnsupportedMediaError):
+        await fetcher.download(
+            "https://i.redd.it/example.mp4",
+            destination_dir=tmp_path,
+            max_bytes=10_000,
+        )
 
 
 async def test_404_is_permanent_and_not_retried(tmp_path: Path) -> None:

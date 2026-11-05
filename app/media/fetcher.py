@@ -23,6 +23,7 @@ from app.media.validation import (
     MediaInfo,
     detect_media_type,
     extension_from_url,
+    ftyp_signature_size,
     media_info_for_mime_type,
 )
 
@@ -339,9 +340,16 @@ class MediaFetcher:
                                         raise OversizeMediaError(
                                             "Media exceeds the configured size limit"
                                         )
-                                    if len(signature) < _MAX_SIGNATURE_BYTES:
+                                    signature_start = len(signature)
+                                    if signature_start < _MAX_SIGNATURE_BYTES:
                                         signature.extend(
-                                            chunk[: _MAX_SIGNATURE_BYTES - len(signature)]
+                                            chunk[: _MAX_SIGNATURE_BYTES - signature_start]
+                                        )
+                                    needed = ftyp_signature_size(bytes(signature))
+                                    if needed is not None and len(signature) < needed:
+                                        chunk_offset = max(0, _MAX_SIGNATURE_BYTES - signature_start)
+                                        signature.extend(
+                                            chunk[chunk_offset : chunk_offset + needed - len(signature)]
                                         )
                                     hasher.update(chunk)
                                     handle.write(chunk)

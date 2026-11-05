@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import struct
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,27 @@ async def test_downloader_returns_validated_mp4(tmp_path) -> None:
     assert options["noplaylist"] is True
     assert options["merge_output_format"] == "mp4"
     assert "acodec!=none" in str(options["format"])
+
+
+async def test_downloader_reads_large_ftyp_box_before_validation(tmp_path) -> None:
+    compatible_brands = b"mp42" * 20
+    box_size = 24 + len(compatible_brands)
+    data = (
+        struct.pack(">I4sQ4sI", 1, b"ftyp", box_size, b"isom", 0)
+        + compatible_brands
+        + b"video-data"
+    )
+    module = FakeYtDlpModule(data)
+    downloader = VideoDownloader(yt_dlp_module=module)
+
+    media = await downloader.download(
+        "https://v.redd.it/abc123/CMAF_720.mp4",
+        destination_dir=tmp_path,
+        max_bytes=2048,
+    )
+
+    assert media.media.extension == "mp4"
+    assert media.path.read_bytes() == data
 
 
 async def test_downloader_rejects_oversized_output(tmp_path) -> None:
