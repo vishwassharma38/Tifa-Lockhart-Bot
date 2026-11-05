@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
-from urllib.parse import urlparse
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -14,10 +14,12 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from app.config import Settings
 from app.media.fetcher import (
     DownloadedMedia,
+    MediaDownloadError,
     MediaFetcher,
     OversizeMediaError,
     UnsupportedMediaError,
@@ -138,10 +140,16 @@ class Phase2Pipeline:
         return results
 
     async def process_candidate(
-        self, candidate: RedditCandidate, *, publish: bool = True
+        self,
+        candidate: RedditCandidate,
+        *,
+        publish: bool = True,
+        collection_run_id: str | None = None,
     ) -> list[Phase2Result]:
         """Process an already normalized submission through the shared asset pipeline."""
-        _candidate, results = await self._process_candidate(candidate, publish=publish)
+        _candidate, results = await self._process_candidate(
+            candidate, publish=publish, collection_run_id=collection_run_id
+        )
         return results
 
     async def _execute(
@@ -166,7 +174,11 @@ class Phase2Pipeline:
         return await self._process_candidate(candidate, publish=True)
 
     async def _process_candidate(
-        self, candidate: RedditCandidate, *, publish: bool
+        self,
+        candidate: RedditCandidate,
+        *,
+        publish: bool,
+        collection_run_id: str | None = None,
     ) -> tuple[RedditCandidate, list[Phase2Result]]:
         assets = candidate.assets
         if not assets:
@@ -188,7 +200,7 @@ class Phase2Pipeline:
         try:
             results: list[Phase2Result] = []
             seen_assets: set[str] = set()
-            for asset in assets:
+            for asset_index, asset in enumerate(assets):
                 if asset.asset_key in seen_assets:
                     results.append(
                         Phase2Result(
@@ -201,7 +213,16 @@ class Phase2Pipeline:
                     continue
                 seen_assets.add(asset.asset_key)
                 results.append(
-                    await self._process_asset(candidate, asset, temp_dir, publish=publish)
+                    await self._process_asset(
+                        candidate,
+                        asset,
+                        temp_dir,
+                        publish=publish,
+                        collection_run_id=collection_run_id,
+                        asset_index=asset.gallery_index
+                        if asset.gallery_index is not None
+                        else asset_index,
+                    )
                 )
             return candidate, results
         finally:
@@ -214,8 +235,16 @@ class Phase2Pipeline:
         temp_dir: Path,
         *,
         publish: bool = True,
+        collection_run_id: str | None = None,
+        asset_index: int = 0,
     ) -> Phase2Result:
-        downloaded = await self._download(asset, temp_dir)
+        downloaded = await self._download(
+            candidate,
+            asset,
+            temp_dir,
+            collection_run_id=collection_run_id,
+            asset_index=asset_index,
+        )
         if isinstance(downloaded, Phase2Result):
             return downloaded
 
@@ -351,9 +380,24 @@ class Phase2Pipeline:
 
     async def _download(
         self,
+        candidate: RedditCandidate,
         asset: MediaAsset,
         temp_dir: Path,
+        *,
+        collection_run_id: str | None = None,
+        asset_index: int = 0,
     ) -> DownloadedMedia | Phase2Result:
+        safe_asset_id = (
+            asset.source_media_id
+            or hashlib.sha256(asset.asset_key.encode("utf-8", errors="replace")).hexdigest()[:12]
+        )
+        safe_path = urlparse(asset.url)
+        url_fingerprint = hashlib.sha256(
+            f"{safe_path.hostname or ''}{safe_path.path or '/'}".encode("utf-8", errors="replace")
+        ).hexdigest()[:12]
+        url_selection = asset.source_metadata.get("url_selection") or asset.source_metadata.get(
+            "extraction", "unknown"
+        )
         if asset.requires_video_download:
             try:
                 return await self._video_downloader.download(
@@ -389,10 +433,21 @@ class Phase2Pipeline:
                 )
 
         try:
-            return await self._fetcher.download(
+            download = self._fetcher.download
+            context = {
+                "submission_id": candidate.submission_id,
+                "asset_id": safe_asset_id,
+                "asset_index": asset_index,
+                "run_id": collection_run_id,
+            }
+            context = {
+                key: value for key, value in context.items() if _accepts_keyword(download, key)
+            }
+            return await download(
                 asset.url,
                 destination_dir=temp_dir,
                 max_bytes=self._max_media_bytes,
+                **context,
             )
         except OversizeMediaError:
             return Phase2Result(
@@ -406,18 +461,62 @@ class Phase2Pipeline:
                 "unsupported_media",
                 details={"asset_url": asset.url},
             )
-        except Exception as exc:
+        except MediaDownloadError as exc:
             host = urlparse(asset.url).hostname or "invalid"
             log.warning(
-                "Media download failed submission_id=%s asset_index=%s host=%s failure_category=%s exception_type=%s error=%s",
-                getattr(self, "_current_submission_id", "unknown"), asset.gallery_index,
-                host, getattr(exc, "category", "download_error"), type(exc).__name__,
+                "Media download failed run_id=%s submission_id=%s asset_id=%s asset_index=%s host=%s url_fingerprint=%s url_selection=%s failure_category=%s status=%s exception_type=%s error=%s retry=false final=true",
+                collection_run_id or "unknown",
+                candidate.submission_id,
+                safe_asset_id,
+                asset_index,
+                host,
+                url_fingerprint,
+                url_selection,
+                exc.category,
+                exc.status_code,
+                type(exc.original_exception or exc).__name__,
                 str(exc)[:180],
             )
             return Phase2Result(
                 Phase2Status.FAILED,
                 "media_download_failed",
-                details={"asset_url": asset.url},
+                submission_id=candidate.submission_id,
+                details={
+                    "asset_id": safe_asset_id,
+                    "asset_index": asset_index,
+                    "host": host,
+                    "url_selection": url_selection,
+                    "failure_category": exc.category,
+                    "status_code": exc.status_code,
+                    "exception_type": type(exc.original_exception or exc).__name__,
+                },
+            )
+        except Exception as exc:
+            host = urlparse(asset.url).hostname or "invalid"
+            log.warning(
+                "Media download failed run_id=%s submission_id=%s asset_id=%s asset_index=%s host=%s url_fingerprint=%s url_selection=%s failure_category=download_error exception_type=%s error=%s retry=false final=true",
+                collection_run_id or "unknown",
+                candidate.submission_id,
+                safe_asset_id,
+                asset_index,
+                host,
+                url_fingerprint,
+                url_selection,
+                type(exc).__name__,
+                str(exc)[:180],
+            )
+            return Phase2Result(
+                Phase2Status.FAILED,
+                "media_download_failed",
+                submission_id=candidate.submission_id,
+                details={
+                    "asset_id": safe_asset_id,
+                    "asset_index": asset_index,
+                    "host": host,
+                    "url_selection": url_selection,
+                    "failure_category": "download_error",
+                    "exception_type": type(exc).__name__,
+                },
             )
 
     async def _store_object(self, downloaded: DownloadedMedia, object_key: str) -> None:

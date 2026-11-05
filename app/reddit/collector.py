@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+from collections import Counter
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -16,6 +18,16 @@ from app.reddit.connector import (
 from app.reddit.models import RedditCandidate
 
 log = logging.getLogger(__name__)
+
+
+def _accepts_keyword(function: Any, name: str) -> bool:
+    try:
+        parameters = inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 class RedditCollector:
@@ -52,6 +64,12 @@ class RedditCollector:
         return None
 
     async def run(self, *, scheduled: bool = True) -> dict[str, int]:
+        """Collect up to the configured unique submissions and return operational counts.
+
+        Discovery, examined, and processed are submission-level counters. Stored,
+        skipped, and media failures are asset-level (duplicates are separate); retries
+        are attempts and never increment a result counter.
+        """
         if self._lock.locked():
             return {
                 "discovered_count": 0,
@@ -86,7 +104,7 @@ class RedditCollector:
                     "blocked_reason": reason,
                 }
             )
-            errors: list[str] = []
+            errors: Counter[str] = Counter()
             if reason:
                 await self.repository.finish_job_run(job_id, counters, "skipped", reason)
                 log.warning("Reddit collection blocked: %s", reason)
@@ -100,7 +118,7 @@ class RedditCollector:
                     try:
                         submissions = await self.connector.search(phrase, limit=remaining)
                     except Exception as exc:
-                        errors.append(f"query_failed:{type(exc).__name__}")
+                        errors[f"query_failed:{type(exc).__name__}"] += 1
                         log.warning("Reddit query failed (%s)", type(exc).__name__)
                         continue
                     for submission in submissions:
@@ -114,6 +132,7 @@ class RedditCollector:
                         )
                         if not sid:
                             counters["failed_count"] += 1
+                            errors["submission_id_missing"] += 1
                             continue
                         if sid in seen:
                             counters["duplicate_count"] += 1
@@ -143,9 +162,13 @@ class RedditCollector:
                             if any(asset.requires_video_download for asset in candidate.assets):
                                 counters["skipped_count"] += len(candidate.assets)
                                 continue
-                            results = await self.pipeline.process_candidate(
-                                candidate, publish=False
+                            process = self.pipeline.process_candidate
+                            kwargs = (
+                                {"collection_run_id": job_id}
+                                if _accepts_keyword(process, "collection_run_id")
+                                else {}
                             )
+                            results = await process(candidate, publish=False, **kwargs)
                             for result in results:
                                 if result.status.value == "archived":
                                     counters["stored_count"] += 1
@@ -153,19 +176,31 @@ class RedditCollector:
                                     counters["skipped_count"] += 1
                                 elif result.status.value in {"failed", "recoverable"}:
                                     counters["failed_count"] += 1
+                                    category = (
+                                        result.details.get("failure_category") or result.reason
+                                    )
+                                    errors[str(category)[:80]] += 1
                         except Exception as exc:
                             counters["failed_count"] += 1
-                            errors.append(f"candidate_failed:{type(exc).__name__}")
+                            errors[f"candidate_failed:{type(exc).__name__}"] += 1
                 outcome = (
                     "failed"
-                    if errors and counters["processed_count"] == 0
+                    if errors
+                    and (
+                        counters["processed_count"] == 0
+                        or (counters["stored_count"] == 0 and counters["failed_count"] > 0)
+                    )
                     else "partial"
                     if errors or counters["failed_count"]
                     else "succeeded"
                 )
-                await self.repository.finish_job_run(
-                    job_id, counters, outcome, "; ".join(errors)[:500] or None
+                error_summary = (
+                    "; ".join(f"{category}: {count}" for category, count in sorted(errors.items()))[
+                        :500
+                    ]
+                    or None
                 )
+                await self.repository.finish_job_run(job_id, counters, outcome, error_summary)
                 if outcome == "succeeded":
                     await self.repository.mark_reddit_success()
             except Exception as exc:

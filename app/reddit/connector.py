@@ -141,6 +141,17 @@ def _original_gallery_url(
     return None
 
 
+def _gallery_url_source(metadata: dict[str, Any]) -> str:
+    source = metadata.get("s")
+    original_url = source.get("u") if isinstance(source, dict) else None
+    if (
+        isinstance(original_url, str)
+        and (urlparse(original_url).hostname or "").lower() == "i.redd.it"
+    ):
+        return "reddit_original_s_u"
+    return "gallery_id_fallback"
+
+
 def _extract_gallery(
     submission: Any,
     submission_id: str,
@@ -259,6 +270,7 @@ def _extract_gallery(
                 source_metadata={
                     "media_id": media_id,
                     "gallery_index": index,
+                    "url_selection": _gallery_url_source(metadata),
                     "declared_category": category,
                     "declared_mime_type": mime_type,
                     "caption": item.get("caption"),

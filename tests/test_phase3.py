@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -405,6 +407,54 @@ async def test_one_gallery_failure_does_not_block_other_assets(make_settings, tm
     assert aggregate.details["asset_count"] == 3
     assert aggregate.details["duplicate_count"] == 2
     assert aggregate.details["failed_count"] == 1
+
+
+async def test_concurrent_candidate_downloads_keep_submission_context(
+    make_settings, tmp_path
+) -> None:
+    class ContextFetcher:
+        def __init__(self):
+            self.contexts = []
+
+        async def download(
+            self, url, *, destination_dir, max_bytes, submission_id, asset_id, asset_index, run_id
+        ):
+            del destination_dir, max_bytes, url
+            await asyncio.sleep(0)
+            self.contexts.append((submission_id, asset_id, asset_index, run_id))
+            raise MediaDownloadError("HTTP 404", category="http_error", status_code=404)
+
+    fetcher = ContextFetcher()
+    assets = (MediaAsset(url="https://i.redd.it/one.png", source_media_id="image-id"),)
+    candidates = [
+        replace(make_candidate(assets), submission_id=submission_id)
+        for submission_id in ("post-one", "post-two")
+    ]
+    pipelines = [
+        build_pipeline(
+            make_settings,
+            tmp_path / submission_id,
+            candidate=candidate,
+            fetcher=fetcher,
+            repository=FakeRepository(),
+            storage=FakeStorage(),
+            publisher=FakePublisher(),
+        )
+        for submission_id, candidate in zip(("post-one", "post-two"), candidates, strict=True)
+    ]
+
+    results = await asyncio.gather(
+        *(
+            pipeline.process_candidate(candidate, publish=False, collection_run_id=f"run-{index}")
+            for index, (pipeline, candidate) in enumerate(zip(pipelines, candidates, strict=True))
+        )
+    )
+
+    assert [result[0].submission_id for result in results] == ["post-one", "post-two"]
+    assert set(fetcher.contexts) == {
+        ("post-one", "image-id", 0, "run-0"),
+        ("post-two", "image-id", 0, "run-1"),
+    }
 
 
 async def test_duplicate_keeps_per_asset_source_and_review_signal(make_settings, tmp_path) -> None:

@@ -41,7 +41,7 @@ class Connector:
 
 
 class Pipeline:
-    async def process_candidate(self, candidate, *, publish):
+    async def process_candidate(self, candidate, *, publish, collection_run_id=None):
         assert publish is False
         return []
 
@@ -123,3 +123,46 @@ async def test_unattended_collection_skips_yt_dlp_video_path(make_settings):
     assert counters["processed_count"] == 1
     assert counters["skipped_count"] == 1
     assert repo.discoveries[0].submission_id == "video1"
+
+
+async def test_asset_failures_populate_bounded_error_summary(make_settings):
+    candidate = RedditCandidate(
+        submission_id="post1",
+        permalink="https://www.reddit.com/r/x/comments/post1/title",
+        source_url="https://www.reddit.com/r/x/comments/post1/title",
+        title="image",
+        body=None,
+        subreddit="x",
+        author_name=None,
+        author_profile_url=None,
+        created_at=datetime.now(UTC),
+        media_url="https://i.redd.it/missing.png",
+        media_assets=(MediaAsset(url="https://i.redd.it/missing.png", source_media_id="asset1"),),
+    )
+
+    class FailedPipeline:
+        async def process_candidate(self, candidate, *, publish, collection_run_id=None):
+            assert collection_run_id == "job"
+            return [
+                SimpleNamespace(
+                    status=SimpleNamespace(value="failed"),
+                    reason="media_download_failed",
+                    details={"failure_category": "http_error"},
+                )
+            ]
+
+    repo = Repo()
+    collector = RedditCollector(
+        settings(make_settings),
+        repo,
+        FailedPipeline(),
+        Connector({"Tifa Lockhart": [candidate]}),
+    )
+
+    counters = await collector.run()
+
+    assert counters["processed_count"] == 1
+    assert counters["failed_count"] == 1
+    assert counters["stored_count"] == 0
+    assert repo.finished[0][2] == "failed"
+    assert repo.finished[0][3] == "http_error: 1"
