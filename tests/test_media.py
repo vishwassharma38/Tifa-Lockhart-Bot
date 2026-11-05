@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import struct
 from pathlib import Path
 
 import aiohttp
@@ -14,6 +15,7 @@ from app.media.fetcher import (
     UnsupportedMediaError,
 )
 from app.media.validation import (
+    _iso_bmff_image_format,
     build_object_key,
     detect_media_type,
     sanitize_filename,
@@ -23,7 +25,7 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"phase-two-media"
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"phase-two-media"
 WEBP_BYTES = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBPVP8 " + b"media"
 GIF_BYTES = b"GIF89a" + b"media"
-MP4_BYTES = b"\x00\x00\x00\x18ftypisom" + b"media"
+MP4_BYTES = struct.pack(">I4s4sI4s", 20, b"ftyp", b"isom", 512, b"mp41") + b"media"
 WEBM_BYTES = b"\x1a\x45\xdf\xa3" + b"media"
 
 
@@ -112,6 +114,89 @@ def test_detect_supported_media_signatures(header, extension, mime_type, media_t
 
 def test_detect_rejects_unknown_content() -> None:
     assert detect_media_type(b"<html>not media</html>") is None
+
+
+def _ftyp(major_brand: bytes, *compatible_brands: bytes) -> bytes:
+    assert all(len(brand) == 4 for brand in (major_brand, *compatible_brands))
+    size = 16 + 4 * len(compatible_brands)
+    return struct.pack(">I4s4sI", size, b"ftyp", major_brand, 0) + b"".join(
+        compatible_brands
+    )
+
+
+@pytest.mark.parametrize("brand", [b"avif", b"avis", b"avio"])
+def test_iso_bmff_avif_major_brands_are_recognized_as_unsupported(brand: bytes) -> None:
+    header = _ftyp(brand, b"mif1")
+
+    assert _iso_bmff_image_format(header) == "avif"
+    assert detect_media_type(header) is None
+
+
+@pytest.mark.parametrize("brand", [b"avif", b"avis", b"avio"])
+def test_iso_bmff_avif_compatible_brands_are_recognized(brand: bytes) -> None:
+    header = _ftyp(b"mif1", brand)
+
+    assert _iso_bmff_image_format(header) == "avif"
+    assert detect_media_type(header) is None
+
+
+@pytest.mark.parametrize(
+    "brand", [b"heic", b"heix", b"mif1", b"mif2", b"msf1", b"msf2"]
+)
+def test_iso_bmff_heif_major_brands_are_recognized_as_unsupported(brand: bytes) -> None:
+    header = _ftyp(brand)
+
+    assert _iso_bmff_image_format(header) == "heif"
+    assert detect_media_type(header) is None
+
+
+@pytest.mark.parametrize(
+    "brand", [b"heic", b"heix", b"mif1", b"mif2", b"msf1", b"msf2"]
+)
+def test_iso_bmff_heif_compatible_brands_are_recognized(brand: bytes) -> None:
+    header = _ftyp(b"isom", brand)
+
+    assert _iso_bmff_image_format(header) == "heif"
+    assert detect_media_type(header) is None
+
+
+def test_iso_bmff_avif_brand_takes_precedence_over_structural_heif_brand() -> None:
+    header = _ftyp(b"mif1", b"avif")
+
+    assert _iso_bmff_image_format(header) == "avif"
+    assert detect_media_type(header) is None
+
+
+def test_iso_bmff_extended_size_ftyp_is_parsed() -> None:
+    header = struct.pack(">I4sQ4sI4s", 1, b"ftyp", 28, b"isom", 0, b"mp41")
+
+    assert detect_media_type(header) is not None
+    assert detect_media_type(header).extension == "mp4"
+
+
+def test_iso_bmff_brand_matching_does_not_search_unrelated_bytes() -> None:
+    header = _ftyp(b"isom", b"xxxx") + b"avifheicmif1"
+
+    assert _iso_bmff_image_format(header) is None
+    assert detect_media_type(header) == detect_media_type(MP4_BYTES)
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        b"\x00\x00\x00\x14moov" + b"avif" * 3,  # no leading ftyp box
+        struct.pack(">I4s4sI", 15, b"ftyp", b"avif", 0),  # undersized box
+        struct.pack(">I4s", 16, b"ftyp") + b"avi",  # truncated major brand
+        struct.pack(">I4s4sI", 21, b"ftyp", b"isom", 0) + b"avi!!",  # partial brand entry
+        struct.pack(">I4s4sI", 24, b"ftyp", b"isom", 0),  # declared size exceeds input
+        b"\x00\x00\x00\x00ftyp" + b"avif" * 4,  # box extends to unknown EOF
+        b"\x00\x00\x00\x01ftyp\x00\x00\x00\x00\x00\x00\x00\x10",  # truncated largesize
+        b"ftyp",  # insufficient input
+    ],
+)
+def test_malformed_ftyp_boxes_are_rejected_safely(header: bytes) -> None:
+    assert _iso_bmff_image_format(header) is None
+    assert detect_media_type(header) is None
 
 
 def test_object_key_is_content_addressed() -> None:

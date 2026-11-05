@@ -11,7 +11,7 @@ from app.media.video import (
     VideoDownloadError,
 )
 
-MP4_BYTES = b"\x00\x00\x00\x18ftypmp42" + b"video-data"
+MP4_BYTES = b"\x00\x00\x00\x14ftypmp42\x00\x00\x00\x00isom" + b"video-data"
 
 
 class FakeYoutubeDL:

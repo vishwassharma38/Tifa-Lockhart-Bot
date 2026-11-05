@@ -70,6 +70,54 @@ def media_info_for_mime_type(mime_type: str | None) -> MediaInfo | None:
     return _BY_MIME.get(base)
 
 
+def _ftyp_brands(header: bytes) -> frozenset[bytes] | None:
+    """Parse a complete leading ISO BMFF File Type Box, if present."""
+    if len(header) < 8 or header[4:8] != b"ftyp":
+        return None
+
+    box_size = int.from_bytes(header[:4], "big")
+    box_header_size = 8
+    if box_size == 1:
+        if len(header) < 16:
+            return None
+        box_size = int.from_bytes(header[8:16], "big")
+        box_header_size = 16
+    elif box_size == 0:
+        # A box extending to EOF cannot be validated from a signature prefix.
+        return None
+
+    brand_data_start = box_header_size + 8  # major_brand and minor_version
+    if (
+        box_size < brand_data_start
+        or box_size > len(header)
+        or (box_size - brand_data_start) % 4 != 0
+    ):
+        return None
+
+    brands = {header[box_header_size : box_header_size + 4]}
+    brands.update(
+        header[offset : offset + 4]
+        for offset in range(brand_data_start, box_size, 4)
+    )
+    return frozenset(brands)
+
+
+_AVIF_BRANDS = frozenset({b"avif", b"avis", b"avio"})
+_HEIF_BRANDS = frozenset({b"heic", b"heix", b"mif1", b"mif2", b"msf1", b"msf2"})
+
+
+def _iso_bmff_image_format(header: bytes) -> str | None:
+    """Identify AVIF or HEIF brands, preferring codec-specific AVIF brands."""
+    brands = _ftyp_brands(header)
+    if brands is None:
+        return None
+    if brands & _AVIF_BRANDS:
+        return "avif"
+    if brands & _HEIF_BRANDS:
+        return "heif"
+    return None
+
+
 def detect_media_type(header: bytes) -> MediaInfo | None:
     """Detect a supported media format from the leading bytes of a file.
 
@@ -87,10 +135,9 @@ def detect_media_type(header: bytes) -> MediaInfo | None:
         return _BY_EXTENSION["gif"]
     if len(header) >= 12 and header[0:4] == b"RIFF" and header[8:12] == b"WEBP":
         return _BY_EXTENSION["webp"]
-    if len(header) >= 12 and header[4:8] == b"ftyp":
-        # AVIF/HEIF also use ISO BMFF's ftyp box; they are not supported media.
-        brands = header[8:64]
-        if any(brand in brands for brand in (b"avif", b"avis", b"heic", b"heix", b"mif1")):
+    if header[4:8] == b"ftyp":
+        brands = _ftyp_brands(header)
+        if brands is None or brands & (_AVIF_BRANDS | _HEIF_BRANDS):
             return None
         return _BY_EXTENSION["mp4"]
     if header.startswith(b"\x1a\x45\xdf\xa3"):

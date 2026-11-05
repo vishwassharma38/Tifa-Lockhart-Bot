@@ -508,7 +508,7 @@ async def test_duplicate_keeps_per_asset_source_and_review_signal(make_settings,
 async def test_video_asset_uses_video_downloader_and_probe_metadata(
     make_settings, tmp_path
 ) -> None:
-    data = b"\x00\x00\x00\x18ftypmp42" + b"video-payload"
+    data = b"\x00\x00\x00\x14ftypmp42\x00\x00\x00\x00isom" + b"video-payload"
     asset = MediaAsset(
         url="https://v.redd.it/abc123/CMAF_720.mp4?source=fallback",
         source_media_id="https://v.redd.it/abc123/DASHPlaylist.mpd",
