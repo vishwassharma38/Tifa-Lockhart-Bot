@@ -346,6 +346,67 @@ async def test_content_must_match_url_extension(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+async def test_reddit_auto_webp_preview_uses_detected_format(tmp_path: Path) -> None:
+    session = FakeSession(FakeResponse([WEBP_BYTES], headers={"Content-Type": "image/webp"}))
+    fetcher = MediaFetcher(session=session)
+
+    result = await fetcher.download(
+        "https://preview.redd.it/example.jpg?width=640&auto=webp&s=test",
+        destination_dir=tmp_path,
+    )
+
+    assert result.media.extension == "webp"
+    assert result.path.suffix == ".webp"
+    assert result.sha256 == hashlib.sha256(WEBP_BYTES).hexdigest()
+    assert result.path.read_bytes() == WEBP_BYTES
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/example.jpg?auto=webp",
+        "https://preview.redd.it/example.jpg?width=640",
+        "https://preview.redd.it/example.jpg?width=640&auto=png",
+    ],
+)
+async def test_format_mismatch_without_reddit_webp_negotiation_is_rejected(url, tmp_path: Path) -> None:
+    session = FakeSession(FakeResponse([WEBP_BYTES], headers={"Content-Type": "image/webp"}))
+    fetcher = MediaFetcher(session=session)
+
+    with pytest.raises(UnsupportedMediaError):
+        await fetcher.download(url, destination_dir=tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_reddit_negotiated_format_still_checks_content_type(tmp_path: Path) -> None:
+    session = FakeSession(FakeResponse([WEBP_BYTES], headers={"Content-Type": "image/jpeg"}))
+    fetcher = MediaFetcher(session=session)
+
+    with pytest.raises(UnsupportedMediaError):
+        await fetcher.download(
+            "https://preview.redd.it/example.jpg?width=640&auto=webp",
+            destination_dir=tmp_path,
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_avif_remains_unsupported_even_with_reddit_webp_parameter(tmp_path: Path) -> None:
+    avif_bytes = b"\x00\x00\x00\x18ftypavif" + b"media"
+    assert detect_media_type(avif_bytes) is None
+    session = FakeSession(FakeResponse([avif_bytes], headers={"Content-Type": "image/avif"}))
+    fetcher = MediaFetcher(session=session)
+
+    with pytest.raises(UnsupportedMediaError):
+        await fetcher.download(
+            "https://preview.redd.it/example.jpg?auto=webp",
+            destination_dir=tmp_path,
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
 async def test_empty_response_is_rejected(tmp_path: Path) -> None:
     session = FakeSession(FakeResponse([]))
     fetcher = MediaFetcher(session=session)

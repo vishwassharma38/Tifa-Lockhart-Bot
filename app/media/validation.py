@@ -88,6 +88,10 @@ def detect_media_type(header: bytes) -> MediaInfo | None:
     if len(header) >= 12 and header[0:4] == b"RIFF" and header[8:12] == b"WEBP":
         return _BY_EXTENSION["webp"]
     if len(header) >= 12 and header[4:8] == b"ftyp":
+        # AVIF/HEIF also use ISO BMFF's ftyp box; they are not supported media.
+        brands = header[8:64]
+        if any(brand in brands for brand in (b"avif", b"avis", b"heic", b"heix", b"mif1")):
+            return None
         return _BY_EXTENSION["mp4"]
     if header.startswith(b"\x1a\x45\xdf\xa3"):
         return _BY_EXTENSION["webm"]

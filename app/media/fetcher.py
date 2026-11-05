@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
@@ -37,6 +37,7 @@ __all__ = [
 
 _DEFAULT_CHUNK_SIZE = 64 * 1024
 _MAX_SIGNATURE_BYTES = 64
+_REDDIT_PREVIEW_HOSTS = frozenset({"preview.redd.it", "external-preview.redd.it"})
 log = logging.getLogger(__name__)
 
 
@@ -401,13 +402,23 @@ class MediaFetcher:
                 )
 
             expected_extension = extension_from_url(url)
-            if expected_extension is not None and expected_extension != media.extension:
+            parsed_query = parse_qs(parsed.query)
+            reddit_webp_negotiation = (
+                (parsed.hostname or "").lower() in _REDDIT_PREVIEW_HOSTS
+                and parsed_query.get("auto") == ["webp"]
+                and media.extension == "webp"
+            )
+            if (
+                expected_extension is not None
+                and expected_extension != media.extension
+                and not reddit_webp_negotiation
+            ):
                 raise UnsupportedMediaError(
                     "Downloaded media type does not match the source URL extension"
                 )
 
             declared_info = media_info_for_mime_type(declared_content_type)
-            if declared_info is not None and declared_info.media_type != media.media_type:
+            if declared_info is not None and declared_info != media:
                 raise UnsupportedMediaError(
                     "Downloaded media type does not match the declared content type"
                 )
