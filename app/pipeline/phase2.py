@@ -596,13 +596,17 @@ class Phase2Pipeline:
         downloaded: DownloadedMedia,
     ) -> str:
         extension = downloaded.media.extension
+        label = getattr(candidate, "source_platform", "reddit") or "reddit"
+        source_label = (
+            "".join(character for character in str(label) if character.isalnum()) or "web"
+        )
         if asset.gallery_index is not None:
-            return f"reddit-{candidate.submission_id}-{asset.gallery_index + 1}.{extension}"
+            return f"{source_label}-{candidate.submission_id}-{asset.gallery_index + 1}.{extension}"
         if asset.requires_video_download:
-            return f"reddit-{candidate.submission_id}.{extension}"
+            return f"{source_label}-{candidate.submission_id}.{extension}"
         if asset.filename:
             return asset.filename
-        return f"reddit-{candidate.submission_id}.{extension}"
+        return f"{source_label}-{candidate.submission_id}.{extension}"
 
     async def _recover_existing_media(
         self,

@@ -11,6 +11,28 @@ from urllib.parse import urlparse
 from app.db.client import SupabaseDatabase
 from app.reddit.models import RedditCandidate
 
+_JOB_TYPES = ("reddit_collection", "brave_discovery", "crawl")
+_DISCOVERY_STATUSES = frozenset(
+    {"queued", "processing", "verified", "dumpster", "rejected", "blocked", "failed", "oversize"}
+)
+_DISCOVERY_UPDATE_FIELDS = frozenset(
+    {
+        "status",
+        "http_status",
+        "retry_count",
+        "last_error",
+        "fetched_at",
+        "verified_at",
+        "next_attempt_at",
+        "metadata_json",
+        "title",
+        "description",
+        "creator_name",
+        "creator_profile_url",
+        "domain",
+    }
+)
+
 
 class RepositoryError(RuntimeError):
     """Raised when a repository operation cannot be completed."""
@@ -82,16 +104,18 @@ class MediaRepository:
         )
         return rows[0] if rows else self._runtime_state_sync()
 
-    async def create_job_run(self, config: dict[str, Any]) -> str:
-        return await self._to_thread(self._create_job_run_sync, config)
+    async def create_job_run(
+        self, config: dict[str, Any], job_type: str = "reddit_collection"
+    ) -> str:
+        if job_type not in _JOB_TYPES:
+            raise ValueError(f"Unsupported job type: {job_type}")
+        return await self._to_thread(self._create_job_run_sync, config, job_type)
 
-    def _create_job_run_sync(self, config: dict[str, Any]) -> str:
+    def _create_job_run_sync(self, config: dict[str, Any], job_type: str) -> str:
         rows = self._rows(
             self._client()
             .table("job_runs")
-            .insert(
-                {"job_type": "reddit_collection", "outcome": "running", "config_snapshot": config}
-            )
+            .insert({"job_type": job_type, "outcome": "running", "config_snapshot": config})
             .execute()
         )
         if not rows:
@@ -118,22 +142,62 @@ class MediaRepository:
         await self._to_thread(self._mark_interrupted_sync)
 
     def _mark_interrupted_sync(self) -> None:
+        client = self._client()
+        for job_type in _JOB_TYPES:
+            rows = self._rows(
+                client.table("job_runs")
+                .select("id")
+                .eq("job_type", job_type)
+                .eq("outcome", "running")
+                .execute()
+            )
+            for row in rows:
+                client.table("job_runs").update(
+                    {
+                        "outcome": "failed",
+                        "error_summary": "interrupted_by_restart",
+                        "finished_at": datetime.now(tz=UTC).isoformat(),
+                    }
+                ).eq("id", row["id"]).execute()
+
+    async def recover_processing_discoveries(self) -> int:
+        return await self._to_thread(self._recover_processing_discoveries_sync)
+
+    def _recover_processing_discoveries_sync(self) -> int:
+        client = self._client()
         rows = self._rows(
-            self._client()
-            .table("job_runs")
-            .select("id")
-            .eq("job_type", "reddit_collection")
-            .eq("outcome", "running")
-            .execute()
+            client.table("discoveries").select("id").eq("status", "processing").execute()
         )
+        now = datetime.now(tz=UTC).isoformat()
         for row in rows:
-            self._client().table("job_runs").update(
+            client.table("discoveries").update(
                 {
-                    "outcome": "failed",
-                    "error_summary": "interrupted_by_restart",
-                    "finished_at": datetime.now(tz=UTC).isoformat(),
+                    "status": "queued",
+                    "last_error": "interrupted_by_restart",
+                    "next_attempt_at": now,
                 }
             ).eq("id", row["id"]).execute()
+        return len(rows)
+
+    async def latest_jobs(self, job_type: str, limit: int = 1) -> list[dict[str, Any]]:
+        return await self._to_thread(self._latest_jobs_sync, job_type, limit)
+
+    def _latest_jobs_sync(self, job_type: str, limit: int) -> list[dict[str, Any]]:
+        return self._rows(
+            self._client()
+            .table("job_runs")
+            .select("*")
+            .eq("job_type", job_type)
+            .order("started_at", desc=True)
+            .limit(max(1, limit))
+            .execute()
+        )
+
+    async def latest_brave_runs(self, limit: int = 1) -> list[dict[str, Any]]:
+        return await self.latest_jobs("brave_discovery", limit)
+
+    async def latest_crawl_runs(self, limit: int = 1) -> list[dict[str, Any]]:
+        return await self.latest_jobs("crawl", limit)
 
     async def latest_reddit_runs(self, limit: int = 2) -> list[dict[str, Any]]:
         return await self._to_thread(self._latest_reddit_runs_sync, limit)
@@ -143,25 +207,31 @@ class MediaRepository:
 
     def _operational_counts_sync(self) -> dict[str, Any]:
         client = self._client()
-        queued = (
-            client.table("discoveries")
-            .select("id", count="exact")
-            .eq("status", "queued")
-            .limit(1)
-            .execute()
-        )
-        dumpster = (
-            client.table("discoveries")
-            .select("id", count="exact")
-            .eq("status", "dumpster")
-            .limit(1)
-            .execute()
-        )
+
+        def count_status(status: str) -> int:
+            response = (
+                client.table("discoveries")
+                .select("id", count="exact")
+                .eq("status", status)
+                .limit(1)
+                .execute()
+            )
+            return int(getattr(response, "count", None) or 0)
+
         state = self._runtime_state_sync()
         return {
-            "queued": int(getattr(queued, "count", None) or 0),
-            "dumpster": int(getattr(dumpster, "count", None) or 0),
+            "queued": count_status("queued"),
+            "processing": count_status("processing"),
+            "verified": count_status("verified"),
+            "dumpster": count_status("dumpster"),
+            "rejected": count_status("rejected"),
+            "blocked": count_status("blocked"),
+            "failed": count_status("failed"),
+            "oversize": count_status("oversize"),
             "last_digest_success_at": state.get("last_digest_success_at"),
+            "last_brave_success_at": state.get("last_brave_success_at"),
+            "brave_paused": bool(state.get("brave_paused")),
+            "brave_pause_reason": state.get("brave_pause_reason"),
         }
 
     async def mark_reddit_success(self) -> None:
@@ -170,6 +240,43 @@ class MediaRepository:
     def _mark_reddit_success_sync(self) -> None:
         self._client().table("runtime_state").update(
             {"last_reddit_success_at": datetime.now(tz=UTC).isoformat()}
+        ).eq("id", 1).execute()
+
+    async def mark_brave_success(self) -> None:
+        await self._to_thread(self._mark_brave_success_sync)
+
+    def _mark_brave_success_sync(self) -> None:
+        self._client().table("runtime_state").update(
+            {"last_brave_success_at": datetime.now(tz=UTC).isoformat()}
+        ).eq("id", 1).execute()
+
+    async def pause_brave(self, reason: str) -> None:
+        await self._to_thread(self._pause_brave_sync, reason)
+
+    def _pause_brave_sync(self, reason: str) -> None:
+        self._client().table("runtime_state").update(
+            {
+                "brave_paused": True,
+                "brave_pause_reason": reason[:500],
+                "brave_paused_at": datetime.now(tz=UTC).isoformat(),
+            }
+        ).eq("id", 1).execute()
+
+    async def clear_brave_pause(self) -> None:
+        """Clear the persisted pause after an owner reviews the restriction.
+
+        No Discord command calls this. It exists for a deliberate operator
+        action and never runs automatically on startup or from ``/start``.
+        """
+        await self._to_thread(self._clear_brave_pause_sync)
+
+    def _clear_brave_pause_sync(self) -> None:
+        self._client().table("runtime_state").update(
+            {
+                "brave_paused": False,
+                "brave_pause_reason": None,
+                "brave_paused_at": None,
+            }
         ).eq("id", 1).execute()
 
     def _latest_reddit_runs_sync(self, limit: int) -> list[dict[str, Any]]:
@@ -264,26 +371,235 @@ class MediaRepository:
         rows = self._rows(response)
         return rows[0] if rows else None
 
+    async def upsert_discovery_record(self, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """Insert a queue record by normalized URL without overwriting existing state.
+
+        Returns ``(row, created)``. Existing rows keep their status, depth, and
+        provenance because the same destination may already be verified,
+        rejected, or have a shallower discovery path.
+        """
+        normalized_url = payload.get("normalized_url")
+        if not isinstance(normalized_url, str) or not normalized_url:
+            raise RepositoryError("Discovery payload requires normalized_url")
+        return await self._to_thread(self._upsert_discovery_record_sync, dict(payload))
+
+    def _upsert_discovery_record_sync(self, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        normalized_url = str(payload["normalized_url"])
+        existing = self._get_discovery_by_url_sync(normalized_url)
+        if existing is not None:
+            return existing, False
+        try:
+            response = self._client().table("discoveries").insert(payload).execute()
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                existing = self._get_discovery_by_url_sync(normalized_url)
+                if existing is not None:
+                    return existing, False
+            raise
+        rows = self._rows(response)
+        if rows:
+            return rows[0], True
+        fallback = self._get_discovery_by_url_sync(normalized_url)
+        if fallback is not None:
+            return fallback, False
+        raise RepositoryError("Discovery insert returned no row")
+
+    def _get_discovery_by_url_sync(self, normalized_url: str) -> dict[str, Any] | None:
+        rows = self._rows(
+            self._client()
+            .table("discoveries")
+            .select("*")
+            .eq("normalized_url", normalized_url)
+            .limit(1)
+            .execute()
+        )
+        return rows[0] if rows else None
+
+    async def get_discovery(self, discovery_id: str) -> dict[str, Any] | None:
+        return await self._to_thread(self._get_discovery_sync, discovery_id)
+
+    def _get_discovery_sync(self, discovery_id: str) -> dict[str, Any] | None:
+        rows = self._rows(
+            self._client()
+            .table("discoveries")
+            .select("*")
+            .eq("id", discovery_id)
+            .limit(1)
+            .execute()
+        )
+        return rows[0] if rows else None
+
+    async def claim_discoveries(
+        self,
+        *,
+        limit: int,
+        max_depth: int,
+    ) -> list[dict[str, Any]]:
+        """Atomically claim up to ``limit`` due queued discoveries."""
+        return await self._to_thread(self._claim_discoveries_sync, limit, max_depth)
+
+    def _claim_discoveries_sync(self, limit: int, max_depth: int) -> list[dict[str, Any]]:
+        if limit < 1:
+            return []
+        now = datetime.now(tz=UTC).isoformat()
+        rows = self._rows(
+            self._client()
+            .table("discoveries")
+            .select("*")
+            .eq("status", "queued")
+            .lte("depth", max_depth)
+            .or_(f"next_attempt_at.is.null,next_attempt_at.lte.{now}")
+            .order("discovered_at")
+            .limit(limit)
+            .execute()
+        )
+        claimed: list[dict[str, Any]] = []
+        for row in rows:
+            discovery_id = row.get("id")
+            if discovery_id is None:
+                continue
+            response = (
+                self._client()
+                .table("discoveries")
+                .update({"status": "processing", "next_attempt_at": None})
+                .eq("id", discovery_id)
+                .eq("status", "queued")
+                .execute()
+            )
+            updated = self._rows(response)
+            if updated:
+                claimed.append({**row, **updated[0]})
+        return claimed
+
+    async def update_discovery(self, discovery_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        return await self._to_thread(self._update_discovery_sync, discovery_id, dict(fields))
+
+    def _update_discovery_sync(self, discovery_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        payload = {key: value for key, value in fields.items() if key in _DISCOVERY_UPDATE_FIELDS}
+        if "status" in payload and payload["status"] not in _DISCOVERY_STATUSES:
+            raise RepositoryError("Unsupported discovery status")
+        if not payload:
+            return {"id": discovery_id}
+        response = (
+            self._client().table("discoveries").update(payload).eq("id", discovery_id).execute()
+        )
+        rows = self._rows(response)
+        return rows[0] if rows else {"id": discovery_id, **payload}
+
+    async def update_discovery_metadata(
+        self, discovery_id: str, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self.update_discovery(discovery_id, {"metadata_json": metadata})
+
+    async def requeue_discovery(
+        self,
+        discovery_id: str,
+        *,
+        reason: str | None = None,
+        next_attempt_at: str | None = None,
+    ) -> dict[str, Any]:
+        return await self.update_discovery(
+            discovery_id,
+            {
+                "status": "queued",
+                "last_error": reason,
+                "next_attempt_at": next_attempt_at,
+            },
+        )
+
+    async def record_discovery_edge(
+        self,
+        *,
+        parent_discovery_id: str | None,
+        child_discovery_id: str | None,
+        child_normalized_url: str,
+        discovered_from_url: str,
+        depth: int,
+    ) -> dict[str, Any]:
+        return await self._to_thread(
+            self._record_discovery_edge_sync,
+            parent_discovery_id,
+            child_discovery_id,
+            child_normalized_url,
+            discovered_from_url,
+            depth,
+        )
+
+    def _edge_query(self, parent_discovery_id: str | None, child_normalized_url: str) -> Any:
+        query = (
+            self._client()
+            .table("discovery_edges")
+            .select("id")
+            .eq("child_normalized_url", child_normalized_url)
+        )
+        if parent_discovery_id is None:
+            query = query.is_("parent_discovery_id", "null")
+        else:
+            query = query.eq("parent_discovery_id", parent_discovery_id)
+        return query.limit(1)
+
+    def _record_discovery_edge_sync(
+        self,
+        parent_discovery_id: str | None,
+        child_discovery_id: str | None,
+        child_normalized_url: str,
+        discovered_from_url: str,
+        depth: int,
+    ) -> dict[str, Any]:
+        existing = self._rows(self._edge_query(parent_discovery_id, child_normalized_url).execute())
+        if existing:
+            return existing[0]
+        payload = {
+            "parent_discovery_id": parent_discovery_id,
+            "child_discovery_id": child_discovery_id,
+            "child_normalized_url": child_normalized_url,
+            "discovered_from_url": discovered_from_url,
+            "depth": depth,
+        }
+        try:
+            response = self._client().table("discovery_edges").insert(payload).execute()
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                existing = self._rows(
+                    self._edge_query(parent_discovery_id, child_normalized_url).execute()
+                )
+                if existing:
+                    return existing[0]
+            raise
+        rows = self._rows(response)
+        return rows[0] if rows else payload
+
     async def upsert_discovery(self, candidate: RedditCandidate) -> dict[str, Any]:
         return await self._to_thread(self._upsert_discovery_sync, candidate)
 
     def _upsert_discovery_sync(self, candidate: RedditCandidate) -> dict[str, Any]:
+        discovery_id = getattr(candidate, "discovery_id", None)
+        if discovery_id:
+            existing = self._get_discovery_sync(str(discovery_id))
+            if existing is not None:
+                return existing
+
         now = datetime.now(tz=UTC).isoformat()
         metadata = dict(candidate.media_metadata)
         metadata["media_url"] = candidate.media_url
         metadata["extraction_reason"] = candidate.extraction_reason
+        source_type = getattr(candidate, "source_type", "reddit") or "reddit"
+        source_url = candidate.source_url
+        source_host = urlparse(source_url).hostname or (
+            "www.reddit.com" if source_type == "reddit" else "unknown"
+        )
 
         payload = {
-            "url": candidate.source_url,
+            "url": source_url,
             "normalized_url": candidate.normalized_source_url,
-            "source_type": "reddit",
+            "source_type": source_type,
             "source_platform_id": candidate.submission_id,
             "title": candidate.title or None,
             "description": candidate.body,
             "creator_name": candidate.author_name,
             "creator_profile_url": candidate.author_profile_url,
-            "domain": urlparse(candidate.source_url).hostname or "www.reddit.com",
-            "depth": 0,
+            "domain": source_host,
+            "depth": int(getattr(candidate, "crawl_depth", 0) or 0),
             "status": "verified",
             "verified_at": now,
             "metadata_json": metadata,
@@ -414,11 +730,13 @@ class MediaRepository:
         media_url: str | None,
         source_media_id: str | None,
     ) -> dict[str, Any]:
+        source_platform = getattr(candidate, "source_platform", "reddit") or "reddit"
+        source_post_id = getattr(candidate, "source_post_id", None) or candidate.submission_id
         payload = {
             "media_item_id": media_item_id,
             "discovery_id": discovery_id,
-            "source_platform": "reddit",
-            "source_post_id": candidate.submission_id,
+            "source_platform": source_platform,
+            "source_post_id": source_post_id,
             "source_media_id": source_media_id or "",
             "source_url": candidate.source_url,
             "normalized_source_url": candidate.normalized_source_url,

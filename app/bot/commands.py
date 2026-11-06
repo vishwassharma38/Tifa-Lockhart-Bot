@@ -1,4 +1,4 @@
-"""Phase 4 Discord application commands."""
+"""Phase 4/5 Discord application commands."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from discord.ext import commands
 
 from app.config import Settings
 from app.health.status import StatusReport
+from app.reddit.connector import parse_submission_id
 
 if TYPE_CHECKING:
     from app.bot.client import TifaBot
@@ -23,6 +24,15 @@ log = logging.getLogger(__name__)
 
 EMBED_COLOR = 0x8B1E3F
 ABOUT_PURPOSE = "Responsible discovery and preservation of Tifa Lockhart-related public media."
+
+
+def _is_reddit_reference(value: str) -> bool:
+    """Return whether the input should use the existing Reddit save flow."""
+    try:
+        parse_submission_id(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def build_about_embed(settings: Settings) -> discord.Embed:
@@ -57,12 +67,12 @@ def build_status_embed(report: StatusReport) -> discord.Embed:
     embed.add_field(name="Supabase", value=report.supabase.label, inline=False)
     embed.add_field(name="B2 storage", value=report.storage.label, inline=False)
     embed.add_field(name="Collection", value="Persisted state unavailable", inline=False)
-    embed.set_footer(text="Phase 1 foundation")
+    embed.set_footer(text="Phase 5 discovery and crawler")
     return embed
 
 
 class PhaseFourCommands(commands.Cog):
-    """Slash commands that truthfully describe the Phase 1 foundation."""
+    """Slash commands for the Phase V1 discovery and archive foundation."""
 
     def __init__(self, bot: TifaBot) -> None:
         self.bot = bot
@@ -77,7 +87,7 @@ class PhaseFourCommands(commands.Cog):
             and interaction.user.id == self.bot.settings.owner_discord_id
         )
 
-    @app_commands.command(name="start", description="Enable scheduled Reddit collection.")
+    @app_commands.command(name="start", description="Enable scheduled discovery and crawling.")
     async def start_collection(self, interaction: discord.Interaction) -> None:
         if not self._owner(interaction):
             await interaction.response.send_message(
@@ -105,7 +115,7 @@ class PhaseFourCommands(commands.Cog):
             log.warning("Start command failed (%s)", type(exc).__name__)
             await interaction.followup.send("Could not persist collection state.", ephemeral=True)
 
-    @app_commands.command(name="stop", description="Pause scheduled Reddit collection.")
+    @app_commands.command(name="stop", description="Pause scheduled discovery and crawling.")
     async def stop_collection(self, interaction: discord.Interaction) -> None:
         if not self._owner(interaction):
             await interaction.response.send_message(
@@ -123,8 +133,10 @@ class PhaseFourCommands(commands.Cog):
             log.warning("Stop command failed (%s)", type(exc).__name__)
             await interaction.followup.send("Could not persist collection state.", ephemeral=True)
 
-    @app_commands.command(name="save", description="Archive and publish one Reddit post.")
-    @app_commands.describe(url="Reddit submission URL or ID")
+    @app_commands.command(
+        name="save", description="Archive and publish one Reddit post or public page."
+    )
+    @app_commands.describe(url="Reddit submission URL or ID, or a public media/page URL")
     async def save(self, interaction: discord.Interaction, url: str) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         pipeline = getattr(self.bot, "pipeline", None)
@@ -135,7 +147,17 @@ class PhaseFourCommands(commands.Cog):
             )
             return
         try:
-            result = await pipeline.run(url)
+            if _is_reddit_reference(url):
+                result = await pipeline.run(url)
+            else:
+                web_save = getattr(self.bot, "web_save_service", None)
+                if web_save is None:
+                    await interaction.followup.send(
+                        "Public URL saves are unavailable because the safe web service is not configured.",
+                        ephemeral=True,
+                    )
+                    return
+                result = await web_save.save(url)
             await interaction.followup.send(
                 f"Save result: {result.reason} ({result.status.value}).", ephemeral=True
             )
@@ -265,13 +287,53 @@ class PhaseFourCommands(commands.Cog):
                 value=f"Persisted: {'enabled' if state.get('collection_enabled') else 'paused'}; effective: {'enabled' if effective else 'blocked/paused'}; Reddit feature: {'enabled' if self.bot.settings.reddit_enabled else 'disabled'}; approval: {'confirmed' if self.bot.settings.reddit_access_approved else 'not confirmed'}; reason: {blocked or 'none'}",
                 inline=False,
             )
+            brave_service = getattr(self.bot, "brave_service", None)
+            brave_block = (
+                brave_service.block_reason(state)
+                if brave_service is not None
+                else "Brave service unavailable"
+            )
+            if not self.bot.settings.brave_html_enabled:
+                brave_state = "disabled by feature flag"
+            elif not self.bot.settings.brave_html_access_approved:
+                brave_state = "enabled but access not approved"
+            elif state.get("brave_paused"):
+                brave_state = "persistently paused"
+            else:
+                brave_state = "enabled and approved, waiting for schedule"
+            brave_runs = await self.bot.repository.latest_brave_runs(1)
+            crawl_runs = await self.bot.repository.latest_crawl_runs(1)
+            brave_latest = brave_runs[0] if brave_runs else None
+            crawl_latest = crawl_runs[0] if crawl_runs else None
+
+            def run_summary(row: dict[str, object] | None) -> str:
+                if not row:
+                    return "No runs"
+                return f"{row.get('outcome')}: {row.get('error_summary') or 'no errors'}"
+
+            embed.add_field(
+                name="Brave discovery",
+                value=(
+                    f"Feature: {'enabled' if self.bot.settings.brave_html_enabled else 'disabled'}; "
+                    f"access: {'approved' if self.bot.settings.brave_html_access_approved else 'not approved'}; "
+                    f"state: {brave_state}; pause reason: "
+                    f"{state.get('brave_pause_reason') or 'none'}; block: {brave_block or 'none'}"
+                ),
+                inline=False,
+            )
             embed.add_field(
                 name="Latest Reddit run",
-                value=(
-                    f"{latest.get('outcome')}: {latest.get('error_summary') or 'no errors'}"
-                    if latest
-                    else "No runs"
-                ),
+                value=run_summary(latest),
+                inline=False,
+            )
+            embed.add_field(
+                name="Latest Brave run",
+                value=run_summary(brave_latest),
+                inline=False,
+            )
+            embed.add_field(
+                name="Latest crawler run",
+                value=run_summary(crawl_latest),
                 inline=False,
             )
             embed.add_field(
@@ -285,8 +347,23 @@ class PhaseFourCommands(commands.Cog):
                 inline=False,
             )
             embed.add_field(
+                name="Last successful Brave discovery",
+                value=str(state.get("last_brave_success_at") or "Never"),
+                inline=False,
+            )
+            embed.add_field(
                 name="Last digest",
                 value=str(counts.get("last_digest_success_at") or "Not implemented in Phase 6"),
+                inline=False,
+            )
+            errors = [
+                str(row.get("error_summary"))
+                for row in (crawl_latest, brave_latest, latest)
+                if row and row.get("error_summary")
+            ]
+            embed.add_field(
+                name="Latest relevant job error",
+                value=(errors[0][:300] if errors else "None"),
                 inline=False,
             )
             embed.add_field(name="Queue / backlog", value=str(counts["queued"]), inline=True)

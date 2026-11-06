@@ -171,6 +171,27 @@ def test_phase4_migration_extends_existing_runtime_and_job_tables() -> None:
     assert "create table" not in sql
 
 
+def test_phase5_migration_adds_durable_discovery_and_brave_controls() -> None:
+    files, _sql = read_migrations()
+    names = [path.name for path in files]
+
+    assert "007_phase5_discovery_controls.sql" in names
+
+    sql = read_migration("007_phase5_discovery_controls.sql")
+    lowered = sql.lower()
+
+    assert "add column if not exists next_attempt_at" in lowered
+    assert "idx_discoveries_queue_claim" in lowered
+    assert "add column if not exists brave_paused" in lowered
+    assert "add column if not exists brave_pause_reason" in lowered
+    assert "add column if not exists brave_paused_at" in lowered
+    assert "create table" not in lowered
+    assert "drop table" not in lowered
+    assert "drop column" not in lowered
+    assert "delete from" not in lowered
+    assert "truncate" not in lowered
+
+
 def test_updated_at_function_search_path_is_hardened() -> None:
     sql = read_migration("003_harden_updated_at_function_search_path.sql")
 

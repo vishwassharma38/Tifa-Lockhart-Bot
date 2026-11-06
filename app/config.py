@@ -16,6 +16,13 @@ VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 _B2_REGION_PATTERN = re.compile(r"^[a-z]{2}-[a-z]+-\d{3}$")
+_DEFAULT_SEARCH_PHRASES = (
+    "Tifa Lockhart",
+    "Tifa Lockhart fanart",
+    "Tifa cosplay",
+    "Tifa Lockhart cosplay",
+    "Tifa Final Fantasy VII",
+)
 
 
 class ConfigurationError(ValueError):
@@ -53,6 +60,16 @@ def _parse_int(env: Mapping[str, str], name: str, default: int) -> int:
         return int(raw, 10)
     except ValueError as exc:
         raise ConfigurationError(f"{name} must be an integer") from exc
+
+
+def _parse_float(env: Mapping[str, str], name: str, default: float) -> float:
+    raw = _read(env, name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a number") from exc
 
 
 def _parse_optional_int(env: Mapping[str, str], name: str) -> int | None:
@@ -117,13 +134,23 @@ class Settings:
     perceptual_hash_enabled: bool
     reddit_enabled: bool = True
     reddit_max_items_per_run: int = 100
-    reddit_search_phrases: tuple[str, ...] = (
-        "Tifa Lockhart",
-        "Tifa Lockhart fanart",
-        "Tifa cosplay",
-        "Tifa Lockhart cosplay",
-        "Tifa Final Fantasy VII",
-    )
+    reddit_search_phrases: tuple[str, ...] = _DEFAULT_SEARCH_PHRASES
+    brave_html_access_approved: bool = False
+    brave_search_base_url: str = "https://search.brave.com/search"
+    brave_search_interval_hours: int = 8
+    brave_search_phrases: tuple[str, ...] = _DEFAULT_SEARCH_PHRASES
+    brave_search_max_pages_per_phrase: int = 2
+    max_page_bytes: int = 5_000_000
+    max_crawl_depth: int = 6
+    max_urls_per_job: int = 300
+    max_pages_per_domain: int = 20
+    max_concurrent_requests: int = 5
+    per_domain_delay_seconds: float = 2.0
+    max_redirects: int = 5
+    crawl_connect_timeout_seconds: float = 10.0
+    crawl_read_timeout_seconds: float = 20.0
+    crawl_max_attempts: int = 3
+    crawl_batch_size: int = 25
 
     @classmethod
     def from_env(
@@ -177,6 +204,34 @@ class Settings:
                 if x.strip()
             ),
             brave_html_enabled=_parse_bool(env, "BRAVE_HTML_ENABLED"),
+            brave_html_access_approved=_parse_bool(env, "BRAVE_HTML_ACCESS_APPROVED"),
+            brave_search_base_url=_read(
+                env, "BRAVE_SEARCH_BASE_URL", "https://search.brave.com/search"
+            ),
+            brave_search_interval_hours=_parse_int(env, "BRAVE_SEARCH_INTERVAL_HOURS", 8),
+            brave_search_phrases=tuple(
+                x.strip()
+                for x in _read(
+                    env,
+                    "BRAVE_SEARCH_PHRASES",
+                    "Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|Tifa Final Fantasy VII",
+                ).split("|")
+                if x.strip()
+            ),
+            brave_search_max_pages_per_phrase=_parse_int(
+                env, "BRAVE_SEARCH_MAX_PAGES_PER_PHRASE", 2
+            ),
+            max_page_bytes=_parse_int(env, "MAX_PAGE_BYTES", 5_000_000),
+            max_crawl_depth=_parse_int(env, "MAX_CRAWL_DEPTH", 6),
+            max_urls_per_job=_parse_int(env, "MAX_URLS_PER_JOB", 300),
+            max_pages_per_domain=_parse_int(env, "MAX_PAGES_PER_DOMAIN", 20),
+            max_concurrent_requests=_parse_int(env, "MAX_CONCURRENT_REQUESTS", 5),
+            per_domain_delay_seconds=_parse_float(env, "PER_DOMAIN_DELAY_SECONDS", 2.0),
+            max_redirects=_parse_int(env, "MAX_REDIRECTS", 5),
+            crawl_connect_timeout_seconds=_parse_float(env, "CRAWL_CONNECT_TIMEOUT_SECONDS", 10.0),
+            crawl_read_timeout_seconds=_parse_float(env, "CRAWL_READ_TIMEOUT_SECONDS", 20.0),
+            crawl_max_attempts=_parse_int(env, "CRAWL_MAX_ATTEMPTS", 3),
+            crawl_batch_size=_parse_int(env, "CRAWL_BATCH_SIZE", 25),
             perceptual_hash_enabled=_parse_bool(env, "PERCEPTUAL_HASH_ENABLED"),
         )
 
@@ -245,6 +300,48 @@ class Settings:
             ZoneInfo(self.timezone)
         except (ZoneInfoNotFoundError, ValueError):
             errors.append("TIMEZONE must be a valid IANA timezone")
+
+        if not self.brave_search_phrases:
+            errors.append("BRAVE_SEARCH_PHRASES must contain at least one phrase")
+        if any(len(phrase) > 200 for phrase in self.brave_search_phrases):
+            errors.append("BRAVE_SEARCH_PHRASES phrases must be 200 characters or fewer")
+        if not 1 <= self.brave_search_interval_hours <= 168:
+            errors.append("BRAVE_SEARCH_INTERVAL_HOURS must be between 1 and 168")
+        if not 1 <= self.brave_search_max_pages_per_phrase <= 10:
+            errors.append("BRAVE_SEARCH_MAX_PAGES_PER_PHRASE must be between 1 and 10")
+        parsed_brave = urlparse(self.brave_search_base_url)
+        if (
+            parsed_brave.scheme != "https"
+            or not parsed_brave.netloc
+            or parsed_brave.username is not None
+            or parsed_brave.password is not None
+            or parsed_brave.fragment
+        ):
+            errors.append(
+                "BRAVE_SEARCH_BASE_URL must be a valid https URL without credentials or a fragment"
+            )
+        if not 1 <= self.max_page_bytes <= 5_000_000:
+            errors.append("MAX_PAGE_BYTES must be between 1 and 5000000")
+        if not 1 <= self.max_crawl_depth <= 6:
+            errors.append("MAX_CRAWL_DEPTH must be between 1 and 6")
+        if not 1 <= self.max_urls_per_job <= 300:
+            errors.append("MAX_URLS_PER_JOB must be between 1 and 300")
+        if not 1 <= self.max_pages_per_domain <= 20:
+            errors.append("MAX_PAGES_PER_DOMAIN must be between 1 and 20")
+        if not 1 <= self.max_concurrent_requests <= 5:
+            errors.append("MAX_CONCURRENT_REQUESTS must be between 1 and 5")
+        if not 2.0 <= self.per_domain_delay_seconds <= 60.0:
+            errors.append("PER_DOMAIN_DELAY_SECONDS must be between 2 and 60")
+        if not 1 <= self.max_redirects <= 5:
+            errors.append("MAX_REDIRECTS must be between 1 and 5")
+        if not 0.1 <= self.crawl_connect_timeout_seconds <= 10.0:
+            errors.append("CRAWL_CONNECT_TIMEOUT_SECONDS must be between 0.1 and 10")
+        if not 0.1 <= self.crawl_read_timeout_seconds <= 20.0:
+            errors.append("CRAWL_READ_TIMEOUT_SECONDS must be between 0.1 and 20")
+        if not 1 <= self.crawl_max_attempts <= 3:
+            errors.append("CRAWL_MAX_ATTEMPTS must be between 1 and 3")
+        if not 1 <= self.crawl_batch_size <= self.max_urls_per_job:
+            errors.append("CRAWL_BATCH_SIZE must be positive and no greater than MAX_URLS_PER_JOB")
 
         for name, value in (
             ("DISCORD_GUILD_ID", self.discord_guild_id),

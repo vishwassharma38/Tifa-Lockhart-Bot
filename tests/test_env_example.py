@@ -24,6 +24,22 @@ REQUIRED_KEYS = {
     "B2_APPLICATION_KEY",
     "REDDIT_ACCESS_APPROVED",
     "BRAVE_HTML_ENABLED",
+    "BRAVE_HTML_ACCESS_APPROVED",
+    "BRAVE_SEARCH_BASE_URL",
+    "BRAVE_SEARCH_INTERVAL_HOURS",
+    "BRAVE_SEARCH_PHRASES",
+    "BRAVE_SEARCH_MAX_PAGES_PER_PHRASE",
+    "MAX_PAGE_BYTES",
+    "MAX_CRAWL_DEPTH",
+    "MAX_URLS_PER_JOB",
+    "MAX_PAGES_PER_DOMAIN",
+    "MAX_CONCURRENT_REQUESTS",
+    "PER_DOMAIN_DELAY_SECONDS",
+    "MAX_REDIRECTS",
+    "CRAWL_CONNECT_TIMEOUT_SECONDS",
+    "CRAWL_READ_TIMEOUT_SECONDS",
+    "CRAWL_MAX_ATTEMPTS",
+    "CRAWL_BATCH_SIZE",
     "MAX_MEDIA_BYTES",
 }
 
@@ -60,6 +76,15 @@ def test_template_contains_only_placeholders_and_safe_defaults() -> None:
     assert values["B2_APPLICATION_KEY"] == ""
     assert values["REDDIT_ACCESS_APPROVED"] == "false"
     assert values["BRAVE_HTML_ENABLED"] == "false"
+    assert values["BRAVE_HTML_ACCESS_APPROVED"] == "false"
+    assert values["BRAVE_SEARCH_INTERVAL_HOURS"] == "8"
+    assert values["MAX_PAGE_BYTES"] == "5000000"
+    assert values["MAX_CRAWL_DEPTH"] == "6"
+    assert values["MAX_URLS_PER_JOB"] == "300"
+    assert values["MAX_PAGES_PER_DOMAIN"] == "20"
+    assert values["MAX_CONCURRENT_REQUESTS"] == "5"
+    assert values["PER_DOMAIN_DELAY_SECONDS"] == "2"
+    assert values["MAX_REDIRECTS"] == "5"
     assert values["MAX_MEDIA_BYTES"] == "10000000"
 
 

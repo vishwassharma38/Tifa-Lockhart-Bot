@@ -28,10 +28,15 @@ def build_publication_message(candidate: RedditCandidate) -> str:
     else:
         creator_line = "Creator: not provided by source"
 
+    source_platform = getattr(candidate, "source_platform", "reddit") or "reddit"
+    if source_platform == "reddit":
+        identity_line = f"Reddit post ID: {candidate.submission_id}"
+    else:
+        identity_line = f"Source ID: {candidate.submission_id}"
     detail_lines = [
         creator_line,
         f"Source: {candidate.source_url}",
-        f"Reddit post ID: {candidate.submission_id}",
+        identity_line,
     ]
     reserved = sum(len(line) + 1 for line in detail_lines) + 1
     remaining = max(0, _MAX_MESSAGE_LENGTH - reserved - 1)

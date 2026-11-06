@@ -14,6 +14,9 @@ from discord.ext import commands
 from app.bot.commands import PhaseFourCommands
 from app.bot.publisher import DiscordPublisher
 from app.config import Settings
+from app.discovery.brave import BraveDiscoveryService, BraveSearchAdapter
+from app.discovery.crawler import DiscoveryCrawler, WebSaveService
+from app.discovery.http import SafeHttpClient
 from app.media.fetcher import MediaFetcher
 from app.pipeline.phase2 import Phase2Pipeline
 from app.reddit.collector import RedditCollector
@@ -63,14 +66,26 @@ class TifaBot(commands.Bot):
         self.repository = repository
         self.storage = storage
         self.collector: RedditCollector | None = None
+        self.pipeline: Phase2Pipeline | None = None
+        self.brave_service: BraveDiscoveryService | None = None
+        self.crawler: DiscoveryCrawler | None = None
+        self.web_save_service: WebSaveService | None = None
+        self.safe_http_client: SafeHttpClient | None = None
         self.scheduler: AsyncIOScheduler | None = None
         self._active_collection_task: asyncio.Task[Any] | None = None
+        self._active_background_tasks: set[asyncio.Task[Any]] = set()
 
     async def setup_hook(self) -> None:
         await self.add_cog(PhaseFourCommands(self))
         if self.repository is not None and self.storage is not None:
             try:
                 await self.repository.mark_interrupted_jobs()
+                try:
+                    recovered = await self.repository.recover_processing_discoveries()
+                    if recovered:
+                        log.info("Recovered %s interrupted discovery record(s)", recovered)
+                except Exception as exc:
+                    log.warning("Discovery recovery unavailable (%s)", type(exc).__name__)
                 connector = RedditConnector(self.settings)
                 fetcher = MediaFetcher()
                 pipeline = Phase2Pipeline(
@@ -89,6 +104,29 @@ class TifaBot(commands.Bot):
                 self.collector = RedditCollector(
                     self.settings, self.repository, pipeline, connector
                 )
+                self.safe_http_client = SafeHttpClient(
+                    max_concurrent_requests=self.settings.max_concurrent_requests,
+                    max_redirects=self.settings.max_redirects,
+                    connect_timeout=self.settings.crawl_connect_timeout_seconds,
+                    read_timeout=self.settings.crawl_read_timeout_seconds,
+                )
+                self.brave_service = BraveDiscoveryService(
+                    self.settings,
+                    self.repository,
+                    BraveSearchAdapter(self.settings, client=self.safe_http_client),
+                )
+                self.crawler = DiscoveryCrawler(
+                    self.settings,
+                    self.repository,
+                    pipeline,
+                    client=self.safe_http_client,
+                )
+                self.web_save_service = WebSaveService(
+                    self.settings,
+                    self.repository,
+                    pipeline,
+                    client=self.safe_http_client,
+                )
                 state = await self.repository.get_runtime_state()
                 self.scheduler = AsyncIOScheduler(timezone=ZoneInfo("Asia/Kolkata"))
                 self.scheduler.add_job(
@@ -101,13 +139,34 @@ class TifaBot(commands.Bot):
                     max_instances=1,
                     misfire_grace_time=900,
                 )
+                self.scheduler.add_job(
+                    self._scheduled_brave_discovery,
+                    "interval",
+                    hours=self.settings.brave_search_interval_hours,
+                    id="brave_discovery",
+                    replace_existing=True,
+                    coalesce=True,
+                    max_instances=1,
+                    misfire_grace_time=900,
+                )
+                self.scheduler.add_job(
+                    self._scheduled_crawl_processing,
+                    "interval",
+                    minutes=5,
+                    id="crawl_processing",
+                    replace_existing=True,
+                    coalesce=True,
+                    max_instances=1,
+                    misfire_grace_time=300,
+                )
                 self.scheduler.start()
                 log.info(
-                    "Reddit scheduler initialized; persisted collection=%s",
+                    "Scheduler initialized; persisted collection=%s Brave interval=%s hours",
                     bool(state.get("collection_enabled")),
+                    self.settings.brave_search_interval_hours,
                 )
             except Exception as exc:
-                log.warning("Reddit scheduler unavailable (%s)", type(exc).__name__)
+                log.warning("Scheduler unavailable (%s)", type(exc).__name__)
         if not self._sync_commands:
             return
         try:
@@ -130,22 +189,71 @@ class TifaBot(commands.Bot):
 
     async def _scheduled_collection(self) -> None:
         if self.collector is not None:
-            self._active_collection_task = asyncio.current_task()
+            current = asyncio.current_task()
+            self._active_collection_task = current
+            if current is not None:
+                self._active_background_tasks.add(current)
             try:
                 await self.collector.run(scheduled=True)
             finally:
+                if current is not None:
+                    self._active_background_tasks.discard(current)
                 self._active_collection_task = None
+
+    async def _scheduled_brave_discovery(self) -> None:
+        current = asyncio.current_task()
+        if current is not None:
+            self._active_background_tasks.add(current)
+        try:
+            if self.brave_service is not None:
+                await self.brave_service.run(scheduled=True)
+            if self.crawler is not None:
+                await self.crawler.run_once(scheduled=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Scheduled Brave discovery failed (%s)", type(exc).__name__)
+        finally:
+            if current is not None:
+                self._active_background_tasks.discard(current)
+
+    async def _scheduled_crawl_processing(self) -> None:
+        current = asyncio.current_task()
+        if current is not None:
+            self._active_background_tasks.add(current)
+        try:
+            if self.crawler is not None:
+                await self.crawler.run_once(scheduled=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Scheduled crawl processing failed (%s)", type(exc).__name__)
+        finally:
+            if current is not None:
+                self._active_background_tasks.discard(current)
 
     async def close(self) -> None:
         log.info("Closing Discord client")
         if self.scheduler is not None:
             self.scheduler.shutdown(wait=False)
-        active = self._active_collection_task
-        if active is not None and active is not asyncio.current_task():
+        current = asyncio.current_task()
+        active = [
+            task
+            for task in self._active_background_tasks
+            if task is not current and not task.done()
+        ]
+        for task in active:
             try:
-                await active
+                await task
+            except asyncio.CancelledError:
+                pass
             except Exception as exc:
-                log.warning(
-                    "Active Reddit collection stopped with an error (%s)", type(exc).__name__
-                )
+                log.warning("Active scheduled job stopped with an error (%s)", type(exc).__name__)
+        client = self.safe_http_client
+        self.safe_http_client = None
+        if client is not None:
+            try:
+                await client.close()
+            except Exception as exc:
+                log.warning("HTTP client close failed (%s)", type(exc).__name__)
         await super().close()
