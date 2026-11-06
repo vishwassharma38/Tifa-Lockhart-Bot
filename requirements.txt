@@ -9,3 +9,5 @@ tzdata>=2024.1
 Pillow>=10,<12
 ImageHash>=4.3,<5
 yt-dlp>=2024.1,<2027
+beautifulsoup4>=4.12,<5
+lxml>=5.2,<6

@@ -347,9 +347,15 @@ class MediaFetcher:
                                         )
                                     needed = ftyp_signature_size(bytes(signature))
                                     if needed is not None and len(signature) < needed:
-                                        chunk_offset = max(0, _MAX_SIGNATURE_BYTES - signature_start)
+                                        chunk_offset = max(
+                                            0, _MAX_SIGNATURE_BYTES - signature_start
+                                        )
                                         signature.extend(
-                                            chunk[chunk_offset : chunk_offset + needed - len(signature)]
+                                            chunk[
+                                                chunk_offset : chunk_offset
+                                                + needed
+                                                - len(signature)
+                                            ]
                                         )
                                     hasher.update(chunk)
                                     handle.write(chunk)

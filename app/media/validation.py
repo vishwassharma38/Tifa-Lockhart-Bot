@@ -108,10 +108,7 @@ def _ftyp_brands(header: bytes) -> frozenset[bytes] | None:
     brand_data_start = box_header_size + 8  # major_brand and minor_version
 
     brands = {header[box_header_size : box_header_size + 4]}
-    brands.update(
-        header[offset : offset + 4]
-        for offset in range(brand_data_start, box_size, 4)
-    )
+    brands.update(header[offset : offset + 4] for offset in range(brand_data_start, box_size, 4))
     return frozenset(brands)
 
 
@@ -119,10 +116,34 @@ _AVIF_BRANDS = frozenset({b"avif", b"avis", b"avio", b"MA1A", b"MA1B"})
 _HEIF_BRANDS = frozenset(
     {
         # Structural and codec-specific HEIF brands.
-        b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs",
-        b"mif1", b"mif2", b"msf1", b"msf2", b"avci", b"avcs", b"vvic", b"vvis",
-        b"jpeg", b"jpgs", b"evbi", b"evbs", b"evmi", b"evms", b"1pic", b"pred",
-        b"j2ki", b"j2is", b"jxsi", b"jxss",
+        b"heic",
+        b"heix",
+        b"hevc",
+        b"hevx",
+        b"heim",
+        b"heis",
+        b"hevm",
+        b"hevs",
+        b"mif1",
+        b"mif2",
+        b"msf1",
+        b"msf2",
+        b"avci",
+        b"avcs",
+        b"vvic",
+        b"vvis",
+        b"jpeg",
+        b"jpgs",
+        b"evbi",
+        b"evbs",
+        b"evmi",
+        b"evms",
+        b"1pic",
+        b"pred",
+        b"j2ki",
+        b"j2is",
+        b"jxsi",
+        b"jxss",
     }
 )
 

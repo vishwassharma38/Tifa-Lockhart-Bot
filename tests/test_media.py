@@ -121,9 +121,7 @@ def test_detect_rejects_unknown_content() -> None:
 def _ftyp(major_brand: bytes, *compatible_brands: bytes) -> bytes:
     assert all(len(brand) == 4 for brand in (major_brand, *compatible_brands))
     size = 16 + 4 * len(compatible_brands)
-    return struct.pack(">I4s4sI", size, b"ftyp", major_brand, 0) + b"".join(
-        compatible_brands
-    )
+    return struct.pack(">I4s4sI", size, b"ftyp", major_brand, 0) + b"".join(compatible_brands)
 
 
 @pytest.mark.parametrize("brand", [b"avif", b"avis", b"avio", b"MA1A", b"MA1B"])
@@ -145,11 +143,34 @@ def test_iso_bmff_avif_compatible_brands_are_recognized(brand: bytes) -> None:
 @pytest.mark.parametrize(
     "brand",
     [
-        b"heic", b"heix", b"mif1", b"mif2", b"msf1", b"msf2",
-        b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs",
-        b"vvic", b"vvis", b"jpeg", b"avci", b"avcs",
-        b"1pic", b"evbi", b"evbs", b"evmi", b"evms", b"jpgs", b"pred",
-        b"j2ki", b"j2is", b"jxsi", b"jxss",
+        b"heic",
+        b"heix",
+        b"mif1",
+        b"mif2",
+        b"msf1",
+        b"msf2",
+        b"hevc",
+        b"hevx",
+        b"heim",
+        b"heis",
+        b"hevm",
+        b"hevs",
+        b"vvic",
+        b"vvis",
+        b"jpeg",
+        b"avci",
+        b"avcs",
+        b"1pic",
+        b"evbi",
+        b"evbs",
+        b"evmi",
+        b"evms",
+        b"jpgs",
+        b"pred",
+        b"j2ki",
+        b"j2is",
+        b"jxsi",
+        b"jxss",
     ],
 )
 def test_iso_bmff_heif_major_brands_are_recognized_as_unsupported(brand: bytes) -> None:
@@ -162,11 +183,34 @@ def test_iso_bmff_heif_major_brands_are_recognized_as_unsupported(brand: bytes) 
 @pytest.mark.parametrize(
     "brand",
     [
-        b"heic", b"heix", b"mif1", b"mif2", b"msf1", b"msf2",
-        b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs",
-        b"vvic", b"vvis", b"jpeg", b"avci", b"avcs",
-        b"1pic", b"evbi", b"evbs", b"evmi", b"evms", b"jpgs", b"pred",
-        b"j2ki", b"j2is", b"jxsi", b"jxss",
+        b"heic",
+        b"heix",
+        b"mif1",
+        b"mif2",
+        b"msf1",
+        b"msf2",
+        b"hevc",
+        b"hevx",
+        b"heim",
+        b"heis",
+        b"hevm",
+        b"hevs",
+        b"vvic",
+        b"vvis",
+        b"jpeg",
+        b"avci",
+        b"avcs",
+        b"1pic",
+        b"evbi",
+        b"evbs",
+        b"evmi",
+        b"evms",
+        b"jpgs",
+        b"pred",
+        b"j2ki",
+        b"j2is",
+        b"jxsi",
+        b"jxss",
     ],
 )
 def test_iso_bmff_heif_compatible_brands_are_recognized(brand: bytes) -> None:
@@ -198,9 +242,8 @@ def test_iso_bmff_large_ftyp_boxes_are_parsed_with_bounded_sizes() -> None:
     assert _iso_bmff_image_format(standard_header) == "avif"
 
     extended_size = 24 + 4 * 20
-    extended_header = (
-        struct.pack(">I4sQ4sI", 1, b"ftyp", extended_size, b"isom", 0)
-        + b"".join([b"xxxx"] * 19 + [b"hevc"])
+    extended_header = struct.pack(">I4sQ4sI", 1, b"ftyp", extended_size, b"isom", 0) + b"".join(
+        [b"xxxx"] * 19 + [b"hevc"]
     )
     assert ftyp_signature_size(extended_header[:64]) == extended_size
     assert _iso_bmff_image_format(extended_header) == "heif"
@@ -213,9 +256,9 @@ def test_iso_bmff_ftyp_read_size_is_bounded_at_configured_limit() -> None:
     assert ftyp_signature_size(at_limit[:64]) == MAX_FTYP_BOX_BYTES
     assert _iso_bmff_image_format(at_limit) == "avif"
 
-    above_limit = struct.pack(
-        ">I4s4sI", MAX_FTYP_BOX_BYTES + 4, b"ftyp", b"isom", 0
-    ) + b"xxxx" * ((MAX_FTYP_BOX_BYTES - 16) // 4)
+    above_limit = struct.pack(">I4s4sI", MAX_FTYP_BOX_BYTES + 4, b"ftyp", b"isom", 0) + b"xxxx" * (
+        (MAX_FTYP_BOX_BYTES - 16) // 4
+    )
     assert ftyp_signature_size(above_limit[:64]) is None
     assert _iso_bmff_image_format(above_limit) is None
     assert detect_media_type(above_limit) is None
@@ -534,7 +577,9 @@ async def test_reddit_auto_webp_preview_uses_detected_format(tmp_path: Path) -> 
         "https://preview.redd.it/example.jpg?width=640&auto=png",
     ],
 )
-async def test_format_mismatch_without_reddit_webp_negotiation_is_rejected(url, tmp_path: Path) -> None:
+async def test_format_mismatch_without_reddit_webp_negotiation_is_rejected(
+    url, tmp_path: Path
+) -> None:
     session = FakeSession(FakeResponse([WEBP_BYTES], headers={"Content-Type": "image/webp"}))
     fetcher = MediaFetcher(session=session)
 
