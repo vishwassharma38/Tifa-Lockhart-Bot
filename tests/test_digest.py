@@ -39,6 +39,7 @@ class FakeDigestRepository:
         self.finished_jobs: list[dict[str, object]] = []
         self.candidate_queries: list[dict[str, object]] = []
         self.retry_queries: list[dict[str, object]] = []
+        self.reconciliation_queries: list[dict[str, object]] = []
         self.digest_success_calls = 0
         self.fail_ensure = False
         self.fail_mark_published = False
@@ -196,16 +197,28 @@ class FakeDigestRepository:
         rows = [
             row
             for row in self.publications.values()
-            if row["status"] in {"pending", "failed"}
+            if row["status"] in {"pending", "failed"} and int(row["attempt_count"]) < attempt_limit
+        ]
+        return [dict(row) for row in rows[:limit]]
+
+    async def list_exhausted_ambiguous_digest_publications(
+        self, *, attempt_limit: int, page_size: int = 100
+    ) -> list[dict[str, object]]:
+        self.reconciliation_queries.append({"attempt_limit": attempt_limit, "page_size": page_size})
+        rows = [
+            row
+            for row in self.publications.values()
+            if int(row["attempt_count"]) >= attempt_limit
+            and row["status"] in {"pending", "failed"}
             and (
-                int(row["attempt_count"]) < attempt_limit
-                or row["status"] == "pending"
+                row["status"] == "pending"
                 or str(row.get("last_error") or "").startswith(
                     ("discord_delivery_ambiguous:", "discord_delivery_failed")
                 )
             )
         ]
-        return [dict(row) for row in rows[:limit]]
+        rows.sort(key=lambda row: (str(row.get("created_at") or ""), str(row["id"])))
+        return [dict(row) for row in rows]
 
     async def get_media_item(self, media_item_id: str) -> dict[str, object] | None:
         row = self.media.get(media_item_id)
@@ -962,6 +975,117 @@ def _set_completed_digest_window(repository: FakeDigestRepository) -> None:
         "last_completed_at": iso(completed_at),
         "cursor_media_created_at": iso(completed_at),
     }
+
+
+async def test_large_exhausted_ambiguous_queue_is_separate_from_delivery_retries(
+    make_settings,
+) -> None:
+    repository = FakeDigestRepository()
+    for index in range(125):
+        media_id = f"old-{index:03}"
+        repository.add_media(media_id, created_at="2025-12-01T00:00:00+00:00")
+        repository.add_publication(
+            media_id,
+            999,
+            status="failed",
+            attempt_count=3,
+            last_error="discord_delivery_ambiguous:TimeoutError",
+        )
+    _set_completed_digest_window(repository)
+    publisher = FakePublisher(marker_lookup=MarkerLookup(message_id=None, conclusive=False))
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_DISCOVERIES_CHANNEL_ID="999",
+    )
+
+    await service.run()
+
+    assert repository.retry_queries[-1]["attempt_limit"] == 3
+    assert repository.reconciliation_queries == [{"attempt_limit": 3, "page_size": 100}]
+    assert len(publisher.marker_calls) == 125
+    assert publisher.calls == []
+    assert all(row["attempt_count"] == 3 for row in repository.publications.values())
+
+
+async def test_exhausted_backlog_does_not_starve_newer_delivery_retries(make_settings) -> None:
+    repository = FakeDigestRepository()
+    for index in range(125):
+        media_id = f"old-{index:03}"
+        repository.add_media(media_id, created_at="2025-12-01T00:00:00+00:00")
+        repository.add_publication(
+            media_id,
+            999,
+            status="failed",
+            attempt_count=3,
+            last_error="discord_delivery_ambiguous:TimeoutError",
+        )
+    retry_media_ids = ["new-retry-a", "new-retry-b", "new-retry-c"]
+    for media_id in retry_media_ids:
+        repository.add_media(media_id, created_at="2025-12-02T00:00:00+00:00")
+        repository.add_publication(
+            media_id,
+            999,
+            status="failed",
+            attempt_count=1,
+            last_error="storage_download_failed:TimeoutError",
+        )
+    _set_completed_digest_window(repository)
+    publisher = FakePublisher(marker_lookup=MarkerLookup(message_id=None, conclusive=False))
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_DISCOVERIES_CHANNEL_ID="999",
+    )
+
+    result = await service.run()
+
+    assert result.published_count == 3
+    assert {str(call["filename"]) for call in publisher.calls} == {
+        f"{media_id}.png" for media_id in retry_media_ids
+    }
+    assert len(publisher.marker_calls) == 125
+    assert all(
+        repository.publications[repository.publication_by_key[(media_id, 999)]]["attempt_count"]
+        == 2
+        for media_id in retry_media_ids
+    )
+
+
+async def test_large_reconciliation_queue_rechecks_records_beyond_first_page(make_settings) -> None:
+    repository = FakeDigestRepository()
+    for index in range(225):
+        media_id = f"old-{index:03}"
+        repository.add_media(media_id, created_at="2025-12-01T00:00:00+00:00")
+        repository.add_publication(
+            media_id,
+            999,
+            status="failed",
+            attempt_count=3,
+            last_error="discord_delivery_ambiguous:TimeoutError",
+        )
+    _set_completed_digest_window(repository)
+    publisher = FakePublisher(marker_lookup=MarkerLookup(message_id=None, conclusive=False))
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_DISCOVERIES_CHANNEL_ID="999",
+    )
+
+    await service.run()
+    await service.run()
+
+    assert len(publisher.marker_calls) == 450
+    markers = [str(call["marker"]) for call in publisher.marker_calls]
+    assert len(set(markers[:225])) == 225
+    assert set(markers[:225]) == set(markers[225:])
+    assert publisher.calls == []
 
 
 async def test_exhausted_ambiguous_publication_is_reconciled_and_recovered(make_settings) -> None:

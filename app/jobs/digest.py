@@ -192,6 +192,7 @@ class DigestService:
             unaccounted: list[str] = []
             await self._process_candidates(window, processed, counters, errors, unaccounted)
             await self._process_retryable(processed, counters, errors, unaccounted)
+            await self._process_exhausted_ambiguous(processed, counters, errors)
             if unaccounted:
                 errors["unaccounted_items"] += len(unaccounted)
                 outcome = "partial"
@@ -482,6 +483,64 @@ class DigestService:
                 errors=errors,
                 unaccounted=unaccounted,
             )
+
+    async def _process_exhausted_ambiguous(
+        self,
+        processed: set[tuple[str, int]],
+        counters: dict[str, int],
+        errors: Counter[str],
+    ) -> None:
+        """Reconcile exhausted ambiguous sends without granting delivery permission."""
+        try:
+            rows = await self._repository.list_exhausted_ambiguous_digest_publications(
+                attempt_limit=self._attempt_limit,
+                page_size=self._retry_batch_size,
+            )
+        except Exception as exc:
+            errors[f"reconciliation_queue_lookup_failed:{type(exc).__name__}"] += 1
+            log.warning("Digest reconciliation queue lookup failed (%s)", type(exc).__name__)
+            return
+
+        for publication in rows:
+            media_id = str(publication.get("media_item_id") or "")
+            try:
+                channel_id = int(publication.get("channel_id") or 0)
+            except (TypeError, ValueError):
+                channel_id = 0
+            if not media_id or channel_id <= 0:
+                continue
+            key = (media_id, channel_id)
+            if key in processed:
+                continue
+            processed.add(key)
+            counters["processed_count"] += 1
+            reconciliation = await self._reconcile(
+                publication,
+                channel_id=channel_id,
+                errors=errors,
+            )
+            if reconciliation == "reconciled":
+                counters["skipped_count"] += 1
+                continue
+            if reconciliation == "unreconciled":
+                counters["failed_count"] += 1
+                continue
+
+            # A conclusive miss means this record is no longer ambiguous, but it
+            # has exhausted its send budget and must not be retried.
+            counters["skipped_count"] += 1
+            try:
+                await self._repository.mark_publication_failed(
+                    str(publication["id"]),
+                    "delivery_attempt_limit_reached:no_marker_found",
+                )
+            except Exception as exc:
+                errors[f"exhausted_publication_update_failed:{type(exc).__name__}"] += 1
+                log.warning(
+                    "Digest exhausted publication state could not be updated publication=%s (%s)",
+                    publication["id"],
+                    type(exc).__name__,
+                )
 
     async def _deliver(
         self,

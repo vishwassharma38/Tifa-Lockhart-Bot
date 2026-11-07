@@ -1047,20 +1047,57 @@ class MediaRepository:
             .select("*")
             .eq("purpose", "daily_digest")
             .in_("status", ["pending", "failed"])
-            .or_(
-                ",".join(
-                    (
-                        f"attempt_count.lt.{max(1, attempt_limit)}",
-                        "status.eq.pending",
-                        "last_error.like.discord_delivery_ambiguous:*",
-                        "last_error.like.discord_delivery_failed*",
-                    )
-                )
-            )
+            .lt("attempt_count", max(1, attempt_limit))
             .order("created_at")
             .limit(max(1, limit))
             .execute()
         )
+
+    async def list_exhausted_ambiguous_digest_publications(
+        self,
+        *,
+        attempt_limit: int,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return every exhausted ambiguous row, reading the backlog in stable pages."""
+        return await self._to_thread(
+            self._list_exhausted_ambiguous_digest_publications_sync,
+            attempt_limit,
+            page_size,
+        )
+
+    def _list_exhausted_ambiguous_digest_publications_sync(
+        self, attempt_limit: int, page_size: int
+    ) -> list[dict[str, Any]]:
+        size = max(1, page_size)
+        offset = 0
+        results: list[dict[str, Any]] = []
+        while True:
+            page = self._rows(
+                self._client()
+                .table("publications")
+                .select("*")
+                .eq("purpose", "daily_digest")
+                .in_("status", ["pending", "failed"])
+                .gte("attempt_count", max(1, attempt_limit))
+                .or_(
+                    ",".join(
+                        (
+                            "status.eq.pending",
+                            "last_error.like.discord_delivery_ambiguous:*",
+                            "last_error.like.discord_delivery_failed*",
+                        )
+                    )
+                )
+                .order("created_at")
+                .order("id")
+                .range(offset, offset + size - 1)
+                .execute()
+            )
+            results.extend(page)
+            if len(page) < size:
+                return results
+            offset += len(page)
 
     async def get_media_item(self, media_item_id: str) -> dict[str, Any] | None:
         return await self._to_thread(self._get_media_item_sync, media_item_id)

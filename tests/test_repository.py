@@ -789,14 +789,41 @@ async def test_list_retryable_digest_publications_filters_unresolved_rows() -> N
     assert query.filters == [
         ("purpose", "daily_digest"),
         ("in.status", ["pending", "failed"]),
+        ("lt.attempt_count", 3),
     ]
-    assert query.or_expression == (
-        "attempt_count.lt.3,status.eq.pending,"
-        "last_error.like.discord_delivery_ambiguous:*,"
-        "last_error.like.discord_delivery_failed*"
-    )
     assert query.order_value == ("created_at", False)
     assert query.limit_value == 25
+
+
+async def test_list_exhausted_ambiguous_publications_reads_every_page() -> None:
+    client = FakeClient()
+    publications = client.table("publications")
+    publications.queued_results["select"] = [
+        [{"id": f"publication-{index}"} for index in range(100)],
+        [{"id": f"publication-{index}"} for index in range(100, 200)],
+        [{"id": f"publication-{index}"} for index in range(200, 207)],
+    ]
+    repository = make_repository(client)
+
+    rows = await repository.list_exhausted_ambiguous_digest_publications(
+        attempt_limit=3,
+        page_size=100,
+    )
+
+    assert len(rows) == 207
+    assert [query.range_value for query in publications.queries] == [
+        (0, 99),
+        (100, 199),
+        (200, 299),
+    ]
+    assert all(
+        query.orders == [("created_at", False), ("id", False)] for query in publications.queries
+    )
+    assert all(
+        query.or_expression == "status.eq.pending,last_error.like.discord_delivery_ambiguous:*,"
+        "last_error.like.discord_delivery_failed*"
+        for query in publications.queries
+    )
 
 
 async def test_record_reconciliation_diagnostic_preserves_ambiguous_error() -> None:
