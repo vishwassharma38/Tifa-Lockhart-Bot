@@ -20,6 +20,10 @@ class DiscordPublicationError(RuntimeError):
     """Raised when an attachment cannot be delivered to Discord."""
 
 
+class DiscordPublicationRejectedError(DiscordPublicationError):
+    """Raised when Discord definitively rejects an attachment request."""
+
+
 @dataclass(frozen=True, slots=True)
 class MarkerLookup:
     """Result of inspecting a channel for a deterministic publication marker."""
@@ -197,9 +201,17 @@ class DiscordPublisher:
                 content=build_publication_message(context or candidate),
                 file=file,
             )
+        except discord.HTTPException as exc:
+            if 400 <= exc.status < 500 and exc.status != 429:
+                raise DiscordPublicationRejectedError(
+                    f"Discord rejected attachment delivery (HTTP {exc.status})"
+                ) from None
+            raise DiscordPublicationError(
+                f"Discord attachment delivery outcome is uncertain ({type(exc).__name__})"
+            ) from None
         except Exception as exc:
             raise DiscordPublicationError(
-                f"Discord attachment delivery failed ({type(exc).__name__})"
+                f"Discord attachment delivery outcome is uncertain ({type(exc).__name__})"
             ) from None
         finally:
             file.close()

@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.bot.publisher import MarkerLookup
+from app.bot.publisher import DiscordPublicationRejectedError, MarkerLookup
 from app.jobs.digest import (
     INITIAL_DIGEST_WINDOW_START,
     DigestService,
@@ -810,10 +810,23 @@ async def test_reconciliation_lookup_error_fails_closed(make_settings) -> None:
     )
 
 
-async def test_discord_send_failure_leaves_retryable_failed_record(make_settings) -> None:
+async def test_ambiguous_discord_send_failure_is_reconciled_before_retry(make_settings) -> None:
     repository = FakeDigestRepository()
     repository.add_media("media-1")
-    publisher = FakePublisher(error=RuntimeError("discord unavailable"))
+
+    class AcceptedThenTimedOutPublisher(FakePublisher):
+        accepted: list[int] = []
+
+        async def publish(self, **kwargs: object) -> int:
+            self.calls.append(kwargs)
+            self.accepted.append(4242)
+            raise TimeoutError("response lost after acceptance")
+
+        async def find_publication_marker(self, *, channel_id: int, marker: str) -> MarkerLookup:
+            self.marker_calls.append({"channel_id": channel_id, "marker": marker})
+            return MarkerLookup(message_id=self.accepted[0], conclusive=True)
+
+    publisher = AcceptedThenTimedOutPublisher()
     service = build_service(
         make_settings,
         repository,
@@ -830,7 +843,40 @@ async def test_discord_send_failure_leaves_retryable_failed_record(make_settings
     publication = repository.publications["publication-1"]
     assert publication["status"] == "failed"
     assert publication["attempt_count"] == 1
-    assert publication["last_error"] == "discord_delivery_failed:RuntimeError"
+    assert publication["last_error"] == "discord_delivery_ambiguous:TimeoutError"
+
+    retry = await service.run()
+
+    assert retry.published_count == 0
+    assert retry.skipped_count >= 1
+    assert len(publisher.calls) == 1
+    assert publisher.accepted == [4242]
+    assert publisher.marker_calls == [
+        {"channel_id": 999, "marker": publication_marker(str(publication["id"]))}
+    ]
+    assert publication["status"] == "published"
+    assert publication["message_id"] == 4242
+
+
+async def test_definite_discord_rejection_leaves_retryable_failed_record(make_settings) -> None:
+    repository = FakeDigestRepository()
+    repository.add_media("media-1")
+    publisher = FakePublisher(error=DiscordPublicationRejectedError("HTTP 403"))
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_DISCOVERIES_CHANNEL_ID="999",
+    )
+
+    result = await service.run()
+
+    assert result.outcome == "partial"
+    assert result.failed_count == 1
+    publication = repository.publications["publication-1"]
+    assert publication["status"] == "failed"
+    assert publication["last_error"] == "discord_delivery_failed:DiscordPublicationRejectedError"
 
 
 async def test_database_update_after_send_is_recovered_by_marker(make_settings) -> None:

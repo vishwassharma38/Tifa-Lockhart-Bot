@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.bot.publisher import PublicationContext
+from app.bot.publisher import DiscordPublicationRejectedError, PublicationContext
 from app.config import Settings
 
 log = logging.getLogger(__name__)
@@ -495,15 +495,11 @@ class DigestService:
         if status == "published":
             counters["skipped_count"] += 1
             return True
-        if attempts >= self._attempt_limit:
-            counters["skipped_count"] += 1
-            log.info(
-                "Digest publication exhausted publication=%s attempts=%s",
-                publication_id,
-                attempts,
-            )
-            return True
-        if status == "pending" and attempts > 0:
+        last_error = str(publication.get("last_error") or "")
+        ambiguous_failure = last_error.startswith(
+            ("discord_delivery_ambiguous:", "discord_delivery_failed")
+        )
+        if attempts > 0 and (status == "pending" or ambiguous_failure):
             reconciliation = await self._reconcile(
                 publication,
                 channel_id=channel_id,
@@ -526,6 +522,14 @@ class DigestService:
                 )
                 return True
 
+        if attempts >= self._attempt_limit:
+            counters["skipped_count"] += 1
+            log.info(
+                "Digest publication exhausted publication=%s attempts=%s",
+                publication_id,
+                attempts,
+            )
+            return True
         try:
             updated = await self._repository.record_publication_attempt(
                 publication_id,
@@ -602,9 +606,11 @@ class DigestService:
                 channel_id=channel_id,
             )
         except Exception as exc:
+            definite_rejection = isinstance(exc, DiscordPublicationRejectedError)
+            error_kind = "failed" if definite_rejection else "ambiguous"
             await self._record_failure(
                 publication_id,
-                f"discord_delivery_failed:{type(exc).__name__}",
+                f"discord_delivery_{error_kind}:{type(exc).__name__}",
                 counters,
                 errors,
             )
