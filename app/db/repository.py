@@ -11,7 +11,15 @@ from urllib.parse import urlparse
 from app.db.client import SupabaseDatabase
 from app.reddit.models import RedditCandidate
 
-_JOB_TYPES = ("reddit_collection", "brave_discovery", "crawl")
+_JOB_TYPES = ("reddit_collection", "brave_discovery", "crawl", "daily_digest")
+_DIGEST_STATE_FIELDS = frozenset(
+    {
+        "last_window_start",
+        "last_window_end",
+        "last_completed_at",
+        "cursor_media_created_at",
+    }
+)
 _DISCOVERY_STATUSES = frozenset(
     {"queued", "processing", "verified", "dumpster", "rejected", "blocked", "failed", "oversize"}
 )
@@ -835,3 +843,330 @@ class MediaRepository:
         if rows:
             return rows[0]
         return {"id": publication_id, **payload}
+
+    async def get_digest_publication(
+        self, media_item_id: str, channel_id: int
+    ) -> dict[str, Any] | None:
+        """Return the durable daily-digest delivery row for one item and channel."""
+        return await self._to_thread(self._get_digest_publication_sync, media_item_id, channel_id)
+
+    def _get_digest_publication_sync(
+        self, media_item_id: str, channel_id: int
+    ) -> dict[str, Any] | None:
+        rows = self._rows(
+            self._client()
+            .table("publications")
+            .select("*")
+            .eq("media_item_id", media_item_id)
+            .eq("channel_id", channel_id)
+            .eq("purpose", "daily_digest")
+            .limit(1)
+            .execute()
+        )
+        return rows[0] if rows else None
+
+    async def ensure_digest_publication(
+        self,
+        media_item_id: str,
+        channel_id: int,
+    ) -> dict[str, Any]:
+        """Create a digest row only when none exists, recovering unique conflicts.
+
+        The partial unique index ``uq_publications_digest_item_channel`` remains
+        the final safety boundary. Attempts are counted separately with
+        :meth:`record_publication_attempt`, so a freshly created row starts at
+        zero.
+        """
+        return await self._to_thread(
+            self._ensure_digest_publication_sync, media_item_id, channel_id
+        )
+
+    def _ensure_digest_publication_sync(
+        self, media_item_id: str, channel_id: int
+    ) -> dict[str, Any]:
+        existing = self._get_digest_publication_sync(media_item_id, channel_id)
+        if existing is not None:
+            return existing
+        payload = {
+            "media_item_id": media_item_id,
+            "channel_id": channel_id,
+            "purpose": "daily_digest",
+            "status": "pending",
+            "attempt_count": 0,
+        }
+        try:
+            response = self._client().table("publications").insert(payload).execute()
+        except Exception as exc:
+            if _is_unique_violation(exc):
+                existing = self._get_digest_publication_sync(media_item_id, channel_id)
+                if existing is not None:
+                    return existing
+            raise
+        rows = self._rows(response)
+        if rows:
+            return rows[0]
+        fallback = self._get_digest_publication_sync(media_item_id, channel_id)
+        if fallback is not None:
+            return fallback
+        raise RepositoryError("Digest publication insert returned no row")
+
+    async def record_publication_attempt(
+        self,
+        publication_id: str,
+        *,
+        expected_attempt_count: int,
+    ) -> dict[str, Any]:
+        """Advance the real delivery attempt count before any send is attempted."""
+        return await self._to_thread(
+            self._record_publication_attempt_sync,
+            publication_id,
+            expected_attempt_count,
+        )
+
+    def _record_publication_attempt_sync(
+        self, publication_id: str, expected_attempt_count: int
+    ) -> dict[str, Any]:
+        payload = {
+            "status": "pending",
+            "attempt_count": max(0, expected_attempt_count) + 1,
+            "last_error": None,
+        }
+        response = (
+            self._client()
+            .table("publications")
+            .update(payload)
+            .eq("id", publication_id)
+            .eq("attempt_count", max(0, expected_attempt_count))
+            .execute()
+        )
+        rows = self._rows(response)
+        if rows:
+            return rows[0]
+        current = self._rows(
+            self._client()
+            .table("publications")
+            .select("*")
+            .eq("id", publication_id)
+            .limit(1)
+            .execute()
+        )
+        if current:
+            return current[0]
+        raise RepositoryError("Publication attempt could not be recorded")
+
+    async def mark_publication_published(
+        self,
+        publication_id: str,
+        message_id: int,
+    ) -> dict[str, Any]:
+        return await self._to_thread(
+            self._mark_publication_published_sync, publication_id, message_id
+        )
+
+    def _mark_publication_published_sync(
+        self, publication_id: str, message_id: int
+    ) -> dict[str, Any]:
+        payload = {
+            "status": "published",
+            "message_id": message_id,
+            "published_at": datetime.now(tz=UTC).isoformat(),
+            "last_error": None,
+        }
+        response = (
+            self._client().table("publications").update(payload).eq("id", publication_id).execute()
+        )
+        rows = self._rows(response)
+        if rows:
+            return rows[0]
+        return {"id": publication_id, **payload}
+
+    async def mark_publication_failed(
+        self,
+        publication_id: str,
+        error: str,
+    ) -> dict[str, Any]:
+        return await self._to_thread(self._mark_publication_failed_sync, publication_id, error)
+
+    def _mark_publication_failed_sync(self, publication_id: str, error: str) -> dict[str, Any]:
+        payload = {"status": "failed", "last_error": error[:500]}
+        response = (
+            self._client().table("publications").update(payload).eq("id", publication_id).execute()
+        )
+        rows = self._rows(response)
+        if rows:
+            return rows[0]
+        return {"id": publication_id, **payload}
+
+    async def record_publication_reconciliation_error(
+        self,
+        publication_id: str,
+        error: str,
+    ) -> dict[str, Any]:
+        """Keep an ambiguous pending row unresolved while recording the reason."""
+        return await self._to_thread(
+            self._record_publication_reconciliation_error_sync, publication_id, error
+        )
+
+    def _record_publication_reconciliation_error_sync(
+        self, publication_id: str, error: str
+    ) -> dict[str, Any]:
+        payload = {"last_error": error[:500]}
+        response = (
+            self._client().table("publications").update(payload).eq("id", publication_id).execute()
+        )
+        rows = self._rows(response)
+        if rows:
+            return rows[0]
+        return {"id": publication_id, **payload}
+
+    async def list_retryable_digest_publications(
+        self,
+        *,
+        attempt_limit: int,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return unresolved digest rows below the bounded attempt limit."""
+        return await self._to_thread(
+            self._list_retryable_digest_publications_sync,
+            attempt_limit,
+            limit,
+        )
+
+    def _list_retryable_digest_publications_sync(
+        self, attempt_limit: int, limit: int
+    ) -> list[dict[str, Any]]:
+        return self._rows(
+            self._client()
+            .table("publications")
+            .select("*")
+            .eq("purpose", "daily_digest")
+            .in_("status", ["pending", "failed"])
+            .lt("attempt_count", max(1, attempt_limit))
+            .order("created_at")
+            .limit(max(1, limit))
+            .execute()
+        )
+
+    async def get_media_item(self, media_item_id: str) -> dict[str, Any] | None:
+        return await self._to_thread(self._get_media_item_sync, media_item_id)
+
+    def _get_media_item_sync(self, media_item_id: str) -> dict[str, Any] | None:
+        rows = self._rows(
+            self._client()
+            .table("media_items")
+            .select("*")
+            .eq("id", media_item_id)
+            .limit(1)
+            .execute()
+        )
+        return rows[0] if rows else None
+
+    async def list_digest_candidates(
+        self,
+        *,
+        window_start: str,
+        window_end: str,
+        cursor: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Return eligible media in deterministic window order.
+
+        The cursor is inclusive. Re-reading rows at the last persisted timestamp
+        is safe because publication records decide whether delivery already
+        happened, and it prevents ties from being skipped permanently.
+        """
+        return await self._to_thread(
+            self._list_digest_candidates_sync,
+            window_start,
+            window_end,
+            cursor,
+            limit,
+            offset,
+        )
+
+    def _list_digest_candidates_sync(
+        self,
+        window_start: str,
+        window_end: str,
+        cursor: str | None,
+        limit: int,
+        offset: int,
+    ) -> list[dict[str, Any]]:
+        page_size = max(1, limit)
+        start_offset = max(0, offset)
+        query = (
+            self._client()
+            .table("media_items")
+            .select("*")
+            .eq("verification_status", "verified")
+            .eq("download_status", "stored")
+            .gte("created_at", cursor or window_start)
+            .lte("created_at", window_end)
+            .order("created_at")
+            .order("id")
+            .range(start_offset, start_offset + page_size - 1)
+        )
+        return self._rows(query.execute())
+
+    async def digest_publication_counts(self, *, attempt_limit: int = 3) -> dict[str, int]:
+        return await self._to_thread(self._digest_publication_counts_sync, attempt_limit)
+
+    def _digest_publication_counts_sync(self, attempt_limit: int) -> dict[str, int]:
+        client = self._client()
+
+        def count(status: str, attempt_filter: str | None = None) -> int:
+            query = (
+                client.table("publications")
+                .select("id", count="exact")
+                .eq("purpose", "daily_digest")
+                .eq("status", status)
+            )
+            threshold = max(1, attempt_limit)
+            if attempt_filter == "retryable":
+                query = query.lt("attempt_count", threshold)
+            elif attempt_filter == "exhausted":
+                query = query.gte("attempt_count", threshold)
+            response = query.limit(1).execute()
+            return int(getattr(response, "count", None) or 0)
+
+        return {
+            "pending": count("pending"),
+            "failed_retryable": count("failed", "retryable"),
+            "failed_exhausted": count("failed", "exhausted"),
+        }
+
+    async def get_digest_state(self) -> dict[str, Any]:
+        return await self._to_thread(self._get_digest_state_sync)
+
+    def _get_digest_state_sync(self) -> dict[str, Any]:
+        rows = self._rows(
+            self._client().table("digest_state").select("*").eq("id", 1).limit(1).execute()
+        )
+        return rows[0] if rows else {"id": 1}
+
+    async def update_digest_state(self, fields: dict[str, Any]) -> dict[str, Any]:
+        return await self._to_thread(self._update_digest_state_sync, dict(fields))
+
+    def _update_digest_state_sync(self, fields: dict[str, Any]) -> dict[str, Any]:
+        payload = {
+            key: value
+            for key, value in fields.items()
+            if key in _DIGEST_STATE_FIELDS and value is not None
+        }
+        if not payload:
+            return {"id": 1}
+        response = self._client().table("digest_state").update(payload).eq("id", 1).execute()
+        rows = self._rows(response)
+        return rows[0] if rows else {"id": 1, **payload}
+
+    async def mark_digest_success(self) -> None:
+        await self._to_thread(self._mark_digest_success_sync)
+
+    def _mark_digest_success_sync(self) -> None:
+        self._client().table("runtime_state").update(
+            {"last_digest_success_at": datetime.now(tz=UTC).isoformat()}
+        ).eq("id", 1).execute()
+
+    async def latest_digest_runs(self, limit: int = 1) -> list[dict[str, Any]]:
+        return await self.latest_jobs("daily_digest", limit)

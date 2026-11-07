@@ -407,3 +407,64 @@ def test_secret_values_and_safe_summary(make_settings) -> None:
     assert "discord=configured" in summary
     assert "supabase=configured" in summary
     assert "b2=configured" in summary
+
+
+def test_category_channels_default_to_empty_mapping() -> None:
+    settings = Settings.from_env(env={}, load_env_file=False)
+
+    assert settings.category_channels == {}
+
+
+def test_empty_category_channel_object_is_accepted() -> None:
+    settings = Settings.from_env(
+        env={"DISCORD_CATEGORY_CHANNELS_JSON": "{}"},
+        load_env_file=False,
+    )
+
+    assert settings.category_channels == {}
+
+
+def test_category_channel_mapping_is_parsed() -> None:
+    settings = Settings.from_env(
+        env={
+            "DISCORD_CATEGORY_CHANNELS_JSON": (
+                '{"fanart": 123456789012345678, "cosplay_photography": 123456789012345679, '
+                '"official_artwork": 1, "wallpaper": 2, "video": 3, "other": 4}'
+            )
+        },
+        load_env_file=False,
+    )
+
+    assert settings.category_channels == {
+        "fanart": 123456789012345678,
+        "cosplay_photography": 123456789012345679,
+        "official_artwork": 1,
+        "wallpaper": 2,
+        "video": 3,
+        "other": 4,
+    }
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_message"),
+    [
+        ('{"fanart": ', "valid JSON"),
+        ('["fanart"]', "JSON object"),
+        ('{"portrait": 123}', "unsupported category"),
+        ('{"fanart": "123"}', "integer channel IDs"),
+        ('{"fanart": 12.5}', "integer channel IDs"),
+        ('{"fanart": true}', "integer channel IDs"),
+        ('{"fanart": 0}', "positive channel IDs"),
+        ('{"fanart": -5}', "positive channel IDs"),
+    ],
+)
+def test_invalid_category_channel_configuration_is_rejected(
+    raw: str, expected_message: str
+) -> None:
+    with pytest.raises(ConfigurationError, match=expected_message) as exc_info:
+        Settings.from_env(
+            env={"DISCORD_CATEGORY_CHANNELS_JSON": raw},
+            load_env_file=False,
+        )
+
+    assert "DISCORD_CATEGORY_CHANNELS_JSON" in str(exc_info.value)

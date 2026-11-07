@@ -17,6 +17,7 @@ from app.config import Settings
 from app.discovery.brave import BraveDiscoveryService, BraveSearchAdapter
 from app.discovery.crawler import DiscoveryCrawler, WebSaveService
 from app.discovery.http import SafeHttpClient
+from app.jobs.digest import DigestService
 from app.media.fetcher import MediaFetcher
 from app.pipeline.phase2 import Phase2Pipeline
 from app.reddit.collector import RedditCollector
@@ -71,9 +72,11 @@ class TifaBot(commands.Bot):
         self.crawler: DiscoveryCrawler | None = None
         self.web_save_service: WebSaveService | None = None
         self.safe_http_client: SafeHttpClient | None = None
+        self.digest_service: DigestService | None = None
         self.scheduler: AsyncIOScheduler | None = None
         self._active_collection_task: asyncio.Task[Any] | None = None
         self._active_background_tasks: set[asyncio.Task[Any]] = set()
+        self._digest_catch_up_started = False
 
     async def setup_hook(self) -> None:
         await self.add_cog(PhaseFourCommands(self))
@@ -127,6 +130,15 @@ class TifaBot(commands.Bot):
                     pipeline,
                     client=self.safe_http_client,
                 )
+                self.digest_service = DigestService(
+                    settings=self.settings,
+                    repository=self.repository,
+                    storage=self.storage,
+                    publisher=DiscordPublisher(
+                        self,
+                        self.settings.discoveries_channel_id or 0,
+                    ),
+                )
                 state = await self.repository.get_runtime_state()
                 self.scheduler = AsyncIOScheduler(timezone=ZoneInfo("Asia/Kolkata"))
                 self.scheduler.add_job(
@@ -159,6 +171,17 @@ class TifaBot(commands.Bot):
                     max_instances=1,
                     misfire_grace_time=300,
                 )
+                self.scheduler.add_job(
+                    self._scheduled_digest,
+                    "cron",
+                    hour=4,
+                    minute=0,
+                    id="daily_digest",
+                    replace_existing=True,
+                    coalesce=True,
+                    max_instances=1,
+                    misfire_grace_time=3600,
+                )
                 self.scheduler.start()
                 log.info(
                     "Scheduler initialized; persisted collection=%s Brave interval=%s hours",
@@ -186,6 +209,14 @@ class TifaBot(commands.Bot):
             user.id if user else "unknown",
             len(self.guilds),
         )
+        if self.digest_service is not None and not self._digest_catch_up_started:
+            self._digest_catch_up_started = True
+            task = asyncio.create_task(
+                self._run_startup_digest_catch_up(),
+                name="digest-startup-catch-up",
+            )
+            self._active_background_tasks.add(task)
+            task.add_done_callback(self._digest_catch_up_done)
 
     async def _scheduled_collection(self) -> None:
         if self.collector is not None:
@@ -231,6 +262,45 @@ class TifaBot(commands.Bot):
         finally:
             if current is not None:
                 self._active_background_tasks.discard(current)
+
+    async def _scheduled_digest(self) -> None:
+        current = asyncio.current_task()
+        if current is not None:
+            self._active_background_tasks.add(current)
+        try:
+            if self.digest_service is not None:
+                await self.digest_service.run(trigger="scheduled")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Scheduled digest failed (%s)", type(exc).__name__)
+        finally:
+            if current is not None:
+                self._active_background_tasks.discard(current)
+
+    async def _run_startup_digest_catch_up(self) -> None:
+        service = self.digest_service
+        if service is None:
+            return
+        try:
+            if await service.catch_up_required():
+                log.info("Startup digest catch-up is due")
+                await service.run(trigger="startup_catch_up")
+            else:
+                log.info("Startup digest catch-up is not due")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Startup digest catch-up failed (%s)", type(exc).__name__)
+
+    def _digest_catch_up_done(self, task: asyncio.Task[Any]) -> None:
+        self._active_background_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception as exc:
+            log.warning("Startup digest catch-up stopped with an error (%s)", type(exc).__name__)
 
     async def close(self) -> None:
         log.info("Closing Discord client")

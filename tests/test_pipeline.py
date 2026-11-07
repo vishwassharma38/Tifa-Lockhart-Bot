@@ -253,13 +253,18 @@ def build_pipeline(
     storage: FakeStorage | None = None,
     publisher: FakePublisher | None = None,
     channel_id: str | None = "999",
+    saves_channel_id: str | None = None,
+    publication_purpose: str = "test_discovery",
 ) -> tuple[Phase2Pipeline, FakeConnector, FakeFetcher, FakeRepository, FakeStorage, FakePublisher]:
     connector = connector or FakeConnector()
     fetcher = fetcher or FakeFetcher()
     repository = repository or FakeRepository()
     storage = storage or FakeStorage()
     publisher = publisher or FakePublisher()
-    settings = make_settings(DISCORD_DISCOVERIES_CHANNEL_ID=channel_id)
+    settings = make_settings(
+        DISCORD_DISCOVERIES_CHANNEL_ID=channel_id,
+        DISCORD_SAVES_CHANNEL_ID=saves_channel_id,
+    )
     pipeline = Phase2Pipeline(
         settings=settings,
         connector=connector,
@@ -267,6 +272,7 @@ def build_pipeline(
         repository=repository,
         storage=storage,
         publisher=publisher,
+        publication_purpose=publication_purpose,
         temp_dir_factory=lambda: str(tmp_path / "work"),
     )
     return pipeline, connector, fetcher, repository, storage, publisher
@@ -485,3 +491,31 @@ async def test_publication_status_update_failure_is_recoverable(make_settings, t
     assert result.reason == "publication_status_update_failed"
     assert result.message_id == 555
     assert result.object_key == build_object_key(PNG_SHA256, "png")
+
+
+async def test_manual_save_publishes_immediately_to_saves_destination(
+    make_settings, tmp_path
+) -> None:
+    pipeline, _connector, _fetcher, repository, storage, publisher = build_pipeline(
+        make_settings,
+        tmp_path,
+        channel_id="999",
+        saves_channel_id="888",
+        publication_purpose="manual_save",
+    )
+
+    result = await pipeline.run("abc123")
+
+    assert result.status is Phase2Status.PUBLISHED
+    assert result.reason == "published"
+    assert len(publisher.calls) == 1
+    assert repository.publications == [
+        {
+            "media_item_id": "media-1",
+            "channel_id": 888,
+            "purpose": "manual_save",
+        }
+    ]
+    assert repository.updates[-1]["status"] == "published"
+    assert repository.updates[-1]["message_id"] == 555
+    assert storage.downloads == [build_object_key(PNG_SHA256, "png")]

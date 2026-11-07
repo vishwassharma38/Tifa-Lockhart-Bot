@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import types
+
+import discord
+from discord import app_commands
+
 from app.bot.client import sync_application_commands
 from app.bot.commands import (
     ABOUT_PURPOSE,
@@ -120,19 +126,26 @@ class FakeResponse:
         self.messages.append({"args": args, **kwargs})
 
 
+class FakeSentMessage:
+    def __init__(self, message_id: int = 999) -> None:
+        self.id = message_id
+
+
 class FakeFollowup:
     def __init__(self) -> None:
         self.messages: list[dict[str, object]] = []
 
-    async def send(self, *args: object, **kwargs: object) -> None:
+    async def send(self, *args: object, **kwargs: object) -> FakeSentMessage:
         self.messages.append({"args": args, **kwargs})
+        return FakeSentMessage()
 
 
 class FakeInteraction:
-    def __init__(self, user_id: int = 1) -> None:
+    def __init__(self, user_id: int = 1, channel_id: int = 5) -> None:
         self.response = FakeResponse()
         self.followup = FakeFollowup()
         self.user = type("User", (), {"id": user_id})()
+        self.channel_id = channel_id
 
 
 class FakeStatusService:
@@ -150,9 +163,18 @@ class FakeStatusService:
 
 
 class FakeBot:
-    def __init__(self, settings, status_service: FakeStatusService) -> None:
+    def __init__(
+        self,
+        settings,
+        status_service: FakeStatusService,
+        *,
+        repository: object | None = None,
+        storage: object | None = None,
+    ) -> None:
         self.settings = settings
         self.status_service = status_service
+        self.repository = repository
+        self.storage = storage
 
     def is_ready(self) -> bool:
         return True
@@ -240,3 +262,315 @@ async def test_status_command_reports_failure_without_leaking_details(make_setti
     message = interaction.followup.messages[0]
     assert message["ephemeral"] is True
     assert "secret-looking failure detail" not in str(message)
+
+
+class FakeOperationalRepository:
+    def __init__(
+        self,
+        *,
+        digest_runs: list[dict[str, object]] | None = None,
+        digest_state: dict[str, object] | None = None,
+        digest_counts: dict[str, int] | None = None,
+        fail_digest: bool = False,
+    ) -> None:
+        self.digest_runs = digest_runs or []
+        self.digest_state = digest_state or {"id": 1}
+        self.digest_counts = digest_counts or {
+            "pending": 0,
+            "failed_retryable": 0,
+            "failed_exhausted": 0,
+        }
+        self.fail_digest = fail_digest
+
+    async def get_runtime_state(self) -> dict[str, object]:
+        return {
+            "collection_enabled": True,
+            "last_reddit_success_at": "2026-01-01T00:00:00+00:00",
+            "last_brave_success_at": None,
+            "last_digest_success_at": "2026-01-01T04:00:00+00:00",
+            "brave_paused": False,
+            "brave_pause_reason": None,
+        }
+
+    async def latest_reddit_runs(self, _limit: int = 1) -> list[dict[str, object]]:
+        return []
+
+    async def latest_brave_runs(self, _limit: int = 1) -> list[dict[str, object]]:
+        return []
+
+    async def latest_crawl_runs(self, _limit: int = 1) -> list[dict[str, object]]:
+        return []
+
+    async def latest_digest_runs(self, _limit: int = 1) -> list[dict[str, object]]:
+        if self.fail_digest:
+            raise RuntimeError("digest runs unavailable")
+        return self.digest_runs
+
+    async def digest_publication_counts(self, *, attempt_limit: int = 3) -> dict[str, int]:
+        assert attempt_limit == 3
+        if self.fail_digest:
+            raise RuntimeError("digest counts unavailable")
+        return dict(self.digest_counts)
+
+    async def get_digest_state(self) -> dict[str, object]:
+        if self.fail_digest:
+            raise RuntimeError("digest state unavailable")
+        return dict(self.digest_state)
+
+    async def operational_counts(self) -> dict[str, object]:
+        return {
+            "queued": 7,
+            "processing": 1,
+            "verified": 4,
+            "dumpster": 3,
+            "rejected": 2,
+            "blocked": 1,
+            "failed": 1,
+            "oversize": 1,
+            "last_digest_success_at": "2026-01-01T04:00:00+00:00",
+            "last_brave_success_at": None,
+            "brave_paused": False,
+            "brave_pause_reason": None,
+        }
+
+    async def asset_stats(self, _start: str | None = None) -> dict[str, int]:
+        return {"total": 10, "delivered": 8, "image": 6, "animation": 2, "video": 2}
+
+    async def random_asset(self) -> dict[str, object]:
+        data = b"random-media"
+        return {
+            "id": "media-random",
+            "storage_object_key": "media/random",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "filename": "random.png",
+            "extension": "png",
+        }
+
+    async def source_for_media(self, _media_item_id: str) -> dict[str, object]:
+        return {
+            "title": "Random Tifa artwork",
+            "creator_name": "artist",
+            "creator_profile_url": "https://example.com/artist",
+            "source_url": "https://example.com/random",
+        }
+
+    async def create_publication(
+        self, _media_item_id: str, _channel_id: int, _purpose: str
+    ) -> dict[str, object]:
+        return {"id": "publication-random"}
+
+    async def update_publication(
+        self,
+        _publication_id: str,
+        *,
+        status: str,
+        message_id: int | None = None,
+        last_error: str | None = None,
+    ) -> dict[str, object]:
+        return {"status": status, "message_id": message_id, "last_error": last_error}
+
+
+class FakeRandomStorage:
+    async def download_bytes(
+        self, _object_key: str, *, max_bytes: int | None = None, timeout: float | None = None
+    ) -> bytes:
+        assert max_bytes == 10_000_000
+        return b"random-media"
+
+
+async def test_status_command_reports_real_digest_state(make_settings) -> None:
+    report = StatusReport(
+        discord_connected=True,
+        app_version="1.2.3",
+        app_env="test",
+        supabase=DependencyStatus.verified(),
+        storage=DependencyStatus.verified(),
+    )
+    repository = FakeOperationalRepository(
+        digest_runs=[
+            {
+                "outcome": "partial",
+                "error_summary": "storage_download_failed:RuntimeError",
+            }
+        ],
+        digest_state={
+            "id": 1,
+            "last_window_start": "2026-01-01T22:00:00+00:00",
+            "last_window_end": "2026-01-02T00:00:00+00:00",
+            "last_completed_at": None,
+        },
+        digest_counts={"pending": 4, "failed_retryable": 2, "failed_exhausted": 1},
+    )
+    cog = PhaseFourCommands(
+        FakeBot(
+            make_settings(OWNER_DISCORD_ID="1"),
+            FakeStatusService(report=report),
+            repository=repository,
+        )
+    )
+    interaction = FakeInteraction()
+
+    await PhaseFourCommands.status_command.callback(cog, interaction)
+
+    assert len(interaction.followup.messages) == 1
+    embed = interaction.followup.messages[0]["embed"]
+    fields = {field.name: field.value for field in embed.fields}
+    digest = fields["Daily digest"]
+    assert "Schedule: 04:00 IST" in digest
+    assert "last success: 2026-01-01T04:00:00+00:00" in digest
+    assert "latest: partial (storage_download_failed:RuntimeError)" in digest
+    assert "pending: 4" in digest
+    assert "retryable failed: 2" in digest
+    assert "exhausted: 1" in digest
+    assert "window: incomplete / awaiting recovery" in digest
+    assert "Not implemented in Phase 6" not in digest
+
+
+async def test_status_command_reports_empty_digest_history(make_settings) -> None:
+    report = StatusReport(
+        discord_connected=True,
+        app_version="1.2.3",
+        app_env="test",
+        supabase=DependencyStatus.verified(),
+        storage=DependencyStatus.verified(),
+    )
+    repository = FakeOperationalRepository(digest_runs=[], digest_state={"id": 1})
+    cog = PhaseFourCommands(
+        FakeBot(make_settings(), FakeStatusService(report=report), repository=repository)
+    )
+    interaction = FakeInteraction()
+
+    await PhaseFourCommands.status_command.callback(cog, interaction)
+
+    embed = interaction.followup.messages[0]["embed"]
+    fields = {field.name: field.value for field in embed.fields}
+    digest = fields["Daily digest"]
+    assert "latest: No runs" in digest
+    assert "pending: 0" in digest
+    assert "window: not started" in digest
+
+
+async def test_status_command_survives_unavailable_digest_data(make_settings) -> None:
+    report = StatusReport(
+        discord_connected=True,
+        app_version="1.2.3",
+        app_env="test",
+        supabase=DependencyStatus.verified(),
+        storage=DependencyStatus.verified(),
+    )
+    repository = FakeOperationalRepository(fail_digest=True)
+    cog = PhaseFourCommands(
+        FakeBot(make_settings(), FakeStatusService(report=report), repository=repository)
+    )
+    interaction = FakeInteraction()
+
+    await PhaseFourCommands.status_command.callback(cog, interaction)
+
+    assert len(interaction.followup.messages) == 1
+    embed = interaction.followup.messages[0]["embed"]
+    fields = {field.name: field.value for field in embed.fields}
+    assert "Daily digest" not in fields
+    assert fields["Collection"].startswith("Persisted: enabled")
+
+
+async def test_stop_pauses_collection_without_touching_digest(make_settings) -> None:
+    class Repository(FakeOperationalRepository):
+        async def set_collection_enabled(self, enabled: bool) -> dict[str, object]:
+            return {"collection_enabled": enabled}
+
+    class Digest:
+        def __init__(self) -> None:
+            self.run_calls: list[str] = []
+
+        async def run(self, *, trigger: str) -> None:
+            self.run_calls.append(trigger)
+
+    bot = FakeBot(
+        make_settings(OWNER_DISCORD_ID="1"),
+        FakeStatusService(),
+        repository=Repository(),
+    )
+    digest = Digest()
+    bot.digest_service = digest
+    cog = PhaseFourCommands(bot)
+    interaction = FakeInteraction(user_id=1)
+
+    await PhaseFourCommands.stop_collection.callback(cog, interaction)
+
+    assert "paused" in interaction.followup.messages[0]["args"][0]
+    assert digest.run_calls == []
+
+
+async def test_random_command_still_delivers_archived_media(make_settings) -> None:
+    repository = FakeOperationalRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    cog = PhaseFourCommands(bot)
+    interaction = FakeInteraction(channel_id=5)
+
+    await PhaseFourCommands.random_asset.callback(cog, interaction)
+
+    assert interaction.response.deferred == [{"thinking": True}]
+    message = interaction.followup.messages[0]
+    assert isinstance(message["file"], discord.File)
+    assert "Random Tifa artwork" in message["args"][0]
+    assert "Creator: artist (https://example.com/artist)" in message["args"][0]
+
+
+async def test_stats_command_still_reports_archive_counts(make_settings) -> None:
+    cog = PhaseFourCommands(
+        FakeBot(
+            make_settings(),
+            FakeStatusService(),
+            repository=FakeOperationalRepository(),
+        )
+    )
+    interaction = FakeInteraction()
+
+    await PhaseFourCommands.stats.callback(
+        cog,
+        interaction,
+        app_commands.Choice(name="Week", value="week"),
+    )
+
+    text = interaction.followup.messages[0]["args"][0]
+    assert "unique archived assets: 10" in text
+    assert "delivered files: 8" in text
+    assert "images: 6" in text
+
+
+async def test_save_command_remains_available_while_collection_is_paused(make_settings) -> None:
+    class Repository(FakeOperationalRepository):
+        async def get_runtime_state(self) -> dict[str, object]:
+            return {"collection_enabled": False}
+
+    class Pipeline:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def run(self, url: str) -> object:
+            self.calls.append(url)
+            return types.SimpleNamespace(
+                status=types.SimpleNamespace(value="published"),
+                reason="published",
+            )
+
+    pipeline = Pipeline()
+    bot = FakeBot(
+        make_settings(OWNER_DISCORD_ID="1"),
+        FakeStatusService(),
+        repository=Repository(),
+    )
+    bot.pipeline = pipeline
+    cog = PhaseFourCommands(bot)
+    interaction = FakeInteraction()
+
+    await PhaseFourCommands.save.callback(cog, interaction, "abc123")
+
+    assert interaction.response.deferred == [{"ephemeral": True, "thinking": True}]
+    assert pipeline.calls == ["abc123"]
+    assert "published" in interaction.followup.messages[0]["args"][0]

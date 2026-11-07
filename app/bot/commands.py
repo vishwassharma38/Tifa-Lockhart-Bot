@@ -15,6 +15,7 @@ from discord.ext import commands
 
 from app.config import Settings
 from app.health.status import StatusReport
+from app.jobs.digest import DEFAULT_DIGEST_ATTEMPT_LIMIT, digest_window_incomplete
 from app.reddit.connector import parse_submission_id
 
 if TYPE_CHECKING:
@@ -305,6 +306,25 @@ class PhaseFourCommands(commands.Cog):
             crawl_runs = await self.bot.repository.latest_crawl_runs(1)
             brave_latest = brave_runs[0] if brave_runs else None
             crawl_latest = crawl_runs[0] if crawl_runs else None
+            digest_runs = await self.bot.repository.latest_digest_runs(1)
+            digest_counts = await self.bot.repository.digest_publication_counts(
+                attempt_limit=DEFAULT_DIGEST_ATTEMPT_LIMIT
+            )
+            digest_state = await self.bot.repository.get_digest_state()
+            digest_latest = digest_runs[0] if digest_runs else None
+            if digest_latest:
+                digest_latest_text = str(digest_latest.get("outcome") or "unknown")
+                digest_error = digest_latest.get("error_summary")
+                if digest_error:
+                    digest_latest_text = f"{digest_latest_text} ({str(digest_error)[:150]})"
+            else:
+                digest_latest_text = "No runs"
+            if digest_window_incomplete(digest_state):
+                digest_window_text = "incomplete / awaiting recovery"
+            elif digest_state.get("last_window_end"):
+                digest_window_text = "complete"
+            else:
+                digest_window_text = "not started"
 
             def run_summary(row: dict[str, object] | None) -> str:
                 if not row:
@@ -352,8 +372,16 @@ class PhaseFourCommands(commands.Cog):
                 inline=False,
             )
             embed.add_field(
-                name="Last digest",
-                value=str(counts.get("last_digest_success_at") or "Not implemented in Phase 6"),
+                name="Daily digest",
+                value=(
+                    f"Schedule: 04:00 IST; last success: "
+                    f"{state.get('last_digest_success_at') or 'Never'}; "
+                    f"latest: {digest_latest_text}; "
+                    f"pending: {digest_counts['pending']}; "
+                    f"retryable failed: {digest_counts['failed_retryable']}; "
+                    f"exhausted: {digest_counts['failed_exhausted']}; "
+                    f"window: {digest_window_text}"
+                ),
                 inline=False,
             )
             errors = [

@@ -212,6 +212,21 @@ class StatusRepository:
     async def latest_crawl_runs(self, _limit: int):
         return [{"outcome": "partial", "error_summary": "rate_limited: 1"}]
 
+    async def latest_digest_runs(self, _limit: int):
+        return [{"outcome": "succeeded", "error_summary": None}]
+
+    async def digest_publication_counts(self, *, attempt_limit: int):
+        assert attempt_limit == 3
+        return {"pending": 1, "failed_retryable": 2, "failed_exhausted": 0}
+
+    async def get_digest_state(self):
+        return {
+            "id": 1,
+            "last_window_start": "2026-01-01T22:30:00+00:00",
+            "last_window_end": "2026-01-02T00:00:00+00:00",
+            "last_completed_at": "2026-01-02T00:01:00+00:00",
+        }
+
     async def operational_counts(self):
         return {
             "queued": 12,
@@ -261,7 +276,11 @@ async def test_status_reports_brave_pause_runs_and_queue_state(make_settings) ->
     assert fields["Queue / backlog"] == "12"
     assert fields["Dumpster"] == "4"
     assert fields["Last successful Brave discovery"] == "2026-01-02T00:00:00+00:00"
-    assert fields["Last digest"].startswith("Not implemented in Phase 6")
+    assert "Schedule: 04:00 IST" in fields["Daily digest"]
+    assert "latest: succeeded" in fields["Daily digest"]
+    assert "pending: 1" in fields["Daily digest"]
+    assert "retryable failed: 2" in fields["Daily digest"]
+    assert "window: complete" in fields["Daily digest"]
 
 
 async def test_status_labels_disabled_brave_feature(make_settings) -> None:
@@ -320,9 +339,14 @@ async def test_scheduler_registers_phase_five_jobs_with_required_intervals(
             "reddit_collection_hourly",
             "brave_discovery",
             "crawl_processing",
+            "daily_digest",
         }
         assert jobs["brave_discovery"].trigger.interval.total_seconds() == 8 * 3600
         assert jobs["crawl_processing"].trigger.interval.total_seconds() == 300
+        assert "hour='4'" in str(jobs["daily_digest"].trigger)
+        assert "minute='0'" in str(jobs["daily_digest"].trigger)
+        assert jobs["daily_digest"].coalesce is True
+        assert jobs["daily_digest"].max_instances == 1
         assert bot.pipeline is not None
         assert bot.brave_service is not None
         assert bot.crawler is not None
