@@ -15,6 +15,7 @@ REQUIRED_KEYS = {
     "OWNER_DISCORD_ID",
     "DISCORD_DISCOVERIES_CHANNEL_ID",
     "DISCORD_SAVES_CHANNEL_ID",
+    "DISCORD_CATEGORY_CHANNELS_JSON",
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
     "B2_ENDPOINT_URL",
@@ -67,6 +68,7 @@ def test_template_contains_only_placeholders_and_safe_defaults() -> None:
     assert values["DISCORD_TOKEN"] == ""
     assert values["DISCORD_GUILD_ID"] == ""
     assert values["OWNER_DISCORD_ID"] == ""
+    assert values["DISCORD_CATEGORY_CHANNELS_JSON"] == "{}"
     assert values["SUPABASE_URL"] == ""
     assert values["SUPABASE_SERVICE_ROLE_KEY"] == ""
     assert values["B2_ENDPOINT_URL"] == ""

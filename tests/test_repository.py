@@ -42,6 +42,8 @@ class FakeQuery:
         self.limit_value: int | None = None
         self.or_expression: str | None = None
         self.order_value: tuple[str, bool] | None = None
+        self.orders: list[tuple[str, bool]] = []
+        self.range_value: tuple[int, int] | None = None
 
     def eq(self, column: str, value: object) -> FakeQuery:
         self.filters.append((column, value))
@@ -51,8 +53,20 @@ class FakeQuery:
         self.filters.append((f"is.{column}", value))
         return self
 
+    def gte(self, column: str, value: object) -> FakeQuery:
+        self.filters.append((f"gte.{column}", value))
+        return self
+
     def lte(self, column: str, value: object) -> FakeQuery:
         self.filters.append((f"lte.{column}", value))
+        return self
+
+    def lt(self, column: str, value: object) -> FakeQuery:
+        self.filters.append((f"lt.{column}", value))
+        return self
+
+    def in_(self, column: str, values: list[object]) -> FakeQuery:
+        self.filters.append((f"in.{column}", list(values)))
         return self
 
     def or_(self, expression: str) -> FakeQuery:
@@ -60,6 +74,7 @@ class FakeQuery:
         return self
 
     def order(self, column: str, *, desc: bool = False) -> FakeQuery:
+        self.orders.append((column, desc))
         self.order_value = (column, desc)
         return self
 
@@ -67,18 +82,30 @@ class FakeQuery:
         self.limit_value = value
         return self
 
+    def range(self, start: int, end: int) -> FakeQuery:
+        self.range_value = (start, end)
+        return self
+
     def execute(self) -> FakeResponse:
         error = self.table.errors.get(self.operation)
         if error is not None:
             raise error
-        data = self.table.results.get(self.operation, [])
+        queued = self.table.queued_results.get(self.operation)
+        if queued:
+            data = queued.pop(0)
+        else:
+            data = self.table.results.get(self.operation, [])
         count = self.table.counts.get(self.operation)
-        if self.count is not None and count is None:
-            status_values = [value for column, value in self.filters if column == "status"]
-            if status_values:
-                count = self.table.counts_by_status.get(str(status_values[0]), 0)
-            else:
-                count = len(data)
+        queued_counts = self.table.queued_counts.get(self.operation)
+        if self.count is not None:
+            if queued_counts:
+                count = queued_counts.pop(0)
+            elif count is None:
+                status_values = [value for column, value in self.filters if column == "status"]
+                if status_values:
+                    count = self.table.counts_by_status.get(str(status_values[0]), 0)
+                else:
+                    count = len(data)
         return FakeResponse(data, count=count)
 
 
@@ -89,6 +116,8 @@ class FakeTable:
         self.errors: dict[str, Exception] = {}
         self.counts: dict[str, int] = {}
         self.counts_by_status: dict[str, int] = {}
+        self.queued_results: dict[str, list[list[dict[str, object]]]] = {}
+        self.queued_counts: dict[str, list[int]] = {}
         self.queries: list[FakeQuery] = []
         self.calls: list[tuple[str, object, object]] = []
 
@@ -389,7 +418,7 @@ async def test_create_job_run_supports_phase5_job_types() -> None:
         await repository.create_job_run({}, job_type="manual_save")
 
 
-async def test_mark_interrupted_jobs_covers_reddit_brave_and_crawl() -> None:
+async def test_mark_interrupted_jobs_covers_worker_and_digest_jobs() -> None:
     client = FakeClient()
     client.table("job_runs").results["select"] = [{"id": "job-1"}]
     repository = make_repository(client)
@@ -401,9 +430,10 @@ async def test_mark_interrupted_jobs_covers_reddit_brave_and_crawl() -> None:
         [("job_type", "reddit_collection"), ("outcome", "running")],
         [("job_type", "brave_discovery"), ("outcome", "running")],
         [("job_type", "crawl"), ("outcome", "running")],
+        [("job_type", "daily_digest"), ("outcome", "running")],
     ]
     updates = [call for call in client.table("job_runs").calls if call[0] == "update"]
-    assert len(updates) == 3
+    assert len(updates) == 4
     assert all(
         payload["error_summary"] == "interrupted_by_restart"
         for _operation, payload, _conflict in updates
@@ -643,3 +673,306 @@ async def test_web_candidate_reuses_existing_discovery_and_records_web_source() 
     assert payload["source_platform"] == "web"
     assert payload["source_post_id"] == candidate.submission_id
     assert payload["source_media_id"] == "web-1"
+
+
+async def test_ensure_digest_publication_creates_zero_attempt_pending_row() -> None:
+    client = FakeClient()
+    publications = client.table("publications")
+    publications.queued_results["select"] = [[]]
+    publications.results["insert"] = [
+        {"id": "publication-1", "status": "pending", "attempt_count": 0}
+    ]
+    repository = make_repository(client)
+
+    row = await repository.ensure_digest_publication("media-1", 222)
+
+    assert row == {"id": "publication-1", "status": "pending", "attempt_count": 0}
+    insert_payload = next(
+        payload for operation, payload, _conflict in publications.calls if operation == "insert"
+    )
+    assert insert_payload == {
+        "media_item_id": "media-1",
+        "channel_id": 222,
+        "purpose": "daily_digest",
+        "status": "pending",
+        "attempt_count": 0,
+    }
+    select_query = publications.queries[0]
+    assert select_query.filters == [
+        ("media_item_id", "media-1"),
+        ("channel_id", 222),
+        ("purpose", "daily_digest"),
+    ]
+    assert select_query.limit_value == 1
+
+
+async def test_ensure_digest_publication_reuses_existing_row() -> None:
+    existing = {"id": "publication-1", "status": "published", "attempt_count": 1}
+    client = FakeClient()
+    client.table("publications").results["select"] = [existing]
+    repository = make_repository(client)
+
+    row = await repository.ensure_digest_publication("media-1", 222)
+
+    assert row == existing
+    assert not [call for call in client.table("publications").calls if call[0] == "insert"]
+
+
+async def test_ensure_digest_publication_recovers_unique_conflict() -> None:
+    existing = {"id": "existing-publication", "status": "pending", "attempt_count": 1}
+    client = FakeClient()
+    publications = client.table("publications")
+    publications.queued_results["select"] = [[], [existing]]
+    publications.errors["insert"] = RuntimeError("duplicate key value violates unique constraint")
+    repository = make_repository(client)
+
+    row = await repository.ensure_digest_publication("media-1", 222)
+
+    assert row == existing
+    assert [query.operation for query in publications.queries] == ["select", "insert", "select"]
+
+
+async def test_ensure_digest_publication_reraises_non_conflict_errors() -> None:
+    client = FakeClient()
+    publications = client.table("publications")
+    publications.queued_results["select"] = [[]]
+    publications.errors["insert"] = RuntimeError("database unavailable")
+    repository = make_repository(client)
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await repository.ensure_digest_publication("media-1", 222)
+
+
+async def test_record_publication_attempt_uses_conditional_increment() -> None:
+    client = FakeClient()
+    publications = client.table("publications")
+    publications.results["update"] = [
+        {"id": "publication-1", "status": "pending", "attempt_count": 2}
+    ]
+    repository = make_repository(client)
+
+    row = await repository.record_publication_attempt("publication-1", expected_attempt_count=1)
+
+    assert row["attempt_count"] == 2
+    update_payload = next(
+        payload for operation, payload, _conflict in publications.calls if operation == "update"
+    )
+    assert update_payload == {"status": "pending", "attempt_count": 2, "last_error": None}
+    update_query = publications.queries[0]
+    assert update_query.filters == [("id", "publication-1"), ("attempt_count", 1)]
+
+
+async def test_record_publication_attempt_returns_current_row_when_update_loses_race() -> None:
+    current = {"id": "publication-1", "status": "pending", "attempt_count": 2}
+    client = FakeClient()
+    publications = client.table("publications")
+    publications.results["update"] = []
+    publications.results["select"] = [current]
+    repository = make_repository(client)
+
+    row = await repository.record_publication_attempt("publication-1", expected_attempt_count=1)
+
+    assert row == current
+    assert publications.queries[1].filters == [("id", "publication-1")]
+
+
+async def test_list_retryable_digest_publications_filters_unresolved_rows() -> None:
+    client = FakeClient()
+    publications = client.table("publications")
+    publications.results["select"] = [{"id": "publication-1"}]
+    repository = make_repository(client)
+
+    rows = await repository.list_retryable_digest_publications(attempt_limit=3, limit=25)
+
+    assert rows == [{"id": "publication-1"}]
+    query = publications.queries[0]
+    assert query.filters == [
+        ("purpose", "daily_digest"),
+        ("in.status", ["pending", "failed"]),
+        ("lt.attempt_count", 3),
+    ]
+    assert query.order_value == ("created_at", False)
+    assert query.limit_value == 25
+
+
+async def test_list_exhausted_ambiguous_publications_reads_every_page() -> None:
+    client = FakeClient()
+    publications = client.table("publications")
+    publications.queued_results["select"] = [
+        [{"id": f"publication-{index}"} for index in range(100)],
+        [{"id": f"publication-{index}"} for index in range(100, 200)],
+        [{"id": f"publication-{index}"} for index in range(200, 207)],
+    ]
+    repository = make_repository(client)
+
+    rows = await repository.list_exhausted_ambiguous_digest_publications(
+        attempt_limit=3,
+        page_size=100,
+    )
+
+    assert len(rows) == 207
+    assert [query.range_value for query in publications.queries] == [
+        (0, 99),
+        (100, 199),
+        (200, 299),
+    ]
+    assert all(
+        query.orders == [("created_at", False), ("id", False)] for query in publications.queries
+    )
+    assert all(
+        query.or_expression == "status.eq.pending,last_error.like.discord_delivery_ambiguous:*,"
+        "last_error.like.discord_delivery_failed*"
+        for query in publications.queries
+    )
+
+
+async def test_record_reconciliation_diagnostic_preserves_ambiguous_error() -> None:
+    client = FakeClient()
+    publications = client.table("publications")
+    publications.results["update"] = [{"id": "publication-1"}]
+    repository = make_repository(client)
+
+    await repository.record_publication_reconciliation_error(
+        "publication-1",
+        "delivery_unreconciled",
+        preserve_error="discord_delivery_ambiguous:TimeoutError",
+    )
+
+    payload = next(
+        payload for operation, payload, _conflict in publications.calls if operation == "update"
+    )
+    assert payload == {
+        "last_error": "discord_delivery_ambiguous:TimeoutError;delivery_unreconciled"
+    }
+
+
+async def test_list_digest_candidates_filters_window_and_paginates_deterministically() -> None:
+    client = FakeClient()
+    media = client.table("media_items")
+    media.results["select"] = [{"id": "media-1", "created_at": "2026-01-02T00:00:00+00:00"}]
+    repository = make_repository(client)
+    window_start = "2026-01-01T00:00:00+00:00"
+    window_end = "2026-01-03T00:00:00+00:00"
+
+    rows = await repository.list_digest_candidates(
+        window_start=window_start,
+        window_end=window_end,
+        limit=50,
+        offset=100,
+    )
+
+    assert rows == [{"id": "media-1", "created_at": "2026-01-02T00:00:00+00:00"}]
+    query = media.queries[0]
+    assert ("verification_status", "verified") in query.filters
+    assert ("download_status", "stored") in query.filters
+    assert ("gte.created_at", window_start) in query.filters
+    assert ("lte.created_at", window_end) in query.filters
+    assert query.orders == [("created_at", False), ("id", False)]
+    assert query.range_value == (100, 149)
+
+
+async def test_list_digest_candidates_uses_inclusive_resume_cursor() -> None:
+    client = FakeClient()
+    repository = make_repository(client)
+    cursor = "2026-01-02T03:04:05+00:00"
+
+    await repository.list_digest_candidates(
+        window_start="2026-01-01T00:00:00+00:00",
+        window_end="2026-01-03T00:00:00+00:00",
+        cursor=cursor,
+        limit=10,
+    )
+
+    query = client.table("media_items").queries[0]
+    assert ("gte.created_at", cursor) in query.filters
+    assert query.range_value == (0, 9)
+
+
+async def test_digest_publication_counts_report_pending_retryable_and_exhausted() -> None:
+    client = FakeClient()
+    publications = client.table("publications")
+    publications.queued_counts["select"] = [5, 2, 3]
+    repository = make_repository(client)
+
+    counts = await repository.digest_publication_counts(attempt_limit=3)
+
+    assert counts == {"pending": 5, "failed_retryable": 2, "failed_exhausted": 3}
+    queries = publications.queries
+    assert all(query.count == "exact" for query in queries)
+    assert ("purpose", "daily_digest") in queries[0].filters
+    assert ("status", "pending") in queries[0].filters
+    assert ("status", "failed") in queries[1].filters
+    assert ("lt.attempt_count", 3) in queries[1].filters
+    assert ("status", "failed") in queries[2].filters
+    assert ("gte.attempt_count", 3) in queries[2].filters
+
+
+async def test_digest_state_is_read_and_updated_through_existing_singleton() -> None:
+    client = FakeClient()
+    digest_state = client.table("digest_state")
+    digest_state.results["select"] = [{"id": 1, "last_window_start": "2026-01-01T00:00:00+00:00"}]
+    digest_state.results["update"] = [{"id": 1}]
+    repository = make_repository(client)
+
+    state = await repository.get_digest_state()
+    updated = await repository.update_digest_state(
+        {
+            "last_window_start": "2026-01-02T00:00:00+00:00",
+            "last_window_end": "2026-01-03T00:00:00+00:00",
+            "last_completed_at": None,
+            "id": 9,
+            "updated_at": "ignored",
+        }
+    )
+
+    assert state["last_window_start"] == "2026-01-01T00:00:00+00:00"
+    assert updated == {"id": 1}
+    update_payload = next(
+        payload for operation, payload, _conflict in digest_state.calls if operation == "update"
+    )
+    assert update_payload == {
+        "last_window_start": "2026-01-02T00:00:00+00:00",
+        "last_window_end": "2026-01-03T00:00:00+00:00",
+    }
+    assert digest_state.queries[0].filters == [("id", 1)]
+    assert digest_state.queries[1].filters == [("id", 1)]
+
+
+async def test_mark_digest_success_updates_runtime_state() -> None:
+    client = FakeClient()
+    client.table("runtime_state").results["update"] = [{"id": 1}]
+    repository = make_repository(client)
+
+    await repository.mark_digest_success()
+
+    update_payload = client.table("runtime_state").calls[0][1]
+    assert "last_digest_success_at" in update_payload
+    assert client.table("runtime_state").queries[0].filters == [("id", 1)]
+
+
+async def test_latest_digest_runs_uses_daily_digest_job_type() -> None:
+    client = FakeClient()
+    client.table("job_runs").results["select"] = [{"id": "run-1", "outcome": "partial"}]
+    repository = make_repository(client)
+
+    rows = await repository.latest_digest_runs(2)
+
+    assert rows == [{"id": "run-1", "outcome": "partial"}]
+    query = client.table("job_runs").queries[0]
+    assert query.filters == [("job_type", "daily_digest")]
+    assert query.order_value == ("started_at", True)
+    assert query.limit_value == 2
+
+
+async def test_mark_publication_published_requires_message_id_in_payload() -> None:
+    client = FakeClient()
+    client.table("publications").results["update"] = [{"id": "publication-1"}]
+    repository = make_repository(client)
+
+    await repository.mark_publication_published("publication-1", 555)
+
+    payload = client.table("publications").calls[0][1]
+    assert payload["status"] == "published"
+    assert payload["message_id"] == 555
+    assert payload["published_at"]
+    assert payload["last_error"] is None

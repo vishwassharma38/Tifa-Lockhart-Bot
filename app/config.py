@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Mapping
@@ -12,6 +13,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 
 VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+MEDIA_CATEGORIES = frozenset(
+    {"fanart", "cosplay_photography", "official_artwork", "wallpaper", "video", "other"}
+)
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -82,6 +86,36 @@ def _parse_optional_int(env: Mapping[str, str], name: str) -> int | None:
         raise ConfigurationError(f"{name} must be an integer") from exc
 
 
+def _parse_category_channels(env: Mapping[str, str]) -> dict[str, int]:
+    """Parse the optional category-to-channel routing JSON object."""
+    raw = _read(env, "DISCORD_CATEGORY_CHANNELS_JSON")
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigurationError("DISCORD_CATEGORY_CHANNELS_JSON must be valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ConfigurationError("DISCORD_CATEGORY_CHANNELS_JSON must be a JSON object")
+
+    channels: dict[str, int] = {}
+    for category, channel_id in value.items():
+        if not isinstance(category, str) or category not in MEDIA_CATEGORIES:
+            raise ConfigurationError(
+                "DISCORD_CATEGORY_CHANNELS_JSON contains an unsupported category name"
+            )
+        if isinstance(channel_id, bool) or not isinstance(channel_id, int):
+            raise ConfigurationError(
+                "DISCORD_CATEGORY_CHANNELS_JSON values must be integer channel IDs"
+            )
+        if channel_id <= 0:
+            raise ConfigurationError(
+                "DISCORD_CATEGORY_CHANNELS_JSON values must be positive channel IDs"
+            )
+        channels[category] = channel_id
+    return channels
+
+
 def _url_is_valid(value: str) -> bool:
     parsed = urlparse(value)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
@@ -119,6 +153,7 @@ class Settings:
     owner_discord_id: int | None
     discoveries_channel_id: int | None
     saves_channel_id: int | None
+    category_channels: dict[str, int]
     supabase_url: str
     supabase_service_role_key: str
     b2_endpoint_url: str
@@ -181,6 +216,7 @@ class Settings:
             owner_discord_id=_parse_optional_int(env, "OWNER_DISCORD_ID"),
             discoveries_channel_id=_parse_optional_int(env, "DISCORD_DISCOVERIES_CHANNEL_ID"),
             saves_channel_id=_parse_optional_int(env, "DISCORD_SAVES_CHANNEL_ID"),
+            category_channels=_parse_category_channels(env),
             supabase_url=_read(env, "SUPABASE_URL"),
             supabase_service_role_key=_read(env, "SUPABASE_SERVICE_ROLE_KEY"),
             b2_endpoint_url=_read(env, "B2_ENDPOINT_URL"),
