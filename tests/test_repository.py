@@ -789,10 +789,34 @@ async def test_list_retryable_digest_publications_filters_unresolved_rows() -> N
     assert query.filters == [
         ("purpose", "daily_digest"),
         ("in.status", ["pending", "failed"]),
-        ("lt.attempt_count", 3),
     ]
+    assert query.or_expression == (
+        "attempt_count.lt.3,status.eq.pending,"
+        "last_error.like.discord_delivery_ambiguous:*,"
+        "last_error.like.discord_delivery_failed*"
+    )
     assert query.order_value == ("created_at", False)
     assert query.limit_value == 25
+
+
+async def test_record_reconciliation_diagnostic_preserves_ambiguous_error() -> None:
+    client = FakeClient()
+    publications = client.table("publications")
+    publications.results["update"] = [{"id": "publication-1"}]
+    repository = make_repository(client)
+
+    await repository.record_publication_reconciliation_error(
+        "publication-1",
+        "delivery_unreconciled",
+        preserve_error="discord_delivery_ambiguous:TimeoutError",
+    )
+
+    payload = next(
+        payload for operation, payload, _conflict in publications.calls if operation == "update"
+    )
+    assert payload == {
+        "last_error": "discord_delivery_ambiguous:TimeoutError;delivery_unreconciled"
+    }
 
 
 async def test_list_digest_candidates_filters_window_and_paginates_deterministically() -> None:

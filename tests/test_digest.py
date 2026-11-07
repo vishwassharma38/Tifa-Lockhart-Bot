@@ -196,7 +196,14 @@ class FakeDigestRepository:
         rows = [
             row
             for row in self.publications.values()
-            if row["status"] in {"pending", "failed"} and int(row["attempt_count"]) < attempt_limit
+            if row["status"] in {"pending", "failed"}
+            and (
+                int(row["attempt_count"]) < attempt_limit
+                or row["status"] == "pending"
+                or str(row.get("last_error") or "").startswith(
+                    ("discord_delivery_ambiguous:", "discord_delivery_failed")
+                )
+            )
         ]
         return [dict(row) for row in rows[:limit]]
 
@@ -239,10 +246,14 @@ class FakeDigestRepository:
         return dict(row)
 
     async def record_publication_reconciliation_error(
-        self, publication_id: str, error: str
+        self,
+        publication_id: str,
+        error: str,
+        *,
+        preserve_error: str | None = None,
     ) -> dict[str, object]:
         row = self.publications[publication_id]
-        row["last_error"] = error
+        row["last_error"] = f"{preserve_error};{error}" if preserve_error else error
         return dict(row)
 
     async def mark_digest_success(self) -> None:
@@ -786,6 +797,62 @@ async def test_ambiguous_pending_inconclusive_lookup_fails_closed(make_settings)
     assert repository.digest_success_calls == 0
 
 
+async def test_failed_ambiguous_delivery_stays_reconcilable_across_runs(make_settings) -> None:
+    repository = FakeDigestRepository()
+    repository.add_media("media-1")
+    publication = repository.add_publication(
+        "media-1",
+        999,
+        status="failed",
+        attempt_count=1,
+        last_error="discord_delivery_ambiguous:TimeoutError",
+    )
+    publisher = FakePublisher(marker_lookup=MarkerLookup(message_id=None, conclusive=False))
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_DISCOVERIES_CHANNEL_ID="999",
+    )
+
+    await service.run()
+    first_error = str(repository.publications[publication["id"]]["last_error"])
+    second = await service.run()
+
+    assert first_error.startswith("discord_delivery_ambiguous:TimeoutError;")
+    assert str(repository.publications[publication["id"]]["last_error"]).startswith(
+        "discord_delivery_ambiguous:TimeoutError;"
+    )
+    assert len(publisher.marker_calls) == 2
+    assert publisher.calls == []
+    assert second.failed_count == 1
+    assert repository.publications[publication["id"]]["status"] == "failed"
+
+
+async def test_legacy_ambiguous_error_still_triggers_reconciliation(make_settings) -> None:
+    repository = FakeDigestRepository()
+    repository.add_media("media-1")
+    publication = repository.add_publication(
+        "media-1", 999, status="failed", attempt_count=1, last_error="discord_delivery_failed"
+    )
+    publisher = FakePublisher(marker_lookup=MarkerLookup(message_id=877, conclusive=True))
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_DISCOVERIES_CHANNEL_ID="999",
+    )
+
+    await service.run()
+
+    assert publisher.calls == []
+    assert len(publisher.marker_calls) == 1
+    assert repository.publications[publication["id"]]["status"] == "published"
+    assert repository.publications[publication["id"]]["message_id"] == 877
+
+
 async def test_reconciliation_lookup_error_fails_closed(make_settings) -> None:
     repository = FakeDigestRepository()
     repository.add_media("media-1")
@@ -876,7 +943,117 @@ async def test_definite_discord_rejection_leaves_retryable_failed_record(make_se
     assert result.failed_count == 1
     publication = repository.publications["publication-1"]
     assert publication["status"] == "failed"
-    assert publication["last_error"] == "discord_delivery_failed:DiscordPublicationRejectedError"
+    assert publication["last_error"] == "discord_delivery_rejected:DiscordPublicationRejectedError"
+
+    retry = await service.run()
+
+    assert retry.published_count == 0
+    assert len(publisher.calls) == 2
+    assert publisher.marker_calls == []
+    assert publication["attempt_count"] == 2
+
+
+def _set_completed_digest_window(repository: FakeDigestRepository) -> None:
+    completed_at = NOW - timedelta(hours=1)
+    repository.state = {
+        "id": 1,
+        "last_window_start": iso(completed_at - timedelta(days=1)),
+        "last_window_end": iso(completed_at),
+        "last_completed_at": iso(completed_at),
+        "cursor_media_created_at": iso(completed_at),
+    }
+
+
+async def test_exhausted_ambiguous_publication_is_reconciled_and_recovered(make_settings) -> None:
+    repository = FakeDigestRepository()
+    repository.add_media("media-1", created_at="2025-12-01T00:00:00+00:00")
+    publication = repository.add_publication(
+        "media-1",
+        999,
+        status="failed",
+        attempt_count=3,
+        last_error="discord_delivery_ambiguous:TimeoutError",
+    )
+    _set_completed_digest_window(repository)
+    publisher = FakePublisher(marker_lookup=MarkerLookup(message_id=4545, conclusive=True))
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_DISCOVERIES_CHANNEL_ID="999",
+    )
+
+    result = await service.run()
+
+    assert result.published_count == 0
+    assert len(publisher.marker_calls) == 1
+    assert publisher.calls == []
+    assert repository.retry_queries[-1]["attempt_limit"] == 3
+    assert repository.publications[publication["id"]]["status"] == "published"
+    assert repository.publications[publication["id"]]["message_id"] == 4545
+    assert repository.publications[publication["id"]]["attempt_count"] == 3
+
+
+async def test_exhausted_ambiguous_publication_remains_reconcilable_without_fourth_send(
+    make_settings,
+) -> None:
+    repository = FakeDigestRepository()
+    repository.add_media("media-1", created_at="2025-12-01T00:00:00+00:00")
+    publication = repository.add_publication(
+        "media-1",
+        999,
+        status="failed",
+        attempt_count=3,
+        last_error="discord_delivery_ambiguous:TimeoutError",
+    )
+    _set_completed_digest_window(repository)
+    publisher = FakePublisher(marker_lookup=MarkerLookup(message_id=None, conclusive=False))
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_DISCOVERIES_CHANNEL_ID="999",
+    )
+
+    await service.run()
+    await service.run()
+
+    assert len(publisher.marker_calls) == 2
+    assert publisher.calls == []
+    assert repository.publications[publication["id"]]["attempt_count"] == 3
+    assert repository.publications[publication["id"]]["status"] == "failed"
+    assert str(repository.publications[publication["id"]]["last_error"]).startswith(
+        "discord_delivery_ambiguous:TimeoutError;"
+    )
+
+
+async def test_exhausted_ambiguous_missing_marker_does_not_send_again(make_settings) -> None:
+    repository = FakeDigestRepository()
+    repository.add_media("media-1", created_at="2025-12-01T00:00:00+00:00")
+    publication = repository.add_publication(
+        "media-1",
+        999,
+        status="failed",
+        attempt_count=3,
+        last_error="discord_delivery_ambiguous:TimeoutError",
+    )
+    _set_completed_digest_window(repository)
+    publisher = FakePublisher(marker_lookup=MarkerLookup(message_id=None, conclusive=True))
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_DISCOVERIES_CHANNEL_ID="999",
+    )
+
+    await service.run()
+
+    assert len(publisher.marker_calls) == 1
+    assert publisher.calls == []
+    assert repository.publications[publication["id"]]["attempt_count"] == 3
 
 
 async def test_database_update_after_send_is_recovered_by_marker(make_settings) -> None:

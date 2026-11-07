@@ -27,6 +27,15 @@ DEFAULT_RETRY_BATCH_SIZE = 100
 MAX_DIGEST_MEDIA_BYTES = 10_000_000
 INITIAL_DIGEST_WINDOW_START = datetime(1970, 1, 1, tzinfo=UTC)
 _PUBLICATION_MARKER_PREFIX = "tifa-digest-publication:"
+_AMBIGUOUS_DELIVERY_PREFIXES = (
+    "discord_delivery_ambiguous:",
+    # Older records used this prefix for all Discord send exceptions.
+    "discord_delivery_failed",
+)
+
+
+def _is_ambiguous_delivery_error(error: Any) -> bool:
+    return isinstance(error, str) and error.startswith(_AMBIGUOUS_DELIVERY_PREFIXES)
 
 
 def publication_marker(publication_id: str) -> str:
@@ -496,9 +505,7 @@ class DigestService:
             counters["skipped_count"] += 1
             return True
         last_error = str(publication.get("last_error") or "")
-        ambiguous_failure = last_error.startswith(
-            ("discord_delivery_ambiguous:", "discord_delivery_failed")
-        )
+        ambiguous_failure = _is_ambiguous_delivery_error(last_error)
         if attempts > 0 and (status == "pending" or ambiguous_failure):
             reconciliation = await self._reconcile(
                 publication,
@@ -607,7 +614,7 @@ class DigestService:
             )
         except Exception as exc:
             definite_rejection = isinstance(exc, DiscordPublicationRejectedError)
-            error_kind = "failed" if definite_rejection else "ambiguous"
+            error_kind = "rejected" if definite_rejection else "ambiguous"
             await self._record_failure(
                 publication_id,
                 f"discord_delivery_{error_kind}:{type(exc).__name__}",
@@ -676,12 +683,15 @@ class DigestService:
     ) -> str:
         publication_id = str(publication["id"])
         marker = publication_marker(publication_id)
+        last_error = str(publication.get("last_error") or "")
+        preserve_error = last_error if _is_ambiguous_delivery_error(last_error) else None
         find_marker = getattr(self._publisher, "find_publication_marker", None)
         if not callable(find_marker):
             await self._record_reconciliation_error(
                 publication_id,
                 "reconciliation_unavailable",
                 errors,
+                preserve_error=preserve_error,
             )
             return "unreconciled"
         try:
@@ -691,6 +701,7 @@ class DigestService:
                 publication_id,
                 f"reconciliation_failed:{type(exc).__name__}",
                 errors,
+                preserve_error=preserve_error,
             )
             return "unreconciled"
 
@@ -707,6 +718,7 @@ class DigestService:
                     publication_id,
                     f"reconciliation_update_failed:{type(exc).__name__}",
                     errors,
+                    preserve_error=preserve_error,
                 )
                 return "unreconciled"
             return "reconciled"
@@ -715,6 +727,7 @@ class DigestService:
                 publication_id,
                 "delivery_unreconciled",
                 errors,
+                preserve_error=preserve_error,
             )
             return "unreconciled"
         return "safe_to_retry"
@@ -724,12 +737,15 @@ class DigestService:
         publication_id: str,
         reason: str,
         errors: Counter[str],
+        *,
+        preserve_error: str | None = None,
     ) -> None:
         errors[reason] += 1
         try:
             await self._repository.record_publication_reconciliation_error(
                 publication_id,
                 reason,
+                preserve_error=preserve_error,
             )
         except Exception as exc:
             errors[f"reconciliation_error_write_failed:{type(exc).__name__}"] += 1

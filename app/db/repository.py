@@ -1001,16 +1001,22 @@ class MediaRepository:
         self,
         publication_id: str,
         error: str,
+        *,
+        preserve_error: str | None = None,
     ) -> dict[str, Any]:
-        """Keep an ambiguous pending row unresolved while recording the reason."""
+        """Record a reconciliation diagnostic without losing prior uncertainty."""
         return await self._to_thread(
-            self._record_publication_reconciliation_error_sync, publication_id, error
+            self._record_publication_reconciliation_error_sync,
+            publication_id,
+            error,
+            preserve_error,
         )
 
     def _record_publication_reconciliation_error_sync(
-        self, publication_id: str, error: str
+        self, publication_id: str, error: str, preserve_error: str | None = None
     ) -> dict[str, Any]:
-        payload = {"last_error": error[:500]}
+        last_error = f"{preserve_error};{error}" if preserve_error else error
+        payload = {"last_error": last_error[:500]}
         response = (
             self._client().table("publications").update(payload).eq("id", publication_id).execute()
         )
@@ -1025,7 +1031,7 @@ class MediaRepository:
         attempt_limit: int,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """Return unresolved digest rows below the bounded attempt limit."""
+        """Return retryable rows and exhausted rows that still need reconciliation."""
         return await self._to_thread(
             self._list_retryable_digest_publications_sync,
             attempt_limit,
@@ -1041,7 +1047,16 @@ class MediaRepository:
             .select("*")
             .eq("purpose", "daily_digest")
             .in_("status", ["pending", "failed"])
-            .lt("attempt_count", max(1, attempt_limit))
+            .or_(
+                ",".join(
+                    (
+                        f"attempt_count.lt.{max(1, attempt_limit)}",
+                        "status.eq.pending",
+                        "last_error.like.discord_delivery_ambiguous:*",
+                        "last_error.like.discord_delivery_failed*",
+                    )
+                )
+            )
             .order("created_at")
             .limit(max(1, limit))
             .execute()
