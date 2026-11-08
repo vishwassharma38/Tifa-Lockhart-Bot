@@ -11,6 +11,7 @@ from app.bot.publisher import DiscordPublicationRejectedError, MarkerLookup
 from app.jobs.digest import (
     INITIAL_DIGEST_WINDOW_START,
     DigestService,
+    digest_cycle_at,
     digest_window_incomplete,
     latest_digest_due_at,
     publication_marker,
@@ -50,6 +51,12 @@ class FakeDigestRepository:
         self.current_time = NOW
         self.digest_limit = 50
         self._next_publication = 1
+        self.validate_digest_cycles = False
+        self.stale_reservation_count = 0
+        self.advance_cycle_stale_count = 0
+        self.on_cycle_stale = None
+        self.reservation_calls: list[tuple[str, int, str]] = []
+        self.attempt_cycle_calls: list[str] = []
 
     def add_media(
         self,
@@ -199,6 +206,12 @@ class FakeDigestRepository:
     async def reserve_digest_publication(
         self, media_item_id: str, channel_id: int, digest_cycle: str, *, limit: int = 50
     ) -> dict[str, object]:
+        self.reservation_calls.append((media_item_id, channel_id, digest_cycle))
+        if self.stale_reservation_count:
+            self.stale_reservation_count -= 1
+            return {"cycle_stale": True}
+        if self.validate_digest_cycles and digest_cycle != digest_cycle_at(self.current_time):
+            return {"cycle_stale": True}
         if self.fail_ensure:
             raise RuntimeError("publication insert failed")
         existing_id = next(
@@ -379,7 +392,13 @@ class FakeDigestRepository:
         attempt_limit: int,
         lease_seconds: int = 900,
     ) -> dict[str, object]:
+        self.attempt_cycle_calls.append(digest_cycle)
         row = self.publications[publication_id]
+        if self.advance_cycle_stale_count:
+            self.advance_cycle_stale_count -= 1
+            if self.on_cycle_stale is not None:
+                self.on_cycle_stale()
+            return {"attempt_advanced": False, "cycle_stale": True}
         if row.get("digest_cycle") != digest_cycle:
             return {"attempt_advanced": False, "cycle_stale": True}
         if (
@@ -392,6 +411,18 @@ class FakeDigestRepository:
         row["status"] = "pending"
         row["last_error"] = None
         return {**row, "attempt_advanced": True}
+
+    async def retarget_digest_publication(
+        self, publication_id: str, claim_token: str, channel_id: int
+    ) -> dict[str, object]:
+        if not self._owns_claim(publication_id, claim_token):
+            return {"claim_valid": False}
+        row = self.publications[publication_id]
+        old_key = (str(row["media_item_id"]), int(row["channel_id"]))
+        self.publication_by_key.pop(old_key, None)
+        row["channel_id"] = channel_id
+        self.publication_by_key[(str(row["media_item_id"]), channel_id)] = publication_id
+        return {**row, "claim_valid": True}
 
     async def terminalize_digest_publication(
         self,
@@ -446,6 +477,8 @@ class FakeDigestRepository:
         row["last_error"] = f"{previous};{error}"[:500] if previous else error[:500]
         row["next_attempt_at"] = iso(self.current_time + timedelta(minutes=15))
         row["retry_schedule_count"] = int(row.get("retry_schedule_count") or 0) + 1
+        row["delivery_claim_token"] = None
+        row["delivery_claim_expires_at"] = None
         self._claims.pop(publication_id, None)
         return True
 
@@ -455,7 +488,14 @@ class FakeDigestRepository:
         if self.fail_finish_published or not self._owns_claim(publication_id, claim_token):
             return False
         row = self.publications[publication_id]
-        row.update(status="published", message_id=message_id, last_error=None)
+        row.update(
+            status="published",
+            message_id=message_id,
+            last_error=None,
+            next_attempt_at=None,
+            delivery_claim_token=None,
+            delivery_claim_expires_at=None,
+        )
         self._claims.pop(publication_id, None)
         return True
 
@@ -1541,12 +1581,17 @@ async def test_retryable_publication_outside_window_is_retried(make_settings) ->
     assert repository.publications[existing["id"]]["status"] == "published"
 
 
-async def test_retry_is_skipped_when_resolved_destination_changed(make_settings) -> None:
+async def test_changed_destination_reconciles_original_marker_before_routing(make_settings) -> None:
     repository = FakeDigestRepository()
     repository.add_media("media-1", category="fanart", created_at="2025-12-01T00:00:00+00:00")
     existing = repository.add_publication(
-        "media-1", 999, status="failed", attempt_count=1, last_error="discord_delivery_failed"
+        "media-1",
+        999,
+        status="failed",
+        attempt_count=1,
+        last_error="discord_delivery_ambiguous:TimeoutError",
     )
+    existing.update(digest_cycle="2026-01-02", digest_slot_reserved=True)
     repository.state = {
         "id": 1,
         "last_window_start": iso(NOW - timedelta(days=1)),
@@ -1554,7 +1599,7 @@ async def test_retry_is_skipped_when_resolved_destination_changed(make_settings)
         "last_completed_at": iso(NOW - timedelta(hours=1)),
         "cursor_media_created_at": iso(NOW - timedelta(hours=1)),
     }
-    publisher = FakePublisher()
+    publisher = FakePublisher(marker_lookup=MarkerLookup(message_id=8181, conclusive=True))
     service = build_service(
         make_settings,
         repository,
@@ -1569,7 +1614,110 @@ async def test_retry_is_skipped_when_resolved_destination_changed(make_settings)
     assert result.published_count == 0
     assert result.skipped_count == 1
     assert publisher.calls == []
+    assert publisher.marker_calls == [
+        {"channel_id": 999, "marker": publication_marker(str(existing["id"]))}
+    ]
     assert repository.publications[existing["id"]]["attempt_count"] == 1
+    assert repository.publications[existing["id"]]["status"] == "published"
+    assert repository.publications[existing["id"]]["channel_id"] == 999
+    assert repository.publications[existing["id"]].get("delivery_claim_token") is None
+
+
+async def test_changed_destination_conclusive_absence_retargets_under_claim(make_settings) -> None:
+    repository = FakeDigestRepository()
+    repository.add_media("media-1", category="fanart", created_at="2025-12-01T00:00:00+00:00")
+    existing = repository.add_publication(
+        "media-1",
+        999,
+        status="failed",
+        attempt_count=1,
+        last_error="discord_delivery_ambiguous:TimeoutError",
+    )
+    existing.update(digest_cycle="2026-01-02", digest_slot_reserved=True)
+    repository.state = {
+        "id": 1,
+        "last_window_start": iso(NOW - timedelta(days=1)),
+        "last_window_end": iso(NOW - timedelta(hours=1)),
+        "last_completed_at": iso(NOW - timedelta(hours=1)),
+        "cursor_media_created_at": iso(NOW - timedelta(hours=1)),
+    }
+    publisher = FakePublisher(marker_lookup=MarkerLookup(message_id=None, conclusive=True))
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_CATEGORY_CHANNELS_JSON='{"image": 222}',
+    )
+
+    result = await service.run()
+
+    assert result.published_count == 1
+    assert publisher.marker_calls[0]["channel_id"] == 999
+    assert [call["channel_id"] for call in publisher.calls] == [222]
+    assert repository.publications[existing["id"]]["channel_id"] == 222
+    assert repository.publications[existing["id"]]["attempt_count"] == 2
+    assert repository.publications[existing["id"]]["status"] == "published"
+    assert repository.publications[existing["id"]].get("delivery_claim_token") is None
+
+
+async def test_changed_destination_inconclusive_reconciliation_is_scheduled(make_settings) -> None:
+    repository = FakeDigestRepository()
+    repository.add_media("media-1", category="fanart", created_at="2025-12-01T00:00:00+00:00")
+    existing = repository.add_publication(
+        "media-1",
+        999,
+        status="failed",
+        attempt_count=1,
+        last_error="discord_delivery_ambiguous:TimeoutError",
+    )
+    existing.update(digest_cycle="2026-01-02", digest_slot_reserved=True)
+    repository.state = {
+        "id": 1,
+        "last_window_start": iso(NOW - timedelta(days=1)),
+        "last_window_end": iso(NOW - timedelta(hours=1)),
+        "last_completed_at": iso(NOW - timedelta(hours=1)),
+        "cursor_media_created_at": iso(NOW - timedelta(hours=1)),
+    }
+    publisher = FakePublisher(marker_lookup=PermissionError("history inaccessible"))
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_CATEGORY_CHANNELS_JSON='{"image": 222}',
+    )
+
+    await service.run()
+
+    row = repository.publications[existing["id"]]
+    assert publisher.marker_calls[0]["channel_id"] == 999
+    assert publisher.calls == []
+    assert row["channel_id"] == 999
+    assert row["status"] == "failed"
+    assert row.get("delivery_claim_token") is None
+    assert datetime.fromisoformat(str(row["next_attempt_at"])) > NOW
+    assert existing["id"] not in {
+        row["id"]
+        for row in await repository.list_retryable_digest_publications(
+            attempt_limit=3, limit=100, now=iso(NOW)
+        )
+    }
+
+
+async def test_changed_destination_retarget_rejects_stale_claim(make_settings) -> None:
+    repository = FakeDigestRepository()
+    row = repository.add_publication("media-1", 999, status="failed", attempt_count=1)
+    acquired = await repository.claim_digest_publication(row["id"], "current-owner")
+    assert acquired["claim_acquired"] is True
+
+    repository._claims[row["id"]] = ("replacement-owner", NOW + timedelta(minutes=15))
+    row["delivery_claim_token"] = "replacement-owner"
+    retargeted = await repository.retarget_digest_publication(row["id"], "current-owner", 222)
+
+    assert retargeted["claim_valid"] is False
+    assert row["channel_id"] == 999
+    assert row["delivery_claim_token"] == "replacement-owner"
 
 
 async def test_published_history_is_not_reposted_after_routing_change(make_settings) -> None:
@@ -1861,6 +2009,112 @@ async def test_active_old_cycle_never_attempted_claim_is_revoked_and_reacquires_
         is False
     )
     assert publication["status"] == "pending"
+
+
+async def test_startup_catchup_crossing_0400_refreshes_cycle_and_delivers_once(
+    make_settings,
+) -> None:
+    before_boundary = datetime(2026, 1, 1, 22, 29, tzinfo=UTC)
+    after_boundary = datetime(2026, 1, 1, 22, 31, tzinfo=UTC)
+    clock = [before_boundary]
+    repository = FakeDigestRepository()
+    repository.current_time = before_boundary
+    repository.validate_digest_cycles = True
+    repository.advance_cycle_stale_count = 1
+
+    def cross_boundary() -> None:
+        clock[0] = after_boundary
+        repository.current_time = after_boundary
+
+    repository.on_cycle_stale = cross_boundary
+    repository.add_media("catchup-media", created_at="2026-01-01T21:00:00+00:00")
+    publisher = FakePublisher()
+    service = DigestService(
+        settings=make_settings(DISCORD_DISCOVERIES_CHANNEL_ID="999"),
+        repository=repository,
+        storage=FakeStorage(),
+        publisher=publisher,
+        now=lambda: clock[0],
+    )
+
+    result = await service.run(trigger="startup")
+
+    publication = next(iter(repository.publications.values()))
+    assert result.published_count == 1
+    assert [call[2] for call in repository.reservation_calls] == ["2026-01-01", "2026-01-02"]
+    assert repository.attempt_cycle_calls == ["2026-01-01", "2026-01-02"]
+    assert publication["digest_cycle"] == "2026-01-02"
+    assert publication["digest_slot_reserved"] is True
+    assert publication["status"] == "published"
+    assert len(publisher.calls) == 1
+
+
+async def test_retry_crossing_0400_is_rescheduled_for_the_current_cycle(make_settings) -> None:
+    before_boundary = datetime(2026, 1, 1, 22, 29, tzinfo=UTC)
+    after_boundary = datetime(2026, 1, 1, 22, 31, tzinfo=UTC)
+    clock = [before_boundary]
+    repository = FakeDigestRepository()
+    repository.current_time = before_boundary
+    repository.validate_digest_cycles = True
+    repository.advance_cycle_stale_count = 1
+
+    def cross_boundary() -> None:
+        clock[0] = after_boundary
+        repository.current_time = after_boundary
+
+    repository.on_cycle_stale = cross_boundary
+    repository.add_media("retry-media", created_at="2025-12-01T00:00:00+00:00")
+    publication = repository.add_publication(
+        "retry-media",
+        999,
+        status="failed",
+        attempt_count=1,
+        last_error="storage_download_failed:TimeoutError",
+    )
+    publication.update(digest_cycle="2026-01-01", digest_slot_reserved=True)
+    repository.state = {
+        "id": 1,
+        "last_window_start": iso(before_boundary - timedelta(days=1)),
+        "last_window_end": iso(before_boundary - timedelta(hours=1)),
+        "last_completed_at": iso(before_boundary - timedelta(hours=1)),
+        "cursor_media_created_at": iso(before_boundary - timedelta(hours=1)),
+        "digest_cycle": "2026-01-01",
+    }
+    publisher = FakePublisher()
+    service = DigestService(
+        settings=make_settings(DISCORD_DISCOVERIES_CHANNEL_ID="999"),
+        repository=repository,
+        storage=FakeStorage(),
+        publisher=publisher,
+        now=lambda: clock[0],
+    )
+
+    first_result = await service.run(trigger="startup")
+    assert first_result.outcome == "partial"
+    assert publisher.calls == []
+    assert publication["delivery_claim_token"] is None
+    assert datetime.fromisoformat(str(publication["next_attempt_at"])) > after_boundary
+
+    clock[0] = after_boundary + timedelta(minutes=16)
+    repository.current_time = clock[0]
+    second_result = await service.run(trigger="scheduled")
+
+    assert second_result.published_count == 1
+    assert publication["digest_cycle"] == "2026-01-02"
+    assert publication["status"] == "published"
+    assert len(publisher.calls) == 1
+
+
+async def test_cycle_refresh_retries_reservation_once_then_stops(make_settings) -> None:
+    repository = FakeDigestRepository()
+    repository.stale_reservation_count = 3
+    service = build_service(make_settings, repository, FakeStorage(), FakePublisher())
+
+    result, cycle = await service._reserve_with_cycle_refresh("media-1", 999, "2026-01-01")
+
+    assert result == {"cycle_stale": True}
+    assert cycle == digest_cycle_at(NOW)
+    assert len(repository.reservation_calls) == 2
 
 
 async def test_retry_selector_skips_active_claims_but_recovers_expired_ones() -> None:

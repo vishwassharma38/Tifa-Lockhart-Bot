@@ -394,6 +394,26 @@ async def test_digest_reservation_uses_atomic_database_function() -> None:
     ]
 
 
+async def test_digest_destination_retarget_uses_claim_fenced_rpc() -> None:
+    client = FakeClient()
+    client.rpc_data = {"claim_valid": True, "channel_id": 222}
+    repository = make_repository(client)
+
+    result = await repository.retarget_digest_publication("publication-1", "claim-token", 222)
+
+    assert result == {"claim_valid": True, "channel_id": 222}
+    assert client.rpc_calls == [
+        (
+            "retarget_daily_digest_publication",
+            {
+                "p_publication_id": "publication-1",
+                "p_claim_token": "claim-token",
+                "p_channel_id": 222,
+            },
+        )
+    ]
+
+
 async def test_create_publication_starts_pending() -> None:
     client = FakeClient()
     client.table("publications").results["insert"] = [{"id": "publication-1"}]

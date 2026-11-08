@@ -150,6 +150,8 @@ migrations/
                           Adds fenced digest leases, retry scheduling, and safe rollover
   010_digest_terminal_rollover_and_retry_claims.sql
                           Adds terminal exhaustion and cycle-aware retry claims
+  011_digest_cycle_validation_and_destination_retarget.sql
+                          Validates current IST cycles and fences routing updates
 scripts/
   verify_b2.py            Safe temporary upload/download/delete check
   phase2_run.py           Controlled one-submission Phase 2 run
@@ -241,7 +243,7 @@ Command registration behavior:
 1. Create a Supabase project.
 2. Set `SUPABASE_URL` to the project API URL.
 3. Set `SUPABASE_SERVICE_ROLE_KEY` to the server-side service-role key. This key bypasses Row Level Security and must never be exposed to browsers, clients, logs, or source control.
-4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If the project is already at migration 007, apply `008_global_digest_budget.sql` through `010_digest_terminal_rollover_and_retry_claims.sql` before deploying this version. Migration 008 adds cycle and reservation columns, preserves historical publication rows, backfills one canonical digest record per media item, and creates the database-side atomic reservation function and indexes. Migration 009 adds expiring, token-fenced delivery claims and persisted retry scheduling. Migration 010 adds terminal exhaustion, safe rollover for active never-attempted reservations, and active-claim-aware retry selection. These migrations preserve publication and media history.
+4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If the project is already at migration 007, apply `008_global_digest_budget.sql` through `011_digest_cycle_validation_and_destination_retarget.sql` before deploying this version. Migration 008 adds cycle and reservation columns, preserves historical publication rows, backfills one canonical digest record per media item, and creates the database-side atomic reservation function and indexes. Migration 009 adds expiring, token-fenced delivery claims and persisted retry scheduling. Migration 010 adds terminal exhaustion, safe rollover for active never-attempted reservations, and active-claim-aware retry selection. Migration 011 validates the supplied cycle against PostgreSQL's Asia/Kolkata clock and adds claim-fenced destination updates. These migrations preserve publication and media history.
 
 The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. Migration 006 extends the existing `job_runs` and `runtime_state` tables in place. Migration 007 extends `discoveries` and `runtime_state` in place. The migrations do not delete data or store media binaries in PostgreSQL.
 

@@ -96,6 +96,11 @@ def latest_digest_due_at(
     return due.astimezone(UTC)
 
 
+def digest_cycle_at(now: datetime) -> str:
+    """Return the active digest cycle using the configured IST 04:00 boundary."""
+    return latest_digest_due_at(now).astimezone(ZoneInfo(DIGEST_TIMEZONE)).date().isoformat()
+
+
 @dataclass(frozen=True, slots=True)
 class DigestWindow:
     """Persisted upper and lower boundaries for one digest run."""
@@ -416,15 +421,15 @@ class DigestService:
             counters["skipped_count"] += 1
             log.info("Digest skipped ineligible media item=%s", media_id)
             return True
-        channel_id = self._destination_channel(media)
-        if channel_id <= 0:
+        destination_channel_id = self._destination_channel(media)
+        if destination_channel_id <= 0:
             counters["processed_count"] += 1
             counters["failed_count"] += 1
             errors["destination_not_configured"] += 1
             unaccounted.append(media_id)
             log.warning("Digest destination is not configured for media item=%s", media_id)
             return False
-        key = (media_id, channel_id)
+        key = (media_id, destination_channel_id)
         if key in processed:
             counters["processed_count"] += 1
             counters["skipped_count"] += 1
@@ -433,20 +438,26 @@ class DigestService:
         counters["processed_count"] += 1
         try:
             reserve = getattr(self._repository, "reserve_digest_publication", None)
+            cycle = window.cycle
             if callable(reserve):
-                publication = await reserve(media_id, channel_id, window.cycle, limit=50)
+                publication, cycle = await self._reserve_with_cycle_refresh(
+                    media_id, destination_channel_id, window.cycle
+                )
+                if publication.get("cycle_stale"):
+                    errors["digest_cycle_stale_retry_exhausted"] += 1
+                    unaccounted.append(media_id)
+                    return False
                 if publication.get("quota_exhausted"):
                     self._quota_exhausted = True
                     return False
             else:
                 publication = await self._repository.ensure_digest_publication(
-                    media_id,
-                    channel_id,
+                    media_id, destination_channel_id
                 )
             try:
-                channel_id = int(publication.get("channel_id") or channel_id)
+                channel_id = int(publication.get("channel_id") or destination_channel_id)
             except (TypeError, ValueError):
-                pass
+                channel_id = destination_channel_id
         except Exception as exc:
             counters["failed_count"] += 1
             errors[f"publication_record_failed:{type(exc).__name__}"] += 1
@@ -461,7 +472,8 @@ class DigestService:
             media,
             publication,
             channel_id=channel_id,
-            cycle=window.cycle,
+            cycle=cycle,
+            destination_channel_id=destination_channel_id,
             counters=counters,
             errors=errors,
             unaccounted=unaccounted,
@@ -498,9 +510,15 @@ class DigestService:
             reserve = getattr(self._repository, "reserve_digest_publication", None)
             if callable(reserve):
                 try:
-                    publication = await reserve(media_id, channel_id, cycle, limit=50)
+                    publication, cycle = await self._reserve_with_cycle_refresh(
+                        media_id, channel_id, cycle
+                    )
                 except Exception as exc:
                     errors[f"retry_reservation_failed:{type(exc).__name__}"] += 1
+                    continue
+                if publication.get("cycle_stale"):
+                    errors["digest_cycle_stale_retry_exhausted"] += 1
+                    unaccounted.append(media_id)
                     continue
                 if publication.get("quota_exhausted"):
                     self._quota_exhausted = True
@@ -529,19 +547,13 @@ class DigestService:
                 counters["skipped_count"] += 1
                 log.info("Digest retry skipped unavailable media item=%s", media_id)
                 continue
-            if self._destination_channel(media) != channel_id:
-                counters["skipped_count"] += 1
-                log.info(
-                    "Digest retry skipped because destination changed item=%s channel=%s",
-                    media_id,
-                    channel_id,
-                )
-                continue
+            destination_channel_id = self._destination_channel(media)
             await self._deliver(
                 media,
                 publication,
                 channel_id=channel_id,
                 cycle=cycle,
+                destination_channel_id=destination_channel_id,
                 counters=counters,
                 errors=errors,
                 unaccounted=unaccounted,
@@ -631,9 +643,11 @@ class DigestService:
         *,
         channel_id: int,
         cycle: str,
+        destination_channel_id: int | None = None,
         counters: dict[str, int],
         errors: Counter[str],
         unaccounted: list[str],
+        cycle_recovery_depth: int = 0,
     ) -> bool:
         publication_id = str(publication.get("id") or "")
         if not publication_id:
@@ -657,6 +671,8 @@ class DigestService:
             counters["skipped_count"] += 1
             return True
         publication = claimed
+        if destination_channel_id is None:
+            destination_channel_id = channel_id
         attempts = self._attempt_count(publication)
         status = str(publication.get("status") or "pending")
         last_error = str(publication.get("last_error") or "")
@@ -708,6 +724,7 @@ class DigestService:
                 counters["skipped_count"] += 1
                 return True
             try:
+                cycle = digest_cycle_at(self._now())
                 rollover = await self._repository.rollover_reconciled_digest_publication(
                     publication_id, claim_token, cycle, limit=50
                 )
@@ -745,6 +762,33 @@ class DigestService:
                 attempts,
             )
             return True
+        if destination_channel_id <= 0:
+            errors["destination_not_configured_for_retry"] += 1
+            await self._finish_reconciliation(
+                publication, claim_token, "destination_not_configured", errors
+            )
+            counters["failed_count"] += 1
+            return True
+        if destination_channel_id != channel_id:
+            try:
+                retarget = getattr(self._repository, "retarget_digest_publication", None)
+                if not callable(retarget):
+                    raise RuntimeError("claim-fenced destination update is unavailable")
+                updated_destination = await retarget(
+                    publication_id, claim_token, destination_channel_id
+                )
+                if not updated_destination.get("claim_valid"):
+                    counters["skipped_count"] += 1
+                    return True
+                publication = updated_destination
+                channel_id = int(publication.get("channel_id") or destination_channel_id)
+            except Exception as exc:
+                errors[f"destination_retarget_failed:{type(exc).__name__}"] += 1
+                await self._finish_reconciliation(
+                    publication, claim_token, "destination_retarget_failed", errors
+                )
+                counters["failed_count"] += 1
+                return True
         media_id = str(media.get("id") or "")
         object_key = str(media.get("storage_object_key") or "")
         expected_sha256 = str(media.get("sha256") or "")
@@ -821,14 +865,73 @@ class DigestService:
             return True
         if not updated.get("attempt_advanced"):
             if updated.get("cycle_stale"):
+                if cycle_recovery_depth >= 1:
+                    errors["digest_cycle_stale_retry_exhausted"] += 1
+                    await self._finish_reconciliation(
+                        publication, claim_token, "digest_cycle_stale_retry_exhausted", errors
+                    )
+                    unaccounted.append(media_id)
+                    counters["failed_count"] += 1
+                    return False
+                fresh_cycle = digest_cycle_at(self._now())
+                if attempts > 0:
+                    errors["digest_cycle_stale"] += 1
+                    # An attempted publication may still carry reconciliation
+                    # context. Release this claim with backoff first; the next
+                    # due retry will reserve against the then-current cycle.
+                    await self._finish_reconciliation(
+                        publication, claim_token, "digest_cycle_stale", errors
+                    )
+                    try:
+                        refreshed, fresh_cycle = await self._reserve_with_cycle_refresh(
+                            media_id, channel_id, fresh_cycle
+                        )
+                    except Exception as exc:
+                        errors[f"cycle_rollover_reservation_failed:{type(exc).__name__}"] += 1
+                        counters["failed_count"] += 1
+                        return True
+                    if refreshed.get("cycle_stale"):
+                        errors["digest_cycle_stale_retry_exhausted"] += 1
+                        counters["failed_count"] += 1
+                        return True
+                    if refreshed.get("quota_exhausted"):
+                        self._quota_exhausted = True
+                    counters["skipped_count"] += 1
+                    return True
                 try:
-                    reserve = getattr(self._repository, "reserve_digest_publication", None)
-                    if callable(reserve):
-                        refreshed = await reserve(media_id, channel_id, cycle, limit=50)
-                        if refreshed.get("quota_exhausted"):
-                            self._quota_exhausted = True
+                    refreshed, fresh_cycle = await self._reserve_with_cycle_refresh(
+                        media_id, channel_id, fresh_cycle
+                    )
                 except Exception as exc:
                     errors[f"cycle_rollover_reservation_failed:{type(exc).__name__}"] += 1
+                    unaccounted.append(media_id)
+                    counters["failed_count"] += 1
+                    return False
+                if refreshed.get("cycle_stale"):
+                    errors["digest_cycle_stale_retry_exhausted"] += 1
+                    await self._finish_reconciliation(
+                        publication, claim_token, "digest_cycle_stale_retry_exhausted", errors
+                    )
+                    unaccounted.append(media_id)
+                    counters["failed_count"] += 1
+                    return False
+                if refreshed.get("quota_exhausted"):
+                    self._quota_exhausted = True
+                    return True
+                if refreshed.get("terminal"):
+                    counters["skipped_count"] += 1
+                    return True
+                return await self._deliver(
+                    media,
+                    refreshed,
+                    channel_id=int(refreshed.get("channel_id") or channel_id),
+                    cycle=fresh_cycle,
+                    destination_channel_id=destination_channel_id,
+                    counters=counters,
+                    errors=errors,
+                    unaccounted=unaccounted,
+                    cycle_recovery_depth=cycle_recovery_depth + 1,
+                )
             counters["skipped_count"] += 1
             return True
         attempt_number = self._attempt_count(updated)
@@ -915,6 +1018,21 @@ class DigestService:
         if not claimed.get("claim_acquired"):
             return None
         return claimed
+
+    async def _reserve_with_cycle_refresh(
+        self, media_item_id: str, channel_id: int, cycle: str
+    ) -> tuple[dict[str, Any], str]:
+        reserve = getattr(self._repository, "reserve_digest_publication", None)
+        if not callable(reserve):
+            raise RuntimeError("atomic digest reservation is unavailable")
+        current_cycle = cycle
+        for attempt in range(2):
+            publication = await reserve(media_item_id, channel_id, current_cycle, limit=50)
+            if not publication.get("cycle_stale"):
+                return publication, current_cycle
+            if attempt == 0:
+                current_cycle = digest_cycle_at(self._now())
+        return {"cycle_stale": True}, current_cycle
 
     async def _finish_reconciliation(
         self,

@@ -126,6 +126,21 @@ def test_digest_terminal_rollover_and_retry_claim_migration_is_forward_only() ->
     assert "delete from" not in sql
 
 
+def test_digest_cycle_validation_and_retarget_migration_is_forward_only() -> None:
+    sql = read_migration("011_digest_cycle_validation_and_destination_retarget.sql").lower()
+    assert "before update of channel_id, status" in sql
+    assert "retarget_daily_digest_publication" in sql
+    assert "delivery_claim_token = p_claim_token" in sql
+    assert "delivery_claim_expires_at > v_now" in sql
+    assert "v_now at time zone 'asia/kolkata'" in sql
+    assert "v_local_now::time < time '04:00'" in sql
+    assert "'cycle_stale', true" in sql
+    assert "perform 1 from public.digest_state where id = 1 for update" in sql
+    assert "grant execute" in sql and "to service_role" in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+
+
 def test_runtime_and_digest_singletons_are_seeded() -> None:
     _files, sql = read_migrations()
 

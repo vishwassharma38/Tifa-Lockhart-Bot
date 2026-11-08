@@ -923,6 +923,18 @@ class MediaRepository:
             limit,
         )
 
+    async def retarget_digest_publication(
+        self, publication_id: str, claim_token: str, channel_id: int
+    ) -> dict[str, Any]:
+        return await self._digest_claim_rpc(
+            "retarget_daily_digest_publication",
+            {
+                "p_publication_id": publication_id,
+                "p_claim_token": claim_token,
+                "p_channel_id": channel_id,
+            },
+        )
+
     def _reserve_digest_publication_sync(
         self,
         media_item_id: str,
