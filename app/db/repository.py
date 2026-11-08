@@ -985,12 +985,14 @@ class MediaRepository:
         *,
         expected_attempt_count: int,
         claim_token: str,
+        digest_cycle: str,
         attempt_limit: int = 3,
     ) -> dict[str, Any] | None:
         """Advance attempts only through a live, fenced delivery claim."""
         result = await self.advance_digest_attempt(
             publication_id,
             claim_token,
+            digest_cycle,
             expected_attempt_count=expected_attempt_count,
             attempt_limit=attempt_limit,
         )
@@ -1026,20 +1028,44 @@ class MediaRepository:
         self,
         publication_id: str,
         claim_token: str,
+        digest_cycle: str,
         *,
         expected_attempt_count: int,
         attempt_limit: int,
         lease_seconds: int = 900,
     ) -> dict[str, Any]:
         return await self._digest_claim_rpc(
-            "advance_daily_digest_attempt",
+            "advance_daily_digest_attempt_for_cycle",
             {
                 "p_publication_id": publication_id,
                 "p_claim_token": claim_token,
                 "p_expected_attempt_count": expected_attempt_count,
+                "p_digest_cycle": digest_cycle,
                 "p_attempt_limit": attempt_limit,
                 "p_lease_seconds": lease_seconds,
             },
+        )
+
+    async def terminalize_digest_publication(
+        self,
+        publication_id: str,
+        claim_token: str,
+        error: str,
+        *,
+        attempt_limit: int,
+        conclusive_no_delivery: bool,
+    ) -> bool:
+        return bool(
+            await self._digest_claim_rpc(
+                "terminalize_daily_digest_publication",
+                {
+                    "p_publication_id": publication_id,
+                    "p_claim_token": claim_token,
+                    "p_error": error,
+                    "p_attempt_limit": attempt_limit,
+                    "p_conclusive_no_delivery": conclusive_no_delivery,
+                },
+            )
         )
 
     async def finish_digest_failure(
@@ -1212,7 +1238,12 @@ class MediaRepository:
             .eq("purpose", "daily_digest")
             .in_("status", ["pending", "failed"])
             .lt("attempt_count", max(1, attempt_limit))
+            .eq("digest_terminal", False)
             .or_(f"next_attempt_at.is.null,next_attempt_at.lte.{now}")
+            .or_(
+                "delivery_claim_token.is.null,delivery_claim_expires_at.is.null,"
+                f"delivery_claim_expires_at.lte.{now}"
+            )
             .order("next_attempt_at", nullsfirst=True)
             .order("created_at")
             .order("id")
@@ -1250,6 +1281,7 @@ class MediaRepository:
                 .eq("purpose", "daily_digest")
                 .in_("status", ["pending", "failed"])
                 .gte("attempt_count", max(1, attempt_limit))
+                .eq("digest_terminal", False)
                 .or_(
                     ",".join(
                         (

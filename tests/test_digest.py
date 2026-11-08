@@ -121,6 +121,7 @@ class FakeDigestRepository:
             "last_error": last_error,
             "created_at": "2026-01-01T00:00:00+00:00",
             "retry_schedule_count": 0,
+            "digest_terminal": False,
         }
         self.publications[publication_id] = row
         self.publication_by_key[(media_id, channel_id)] = publication_id
@@ -206,7 +207,34 @@ class FakeDigestRepository:
         )
         if existing_id:
             row = self.publications[existing_id]
+            if row.get("digest_terminal"):
+                return {**row, "terminal": True, "quota_exhausted": False}
             if row["status"] == "published":
+                return dict(row)
+            if int(row.get("attempt_count") or 0) == 0 and row.get("digest_cycle") not in (
+                None,
+                digest_cycle,
+            ):
+                reserved_now = sum(
+                    item.get("digest_cycle") == digest_cycle and item.get("digest_slot_reserved")
+                    for item in self.publications.values()
+                    if item["id"] != existing_id
+                )
+                if reserved_now >= min(limit, self.digest_limit):
+                    self._claims.pop(existing_id, None)
+                    row.update(
+                        digest_slot_reserved=False,
+                        delivery_claim_token=None,
+                        delivery_claim_expires_at=None,
+                    )
+                    return {"quota_exhausted": True}
+                self._claims.pop(existing_id, None)
+                row.update(
+                    digest_cycle=digest_cycle,
+                    digest_slot_reserved=True,
+                    delivery_claim_token=None,
+                    delivery_claim_expires_at=None,
+                )
                 return dict(row)
             if row.get("attempt_count", 0) and (
                 row.get("status") == "pending"
@@ -243,6 +271,11 @@ class FakeDigestRepository:
             for row in self.publications.values()
             if row["status"] in {"pending", "failed"}
             and int(row["attempt_count"]) < attempt_limit
+            and not row.get("digest_terminal")
+            and not (
+                self._claims.get(str(row["id"]))
+                and self._claims[str(row["id"])][1] > self.current_time
+            )
             and (not row.get("next_attempt_at") or str(row["next_attempt_at"]) <= now)
         ]
         rows.sort(
@@ -265,6 +298,7 @@ class FakeDigestRepository:
             for row in self.publications.values()
             if int(row["attempt_count"]) >= attempt_limit
             and row["status"] in {"pending", "failed"}
+            and not row.get("digest_terminal")
             and (not row.get("next_attempt_at") or str(row["next_attempt_at"]) <= now)
             and (
                 row["status"] == "pending"
@@ -308,6 +342,8 @@ class FakeDigestRepository:
         active = self._claims.get(publication_id)
         if active and active[1] > self.current_time:
             return {"claim_acquired": False}
+        if row.get("digest_terminal"):
+            return {"claim_acquired": False}
         if row.get("next_attempt_at") and str(row["next_attempt_at"]) > iso(self.current_time):
             return {"claim_acquired": False}
         self._claims[publication_id] = (
@@ -337,12 +373,15 @@ class FakeDigestRepository:
         self,
         publication_id: str,
         claim_token: str,
+        digest_cycle: str,
         *,
         expected_attempt_count: int,
         attempt_limit: int,
         lease_seconds: int = 900,
     ) -> dict[str, object]:
         row = self.publications[publication_id]
+        if row.get("digest_cycle") != digest_cycle:
+            return {"attempt_advanced": False, "cycle_stale": True}
         if (
             not self._owns_claim(publication_id, claim_token)
             or int(row["attempt_count"]) != expected_attempt_count
@@ -353,6 +392,34 @@ class FakeDigestRepository:
         row["status"] = "pending"
         row["last_error"] = None
         return {**row, "attempt_advanced": True}
+
+    async def terminalize_digest_publication(
+        self,
+        publication_id: str,
+        claim_token: str,
+        error: str,
+        *,
+        attempt_limit: int,
+        conclusive_no_delivery: bool,
+    ) -> bool:
+        if (
+            not conclusive_no_delivery
+            or not self._owns_claim(publication_id, claim_token)
+            or int(self.publications[publication_id]["attempt_count"]) < attempt_limit
+        ):
+            return False
+        row = self.publications[publication_id]
+        row.update(
+            status="failed",
+            last_error=error,
+            digest_terminal=True,
+            digest_slot_reserved=False,
+            next_attempt_at=None,
+            delivery_claim_token=None,
+            delivery_claim_expires_at=None,
+        )
+        self._claims.pop(publication_id, None)
+        return True
 
     async def finish_digest_failure(
         self, publication_id: str, claim_token: str, error: str
@@ -1706,6 +1773,113 @@ async def test_attempted_ambiguous_old_cycle_reservation_keeps_reconciliation_co
     assert result["digest_cycle"] == "2026-01-01"
     assert result["last_error"] == "discord_delivery_ambiguous:TimeoutError"
     assert result["attempt_count"] == 1
+
+
+async def test_terminal_exhaustion_releases_claim_and_prevents_future_reservation(
+    make_settings,
+) -> None:
+    repository = FakeDigestRepository()
+    repository.add_media("old-media", created_at="2025-12-01T00:00:00+00:00")
+    publication = repository.add_publication(
+        "old-media",
+        999,
+        status="failed",
+        attempt_count=3,
+        last_error="discord_delivery_ambiguous:TimeoutError",
+    )
+    publication.update(digest_cycle="2026-01-01", digest_slot_reserved=True)
+    _set_completed_digest_window(repository)
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        FakePublisher(marker_lookup=MarkerLookup(message_id=None, conclusive=True)),
+        DISCORD_DISCOVERIES_CHANNEL_ID="999",
+    )
+
+    result = await service.run()
+    terminal = repository.publications[publication["id"]]
+    assert result.failed_count == 0
+    assert terminal["digest_terminal"] is True
+    assert terminal["digest_slot_reserved"] is False
+    assert terminal["delivery_claim_token"] is None
+    assert terminal["delivery_claim_expires_at"] is None
+
+    later = await repository.reserve_digest_publication("old-media", 999, "2026-01-02", limit=50)
+    assert later["terminal"] is True
+    assert later["id"] == publication["id"]
+    assert later["digest_cycle"] == "2026-01-01"
+
+
+async def test_terminal_exhaustion_rejects_invalid_claim_token() -> None:
+    repository = FakeDigestRepository()
+    publication = repository.add_publication(
+        "media-1",
+        999,
+        status="failed",
+        attempt_count=3,
+        last_error="discord_delivery_ambiguous:TimeoutError",
+    )
+    publication["digest_slot_reserved"] = True
+    claim = await repository.claim_digest_publication(publication["id"], "valid-token")
+    assert claim["claim_acquired"] is True
+
+    assert (
+        await repository.terminalize_digest_publication(
+            publication["id"],
+            "wrong-token",
+            "delivery_attempt_limit_reached:no_marker_found",
+            attempt_limit=3,
+            conclusive_no_delivery=True,
+        )
+        is False
+    )
+    assert publication["digest_terminal"] is False
+    assert publication["digest_slot_reserved"] is True
+
+
+async def test_active_old_cycle_never_attempted_claim_is_revoked_and_reacquires_quota() -> None:
+    repository = FakeDigestRepository()
+    publication = repository.add_publication("media-1", 999, attempt_count=0)
+    publication.update(digest_cycle="2026-01-01", digest_slot_reserved=True)
+    claimed = await repository.claim_digest_publication(publication["id"], "old-worker-token")
+    assert claimed["claim_acquired"] is True
+
+    moved = await repository.reserve_digest_publication("media-1", 999, "2026-01-02", limit=50)
+    assert moved["digest_cycle"] == "2026-01-02"
+    assert moved["digest_slot_reserved"] is True
+    assert moved["delivery_claim_token"] is None
+    assert publication["attempt_count"] == 0
+    assert (
+        await repository.publish_digest_claimed(publication["id"], "old-worker-token", 12345)
+        is False
+    )
+    assert (
+        await repository.finish_digest_failure(
+            publication["id"], "old-worker-token", "stale-worker-error"
+        )
+        is False
+    )
+    assert publication["status"] == "pending"
+
+
+async def test_retry_selector_skips_active_claims_but_recovers_expired_ones() -> None:
+    repository = FakeDigestRepository()
+    rows = [repository.add_publication(f"media-{index:03}", 999) for index in range(110)]
+    for row in rows[:105]:
+        assert (await repository.claim_digest_publication(row["id"], f"token-{row['id']}"))[
+            "claim_acquired"
+        ]
+
+    eligible = await repository.list_retryable_digest_publications(
+        attempt_limit=3, limit=100, now=iso(NOW)
+    )
+    assert [row["id"] for row in eligible] == [row["id"] for row in rows[105:]]
+
+    expired_id = str(rows[0]["id"])
+    repository._claims[expired_id] = (f"token-{expired_id}", NOW - timedelta(seconds=1))
+    reclaimed = await repository.claim_digest_publication(expired_id, "replacement-token")
+    assert reclaimed["claim_acquired"] is True
 
 
 async def test_incomplete_window_is_resumed_from_persisted_cursor(make_settings) -> None:

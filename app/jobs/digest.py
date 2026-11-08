@@ -609,10 +609,12 @@ class DigestService:
             # has exhausted its send budget and must not be retried.
             counters["skipped_count"] += 1
             try:
-                await self._repository.finish_digest_failure(
+                await self._repository.terminalize_digest_publication(
                     str(publication["id"]),
                     claim_token,
                     "delivery_attempt_limit_reached:no_marker_found",
+                    attempt_limit=self._attempt_limit,
+                    conclusive_no_delivery=True,
                 )
             except Exception as exc:
                 errors[f"exhausted_publication_update_failed:{type(exc).__name__}"] += 1
@@ -639,7 +641,9 @@ class DigestService:
             errors["publication_id_missing"] += 1
             unaccounted.append(str(media.get("id") or "unknown"))
             return False
-        if str(publication.get("status") or "pending") == "published":
+        if str(publication.get("status") or "pending") == "published" or publication.get(
+            "digest_terminal"
+        ):
             counters["skipped_count"] += 1
             return True
         claim_token = str(uuid.uuid4())
@@ -688,6 +692,21 @@ class DigestService:
                 return True
             # A conclusive miss retires the ambiguous hold. Any resend in a
             # newer cycle must acquire that cycle's slot before it can proceed.
+            if attempts >= self._attempt_limit:
+                try:
+                    await self._repository.terminalize_digest_publication(
+                        publication_id,
+                        claim_token,
+                        "delivery_attempt_limit_reached:no_marker_found",
+                        attempt_limit=self._attempt_limit,
+                        conclusive_no_delivery=True,
+                    )
+                except Exception as exc:
+                    counters["failed_count"] += 1
+                    errors[f"publication_terminal_update_failed:{type(exc).__name__}"] += 1
+                    return True
+                counters["skipped_count"] += 1
+                return True
             try:
                 rollover = await self._repository.rollover_reconciled_digest_publication(
                     publication_id, claim_token, cycle, limit=50
@@ -709,13 +728,16 @@ class DigestService:
                 return True
 
         if attempts >= self._attempt_limit:
-            if not _is_ambiguous_delivery_error(last_error):
-                try:
-                    await self._repository.mark_publication_failed(
-                        publication_id, "delivery_attempt_limit_reached"
-                    )
-                except Exception as exc:
-                    errors[f"publication_failure_update_failed:{type(exc).__name__}"] += 1
+            try:
+                await self._repository.terminalize_digest_publication(
+                    publication_id,
+                    claim_token,
+                    "delivery_attempt_limit_reached:no_marker_found",
+                    attempt_limit=self._attempt_limit,
+                    conclusive_no_delivery=True,
+                )
+            except Exception as exc:
+                errors[f"publication_terminal_update_failed:{type(exc).__name__}"] += 1
             counters["skipped_count"] += 1
             log.info(
                 "Digest publication exhausted publication=%s attempts=%s",
@@ -784,6 +806,7 @@ class DigestService:
             updated = await self._repository.advance_digest_attempt(
                 publication_id,
                 claim_token,
+                cycle,
                 expected_attempt_count=attempts,
                 attempt_limit=self._attempt_limit,
             )
@@ -797,6 +820,15 @@ class DigestService:
             )
             return True
         if not updated.get("attempt_advanced"):
+            if updated.get("cycle_stale"):
+                try:
+                    reserve = getattr(self._repository, "reserve_digest_publication", None)
+                    if callable(reserve):
+                        refreshed = await reserve(media_id, channel_id, cycle, limit=50)
+                        if refreshed.get("quota_exhausted"):
+                            self._quota_exhausted = True
+                except Exception as exc:
+                    errors[f"cycle_rollover_reservation_failed:{type(exc).__name__}"] += 1
             counters["skipped_count"] += 1
             return True
         attempt_number = self._attempt_count(updated)

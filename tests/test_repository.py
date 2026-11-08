@@ -807,17 +807,21 @@ async def test_record_publication_attempt_requires_and_uses_claim_token() -> Non
     repository = make_repository(client)
 
     row = await repository.record_publication_attempt(
-        "publication-1", expected_attempt_count=1, claim_token="claim-token"
+        "publication-1",
+        expected_attempt_count=1,
+        claim_token="claim-token",
+        digest_cycle="2026-11-08",
     )
 
     assert row["attempt_count"] == 2
     assert client.rpc_calls == [
         (
-            "advance_daily_digest_attempt",
+            "advance_daily_digest_attempt_for_cycle",
             {
                 "p_publication_id": "publication-1",
                 "p_claim_token": "claim-token",
                 "p_expected_attempt_count": 1,
+                "p_digest_cycle": "2026-11-08",
                 "p_attempt_limit": 3,
                 "p_lease_seconds": 900,
             },
@@ -831,11 +835,14 @@ async def test_record_publication_attempt_returns_no_claim_when_update_loses_rac
     repository = make_repository(client)
 
     row = await repository.record_publication_attempt(
-        "publication-1", expected_attempt_count=1, claim_token="stale-token"
+        "publication-1",
+        expected_attempt_count=1,
+        claim_token="stale-token",
+        digest_cycle="2026-11-08",
     )
 
     assert row is None
-    assert client.rpc_calls[0][0] == "advance_daily_digest_attempt"
+    assert client.rpc_calls[0][0] == "advance_daily_digest_attempt_for_cycle"
 
 
 async def test_digest_claim_rpc_preserves_explicit_loser_result() -> None:
@@ -874,9 +881,13 @@ async def test_list_retryable_digest_publications_filters_unresolved_rows() -> N
         ("purpose", "daily_digest"),
         ("in.status", ["pending", "failed"]),
         ("lt.attempt_count", 3),
+        ("digest_terminal", False),
     ]
-    assert query.or_expression is not None
-    assert query.or_expression.startswith("next_attempt_at.is.null,next_attempt_at.lte.")
+    assert len(query.or_expressions) == 2
+    assert query.or_expressions[0].startswith("next_attempt_at.is.null,next_attempt_at.lte.")
+    assert query.or_expressions[1].startswith(
+        "delivery_claim_token.is.null,delivery_claim_expires_at.is.null,"
+    )
     assert query.orders == [
         ("next_attempt_at", False),
         ("created_at", False),

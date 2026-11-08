@@ -106,6 +106,26 @@ def test_digest_claims_retry_fairness_and_rollover_migration_is_fenced() -> None
     assert "delete from" not in sql
 
 
+def test_digest_terminal_rollover_and_retry_claim_migration_is_forward_only() -> None:
+    sql = read_migration("010_digest_terminal_rollover_and_retry_claims.sql").lower()
+    assert "add column if not exists digest_terminal boolean not null default false" in sql
+    assert "terminalize_daily_digest_publication" in sql
+    assert "digest_terminal = true" in sql
+    assert "digest_slot_reserved = false" in sql
+    assert "delivery_claim_token = null" in sql
+    assert "advance_daily_digest_attempt_for_cycle" in sql
+    assert "at time zone 'asia/kolkata'" in sql
+    assert "v_local_now::time < time '04:00'" in sql
+    assert "digest_cycle is distinct from p_digest_cycle" in sql
+    assert "tifa.digest_claim_rollover" in sql
+    assert "old.attempt_count = 0" in sql
+    assert "not digest_terminal" in sql
+    assert "revoke all on function public.advance_daily_digest_attempt" in sql
+    assert "grant execute" in sql and "to service_role" in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+
+
 def test_runtime_and_digest_singletons_are_seeded() -> None:
     _files, sql = read_migrations()
 
