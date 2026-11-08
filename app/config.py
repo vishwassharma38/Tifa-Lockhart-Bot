@@ -169,6 +169,7 @@ class Settings:
     brave_html_enabled: bool
     perceptual_hash_enabled: bool
     reddit_enabled: bool = True
+    reddit_seed_discovery_enabled: bool = True
     reddit_max_items_per_run: int = 100
     reddit_search_phrases: tuple[str, ...] = _DEFAULT_SEARCH_PHRASES
     brave_html_access_approved: bool = False
@@ -230,6 +231,7 @@ class Settings:
             reddit_user_agent=_read(env, "REDDIT_USER_AGENT"),
             reddit_access_approved=_parse_bool(env, "REDDIT_ACCESS_APPROVED"),
             reddit_enabled=_parse_bool(env, "REDDIT_ENABLED", True),
+            reddit_seed_discovery_enabled=_parse_bool(env, "REDDIT_SEED_DISCOVERY_ENABLED", True),
             reddit_max_items_per_run=_parse_int(env, "REDDIT_MAX_ITEMS_PER_RUN", 100),
             reddit_search_phrases=tuple(
                 x.strip()

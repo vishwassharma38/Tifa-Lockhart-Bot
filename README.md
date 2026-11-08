@@ -41,7 +41,7 @@ Phase 4 adds scheduled discovery and controls:
 - Automated collection archives through the shared media pipeline without immediately publishing to Discord. `/save` publishes immediately.
 - Hourly scheduling in `Asia/Kolkata`, persistent pause/start state, one in-process overlapping-run guard, run counters in Supabase, and interrupted-run recovery.
 - `/start`, `/stop`, `/save`, `/random`, `/stats`, `/about`, and `/status` slash commands.
-- `REDDIT_ENABLED` and `REDDIT_ACCESS_APPROVED` both gate automated Reddit access. Approval defaults to false and must reflect actual authorization; valid credentials do not grant approval.
+- `REDDIT_ENABLED` and `REDDIT_ACCESS_APPROVED` both gate automated Reddit access. Approval defaults to false and must reflect actual authorization; valid credentials do not grant approval. `REDDIT_SEED_DISCOVERY_ENABLED` controls only whether external links from collected submissions seed the crawler.
 - Media URL resolution blocks non-public destinations, including redirect destinations. Existing B2 objects are downloaded and checked against expected size and SHA-256 before reuse.
 - Scheduled collection skips standalone Reddit-hosted video because yt-dlp performs segmented requests outside the public-only media resolver. Manual `/save` retains the existing Phase 3 video path.
 
@@ -429,9 +429,13 @@ For each configured phrase, the adapter requests up to the configured number of 
 
 Each accepted result is normalized, deduplicated by normalized URL, and inserted into the persistent `discoveries` queue with its search phrase, result title, snippet, and originating URL. If Brave returns a CAPTCHA/anti-automation challenge, HTTP `401`, `403`, or `429`, or an explicit access-denial page, the run stops immediately, further Brave requests are not attempted, and the adapter is persistently paused until the owner reviews the restriction. The reason and timestamp are stored in `runtime_state`; a restart or `/start` does not clear them.
 
+#### Reddit links as crawler seeds
+
+When `REDDIT_SEED_DISCOVERY_ENABLED=true` (the default), each collected submission can seed the crawler from its external destination URL and explicit HTTP(S) links in its self-text, including Reddit Markdown links. Reddit-owned URLs and direct media URLs are filtered out. Accepted links are inserted as depth-zero queued records in the same persistent `discoveries` queue as Brave results. `MAX_URLS_PER_JOB` caps newly created Reddit seed records per collection run; existing duplicate destinations do not use an admission slot. The existing crawler subsequently fetches eligible pages and recursively explores their links. Turning the flag off disables only Reddit URL seeding; Reddit discovery recording and media archiving continue normally.
+
 #### Persistent queue and discovery path
 
-Brave results, crawler-discovered child links, and manual public-URL saves share the existing `discoveries` table. There is no second queue or scheduler. A queue row moves through statuses such as `queued`, `processing`, `verified`, `dumpster`, `rejected`, `blocked`, `failed`, and `oversize`.
+Brave results, Reddit external links, crawler-discovered child links, and manual public-URL saves share the existing `discoveries` table. There is no second queue or scheduler. A queue row moves through statuses such as `queued`, `processing`, `verified`, `dumpster`, `rejected`, `blocked`, `failed`, and `oversize`.
 
 - `next_attempt_at` provides durable retry scheduling. HTTP `429` honors `Retry-After` when present and otherwise schedules a later attempt; interrupted or paused work is returned to `queued`.
 - Each crawl pass claims at most `CRAWL_BATCH_SIZE` (default `25`) due rows and atomically moves them to `processing`. A single in-process lock prevents overlapping crawl runs.
@@ -649,6 +653,7 @@ The implemented settings are:
 | `B2_APPLICATION_KEY` | B2 application key secret | empty |
 | `REDDIT_ACCESS_APPROVED` | Explicit gate for authorized Reddit API access | `false` |
 | `REDDIT_ENABLED` | Feature gate for Reddit API use | `true` |
+| `REDDIT_SEED_DISCOVERY_ENABLED` | Seed crawler from external Reddit submission links (does not affect collection or media archiving) | `true` |
 | `REDDIT_MAX_ITEMS_PER_RUN` | Global unique candidate ceiling across all phrases | `100` |
 | `REDDIT_CLIENT_ID` | Authorized Reddit OAuth client ID | empty |
 | `REDDIT_CLIENT_SECRET` | Authorized Reddit OAuth client secret | empty |

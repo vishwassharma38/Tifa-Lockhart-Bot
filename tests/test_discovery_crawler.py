@@ -687,6 +687,30 @@ async def test_crawler_verifies_acquires_and_admits_bounded_children(make_settin
     assert repository.finished[-1][2] == "succeeded"
 
 
+async def test_reddit_seed_root_is_crawled_and_children_keep_reddit_provenance(
+    make_settings,
+) -> None:
+    page = extracted_page(media=("/full.jpg",), links=("https://other.example/page",))
+    root = row(metadata={"reddit_submission_id": "reddit-post"})
+    root["source_type"] = "reddit"
+    repository = FakeRepository(rows=[root])
+    pipeline = FakePipeline()
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        pipeline,
+        FakeInspector(ok_inspection(page)),
+    )
+
+    await crawler_.run_once(scheduled=True)
+
+    candidate, publish = pipeline.calls[0]
+    assert publish is False
+    assert candidate.source_type == "reddit"
+    assert repository.upserts[0]["source_type"] == "reddit"
+    assert repository.upserts[0]["metadata_json"]["origin_source_type"] == "reddit"
+
+
 async def test_crawler_stages_verified_pages_without_original_media(make_settings) -> None:
     page = extracted_page(media=(), links=("/child",), body="Tifa Lockhart text")
     repository = FakeRepository(rows=[row()])

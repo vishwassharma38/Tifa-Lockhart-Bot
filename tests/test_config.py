@@ -21,6 +21,7 @@ def test_defaults_do_not_require_credentials() -> None:
     assert settings.supabase_configured is False
     assert settings.b2_configured is False
     assert settings.reddit_access_approved is False
+    assert settings.reddit_seed_discovery_enabled is True
     assert settings.brave_html_enabled is False
     assert settings.perceptual_hash_enabled is False
 
@@ -49,6 +50,7 @@ def test_parses_phase_one_settings() -> None:
                 '{"image": 1, "animation": 2, "video": 3, "dumpster": 4}'
             ),
             "REDDIT_ACCESS_APPROVED": "true",
+            "REDDIT_SEED_DISCOVERY_ENABLED": "false",
             "BRAVE_HTML_ENABLED": "false",
             "PERCEPTUAL_HASH_ENABLED": "true",
         },
@@ -67,6 +69,7 @@ def test_parses_phase_one_settings() -> None:
     assert settings.supabase_configured is True
     assert settings.b2_configured is True
     assert settings.reddit_access_approved is True
+    assert settings.reddit_seed_discovery_enabled is False
     assert settings.brave_html_enabled is False
     assert settings.perceptual_hash_enabled is True
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.reddit.collector import RedditCollector, extract_reddit_seed_links
 from app.reddit.connector import (
     RedditAccessNotApprovedError,
     RedditConfigurationError,
@@ -66,6 +67,237 @@ class FakeRedditFactory:
 
 async def immediate_thread(function, *args, **kwargs):
     return function(*args, **kwargs)
+
+
+def test_extract_reddit_seed_links_normalizes_and_filters_destinations() -> None:
+    candidate = normalize_submission(
+        FakeSubmission(
+            is_self=True,
+            url="https://www.reddit.com/r/Tifa/comments/abc123/a_post",
+            selftext=(
+                "See [portfolio](https://Example.com/gallery?utm_source=reddit#top), "
+                "https://example.com/gallery. Also https://reddit.com/r/test and "
+                "https://preview.redd.it/image.jpg and https://cdn.example/video.mp4."
+            ),
+        )
+    )
+
+    links = extract_reddit_seed_links(candidate)
+
+    assert [(link.normalized_url, link.link_text) for link in links] == [
+        ("https://example.com/gallery", "portfolio")
+    ]
+    assert links[0].link_source == "self_text"
+
+
+def test_link_submission_destination_becomes_a_seed_candidate() -> None:
+    candidate = normalize_submission(
+        FakeSubmission(url="https://artist.example/portfolio", selftext="")
+    )
+
+    links = extract_reddit_seed_links(candidate)
+
+    assert len(links) == 1
+    assert links[0].original_url == "https://artist.example/portfolio"
+    assert links[0].normalized_url == "https://artist.example/portfolio"
+    assert links[0].link_source == "submission_url"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "javascript:alert(1)",
+        "https://user:pass@example.com/page",
+        "https://redd.it/abc123",
+        "https://www.redditstatic.com/site.css",
+        "https://reddit-uploaded-media.s3-accelerate.amazonaws.com/image.png",
+        "https://example.com/image.gif",
+        "https://example.com/video.webm",
+    ],
+)
+def test_extract_reddit_seed_links_rejects_unsafe_reddit_and_media_urls(url: str) -> None:
+    candidate = normalize_submission(
+        FakeSubmission(is_self=True, url="https://www.reddit.com/post", selftext=url)
+    )
+    assert extract_reddit_seed_links(candidate) == []
+
+
+def test_invalid_self_text_url_does_not_hide_valid_urls() -> None:
+    candidate = normalize_submission(
+        FakeSubmission(
+            is_self=True,
+            url="https://www.reddit.com/post",
+            selftext="https://user:pass@example.com/private https://valid.example/page",
+        )
+    )
+    assert [link.normalized_url for link in extract_reddit_seed_links(candidate)] == [
+        "https://valid.example/page"
+    ]
+
+
+class CollectorRepository:
+    configured = True
+
+    def __init__(self) -> None:
+        self.discovery_payloads = []
+        self.existing_urls: set[str] = set()
+        self.config_snapshot = None
+
+    async def get_runtime_state(self):
+        return {"collection_enabled": True}
+
+    async def create_job_run(self, config):
+        self.config_snapshot = config
+        return "job-1"
+
+    async def upsert_discovery(self, _candidate):
+        return {"id": "submission"}, True
+
+    async def upsert_discovery_record(self, payload):
+        self.discovery_payloads.append(payload)
+        url = payload["normalized_url"]
+        if url in self.existing_urls:
+            return {"id": "existing", "status": "verified"}, False
+        self.existing_urls.add(url)
+        return {"id": str(len(self.existing_urls))}, True
+
+    async def finish_job_run(self, *_args):
+        return None
+
+    async def mark_reddit_success(self):
+        return None
+
+
+class CollectorPipeline:
+    def __init__(self) -> None:
+        self.candidates = []
+
+    async def process_candidate(self, candidate, *, publish, collection_run_id=None):
+        assert publish is False
+        assert collection_run_id == "job-1"
+        self.candidates.append(candidate)
+        return []
+
+
+class CandidateConnector:
+    def __init__(self, candidates) -> None:
+        self.candidates = candidates
+
+    async def search(self, _phrase, *, limit):
+        return self.candidates[:limit]
+
+
+def _self_post(submission_id: str, body: str):
+    return normalize_submission(
+        FakeSubmission(
+            id=submission_id,
+            permalink=f"/r/TifaLockhart/comments/{submission_id}/post/",
+            is_self=True,
+            url=f"https://www.reddit.com/r/TifaLockhart/comments/{submission_id}/post/",
+            selftext=body,
+        )
+    )
+
+
+async def test_collector_queues_reddit_seeds_and_respects_budget(make_settings) -> None:
+    repository = CollectorRepository()
+    pipeline = CollectorPipeline()
+    candidates = [
+        _self_post("one", "https://one.example/page https://shared.example/start"),
+        _self_post("two", "https://shared.example/start https://two.example/page"),
+    ]
+    settings = make_settings(
+        REDDIT_ENABLED="true",
+        REDDIT_ACCESS_APPROVED="true",
+        REDDIT_CLIENT_ID="id",
+        REDDIT_CLIENT_SECRET="secret",
+        REDDIT_USER_AGENT="agent",
+        REDDIT_SEARCH_PHRASES="Tifa",
+        MAX_URLS_PER_JOB="2",
+    )
+    collector = RedditCollector(settings, repository, pipeline, CandidateConnector(candidates))
+
+    await collector.run()
+
+    assert len(repository.discovery_payloads) == 2
+    payload = repository.discovery_payloads[0]
+    assert payload["source_type"] == "reddit"
+    assert payload["status"] == "queued"
+    assert payload["depth"] == 0
+    assert payload["domain"] == "one.example"
+    assert payload["source_platform_id"] == "one"
+    assert payload["metadata_json"]["discovered_via"] == "reddit_link"
+    assert payload["metadata_json"]["reddit_submission_id"] == "one"
+    assert repository.config_snapshot["reddit_seed_discovery_enabled"] is True
+    assert repository.config_snapshot["url_budget"] == 2
+    assert len(pipeline.candidates) == 2
+
+
+async def test_existing_url_does_not_consume_reddit_seed_budget(make_settings) -> None:
+    repository = CollectorRepository()
+    repository.existing_urls.add("https://existing.example/page")
+    candidate = _self_post("one", "https://existing.example/page https://new.example/page")
+    settings = make_settings(
+        REDDIT_ENABLED="true",
+        REDDIT_ACCESS_APPROVED="true",
+        REDDIT_CLIENT_ID="id",
+        REDDIT_CLIENT_SECRET="secret",
+        REDDIT_USER_AGENT="agent",
+        REDDIT_SEARCH_PHRASES="Tifa",
+        MAX_URLS_PER_JOB="1",
+    )
+    await RedditCollector(
+        settings, repository, CollectorPipeline(), CandidateConnector([candidate])
+    ).run()
+
+    assert [payload["normalized_url"] for payload in repository.discovery_payloads] == [
+        "https://existing.example/page",
+        "https://new.example/page",
+    ]
+
+
+async def test_collector_seed_failure_and_disabled_flag_do_not_block_media(make_settings) -> None:
+    repository = CollectorRepository()
+
+    async def fail_seed(_payload):
+        raise RuntimeError("seed insert failed")
+
+    repository.upsert_discovery_record = fail_seed
+    pipeline = CollectorPipeline()
+    candidate = _self_post("one", "https://portfolio.example/gallery")
+    settings = make_settings(
+        REDDIT_ENABLED="true",
+        REDDIT_ACCESS_APPROVED="true",
+        REDDIT_CLIENT_ID="id",
+        REDDIT_CLIENT_SECRET="secret",
+        REDDIT_USER_AGENT="agent",
+        REDDIT_SEARCH_PHRASES="Tifa",
+    )
+    collector = RedditCollector(settings, repository, pipeline, CandidateConnector([candidate]))
+
+    await collector.run()
+
+    assert len(pipeline.candidates) == 1
+
+    disabled_repository = CollectorRepository()
+    disabled_pipeline = CollectorPipeline()
+    disabled = RedditCollector(
+        make_settings(
+            REDDIT_ENABLED="true",
+            REDDIT_ACCESS_APPROVED="true",
+            REDDIT_CLIENT_ID="id",
+            REDDIT_CLIENT_SECRET="secret",
+            REDDIT_USER_AGENT="agent",
+            REDDIT_SEARCH_PHRASES="Tifa",
+            REDDIT_SEED_DISCOVERY_ENABLED="false",
+        ),
+        disabled_repository,
+        disabled_pipeline,
+        CandidateConnector([candidate]),
+    )
+    await disabled.run()
+    assert disabled_repository.discovery_payloads == []
+    assert len(disabled_pipeline.candidates) == 1
 
 
 def test_parse_submission_id_accepts_ids_and_urls() -> None:
