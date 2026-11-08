@@ -22,6 +22,14 @@ def test_defaults_do_not_require_credentials() -> None:
     assert settings.b2_configured is False
     assert settings.reddit_access_approved is False
     assert settings.reddit_seed_discovery_enabled is True
+    assert settings.reddit_search_phrases == (
+        "Tifa Lockhart",
+        "Tifa Lockhart fanart",
+        "Tifa cosplay",
+        "Tifa Lockhart cosplay",
+        "Tifa Lockhart NSFW",
+    )
+    assert settings.brave_search_phrases == settings.reddit_search_phrases
     assert settings.brave_html_enabled is False
     assert settings.perceptual_hash_enabled is False
 

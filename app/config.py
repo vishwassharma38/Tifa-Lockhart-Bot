@@ -26,7 +26,7 @@ _DEFAULT_SEARCH_PHRASES = (
     "Tifa Lockhart fanart",
     "Tifa cosplay",
     "Tifa Lockhart cosplay",
-    "Tifa Final Fantasy VII",
+    "Tifa Lockhart NSFW",
 )
 
 
@@ -238,7 +238,7 @@ class Settings:
                 for x in _read(
                     env,
                     "REDDIT_SEARCH_PHRASES",
-                    "Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|Tifa Final Fantasy VII",
+                    "Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|Tifa Lockhart NSFW",
                 ).split("|")
                 if x.strip()
             ),
@@ -253,7 +253,7 @@ class Settings:
                 for x in _read(
                     env,
                     "BRAVE_SEARCH_PHRASES",
-                    "Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|Tifa Final Fantasy VII",
+                    "Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|Tifa Lockhart NSFW",
                 ).split("|")
                 if x.strip()
             ),

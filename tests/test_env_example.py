@@ -82,6 +82,12 @@ def test_template_contains_only_placeholders_and_safe_defaults() -> None:
     assert values["BRAVE_HTML_ENABLED"] == "false"
     assert values["BRAVE_HTML_ACCESS_APPROVED"] == "false"
     assert values["BRAVE_SEARCH_INTERVAL_HOURS"] == "8"
+    expected_phrases = (
+        "Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|"
+        "|Tifa Lockhart NSFW"
+    )
+    assert values["REDDIT_SEARCH_PHRASES"] == expected_phrases
+    assert values["BRAVE_SEARCH_PHRASES"] == expected_phrases
     assert values["MAX_PAGE_BYTES"] == "5000000"
     assert values["MAX_CRAWL_DEPTH"] == "6"
     assert values["MAX_URLS_PER_JOB"] == "300"
