@@ -9,13 +9,14 @@ import logging
 import shutil
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from app.bot.publisher import PublicationContext
 from app.config import Settings
 from app.media.fetcher import (
     DownloadedMedia,
@@ -126,6 +127,7 @@ class Phase2Pipeline:
         self._source_accepts_media_id = _accepts_keyword(
             repository.record_source, "source_media_id"
         )
+        self._publisher_accepts_context = _accepts_keyword(publisher.publish, "context")
 
     async def run(self, submission_reference: str) -> Phase2Result:
         """Process every supported asset, preserving the single-asset result shape."""
@@ -376,6 +378,7 @@ class Phase2Pipeline:
             object_key=object_key,
             media_item_id=media_item_id,
             filename=filename,
+            media_type=downloaded.media.media_type,
         )
 
     async def _download(
@@ -767,6 +770,7 @@ class Phase2Pipeline:
         object_key: str,
         media_item_id: str,
         filename: str,
+        media_type: str,
     ) -> Phase2Result:
         channel_id = self._publication_channel_id
         try:
@@ -796,11 +800,17 @@ class Phase2Pipeline:
                 object_key,
                 max_bytes=self._max_media_bytes,
             )
-            message_id = await self._publisher.publish(
-                filename=filename,
-                data=data,
-                candidate=candidate,
-            )
+            publish_kwargs: dict[str, Any] = {
+                "filename": filename,
+                "data": data,
+                "candidate": candidate,
+            }
+            if self._publisher_accepts_context:
+                publish_kwargs["context"] = replace(
+                    PublicationContext.from_candidate(candidate),
+                    media_type=media_type,
+                )
+            message_id = await self._publisher.publish(**publish_kwargs)
         except Exception as exc:
             log.warning(
                 "Discord publication failed (%s); archived asset %s retained",

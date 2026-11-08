@@ -6,6 +6,7 @@ import io
 import logging
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import discord
 
@@ -50,6 +51,8 @@ class PublicationContext:
     source_post_id: str | None = None
     category: str | None = None
     publication_marker: str | None = None
+    sources: tuple[dict[str, Any], ...] = ()
+    media_type: str | None = None
 
     @classmethod
     def from_candidate(cls, candidate: RedditCandidate) -> PublicationContext:
@@ -67,21 +70,25 @@ class PublicationContext:
     def from_media_record(
         cls,
         media: dict[str, Any],
-        source: dict[str, Any] | None = None,
+        source: dict[str, Any] | list[dict[str, Any]] | None = None,
         *,
         publication_marker: str | None = None,
     ) -> PublicationContext:
-        provenance = source or {}
+        sources = tuple(source) if isinstance(source, list) else ((source,) if source else ())
+        provenance = next((row for row in sources if row.get("source_url")), {})
+        creator = next((row for row in sources if row.get("creator_name")), {})
         return cls(
             title=provenance.get("title") or media.get("title"),
             caption=provenance.get("caption") or media.get("caption"),
-            creator_name=provenance.get("creator_name"),
-            creator_profile_url=provenance.get("creator_profile_url"),
+            creator_name=creator.get("creator_name"),
+            creator_profile_url=creator.get("creator_profile_url"),
             source_url=provenance.get("source_url"),
             source_platform=provenance.get("source_platform"),
             source_post_id=provenance.get("source_post_id"),
             category=media.get("category"),
             publication_marker=publication_marker,
+            sources=sources,
+            media_type=media.get("media_type"),
         )
 
 
@@ -97,60 +104,104 @@ def build_publication_message(
     """Build truthful caption text without inventing missing attribution."""
     context = _as_context(value)
 
-    creator_name = (context.creator_name or "").strip()
-    profile_url = (context.creator_profile_url or "").strip()
-    if creator_name:
-        creator_line = f"Creator: {creator_name}"
-        if profile_url:
-            creator_line = f"{creator_line} ({profile_url})"
-        else:
-            creator_line = f"{creator_line} (profile not provided by source)"
-    else:
-        creator_line = "Creator: not provided by source"
+    def clean_label(value: Any) -> str:
+        text = " ".join(str(value or "").split())
+        markdown_special = set("\\`*_{}[]()#+-.!|>~")
+        return "".join(
+            f"\\{character}" if character in markdown_special else character for character in text
+        )
 
-    detail_lines = [creator_line]
-    category = (context.category or "").strip()
-    if category:
-        detail_lines.append(f"Category: {category}")
+    def safe_url(value: Any) -> str | None:
+        text = str(value or "").strip()
+        try:
+            parsed = urlsplit(text)
+        except ValueError:
+            return None
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or any(ord(char) < 32 or char.isspace() for char in text)
+        ):
+            return None
+        try:
+            _port = parsed.port
+        except ValueError:
+            return None
+        return quote(text, safe=":/?@!$&'*,;=%+-._~")
 
-    source_url = (context.source_url or "").strip()
-    if source_url:
-        detail_lines.append(f"Source: {source_url}")
-    elif context.publication_marker:
-        detail_lines.append("Source: not provided by source")
-
-    platform = (context.source_platform or "").strip().lower()
-    post_id = (context.source_post_id or "").strip()
-    if platform == "reddit":
-        if post_id:
-            detail_lines.append(f"Reddit post ID: {post_id}")
-    elif platform:
-        detail_lines.append(f"Source platform: {platform}")
-        # Web discoveries use a normalized-URL identity, not a native platform
-        # post ID. Do not present that generated identity as fabricated metadata.
-        if post_id and platform != "web":
-            detail_lines.append(f"Source ID: {post_id}")
-    elif post_id:
-        detail_lines.append(f"Source ID: {post_id}")
-
-    marker = (context.publication_marker or "").strip()
-    if marker:
-        detail_lines.append(f"Publication: {marker}")
-
-    reserved = sum(len(line) + 1 for line in detail_lines) + 1
-    remaining = max(0, _MAX_MESSAGE_LENGTH - reserved - 1)
-
-    text_parts: list[str] = []
-    title = (context.title or "").strip()
-    body = (context.caption or "").strip()
+    media_type = clean_label(context.media_type).upper() or "MEDIA"
+    lines = [f"**TIFA ARCHIVE · {media_type}**"]
+    title = clean_label(context.title)
     if title:
-        text_parts.append(title[:remaining])
-        remaining = max(0, remaining - len(text_parts[-1]) - 1)
-    if body and remaining > 0:
-        text_parts.append(body[:remaining])
+        lines.append(title[:500])
+    creator = clean_label(context.creator_name)
+    profile = safe_url(context.creator_profile_url)
+    if creator:
+        lines.append(
+            f"Creator: [{creator}]({profile})"
+            if profile
+            else f"Creator: {creator} (profile not provided by source)"
+        )
+    else:
+        lines.append("Creator: not provided by source")
+    category = clean_label(context.category)
+    if category:
+        lines.append(f"Category: {category}")
 
-    parts = [*text_parts, "", *detail_lines]
-    return "\n".join(parts).strip()[: _MAX_MESSAGE_LENGTH - 1]
+    associations = list(context.sources)
+    if not associations and context.source_url:
+        associations = [{"source_url": context.source_url}]
+    seen: set[str] = set()
+    if context.creator_profile_url:
+        seen.add(str(context.creator_profile_url).strip())
+    links: list[str] = []
+    for source in associations:
+        additional_creator = clean_label(source.get("creator_name"))
+        additional_profile = safe_url(source.get("creator_profile_url"))
+        if additional_creator and additional_creator != creator:
+            if additional_profile:
+                lines.append(f"Creator: [{additional_creator}]({additional_profile})")
+                seen.add(str(source.get("creator_profile_url") or "").strip())
+            else:
+                lines.append(f"Creator: {additional_creator} (profile not provided by source)")
+        original = str(source.get("source_url") or "").strip()
+        url = safe_url(original)
+        if url and original not in seen:
+            seen.add(original)
+            links.append(f"[Original source]({url})")
+        for key, label in (
+            ("creator_profile_url", "Creator profile"),
+            ("external_url", "Related source"),
+        ):
+            original = str(source.get(key) or "").strip()
+            url = safe_url(original)
+            if url and original not in seen:
+                seen.add(original)
+                links.append(f"[{label}]({url})")
+    if links:
+        lines.append("Sources: " + " · ".join(links))
+    elif context.publication_marker:
+        lines.append("Source: not provided by source")
+
+    marker = str(context.publication_marker or "").strip()
+    if marker:
+        lines.append(f"Publication: {marker}")
+    platform = clean_label(context.source_platform)
+    if platform:
+        lines.append(f"Source platform: {platform}")
+    if context.source_post_id and platform != "web":
+        lines.append(f"Source ID: {clean_label(context.source_post_id)}")
+    body = clean_label(context.caption)
+    if body:
+        lines.insert(2 if title else 1, body[:300])
+    message = "\n".join(lines)
+    if len(message) > _MAX_MESSAGE_LENGTH:
+        # Never silently drop attribution: fail before sending and leave the
+        # durable publication row available for operator review.
+        raise DiscordPublicationRejectedError("Attribution exceeds Discord message length")
+    return message
 
 
 class DiscordPublisher:
@@ -194,12 +245,14 @@ class DiscordPublisher:
             raise DiscordPublicationError("Publication attribution is required")
         target_channel = channel_id or self._channel_id
         channel = await self._resolve_channel(target_channel)
+        content = build_publication_message(context or candidate)
 
         file = discord.File(io.BytesIO(data), filename=filename)
         try:
             message = await channel.send(
-                content=build_publication_message(context or candidate),
+                content=content,
                 file=file,
+                suppress_embeds=True,
             )
         except discord.HTTPException as exc:
             if 400 <= exc.status < 500 and exc.status != 429:

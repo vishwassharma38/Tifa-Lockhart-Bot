@@ -518,7 +518,8 @@ async def test_random_command_still_delivers_archived_media(make_settings) -> No
     message = interaction.followup.messages[0]
     assert isinstance(message["file"], discord.File)
     assert "Random Tifa artwork" in message["args"][0]
-    assert "Creator: artist (https://example.com/artist)" in message["args"][0]
+    assert "Creator: [artist](https://example.com/artist)" in message["args"][0]
+    assert message["suppress_embeds"] is True
 
 
 async def test_stats_command_still_reports_archive_counts(make_settings) -> None:

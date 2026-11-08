@@ -103,6 +103,7 @@ class DigestWindow:
     end: datetime
     cursor: datetime
     resumed: bool
+    cycle: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +146,7 @@ class DigestService:
         self._retry_batch_size = max(1, retry_batch_size)
         self._now = now or (lambda: datetime.now(UTC))
         self._lock = asyncio.Lock()
+        self._quota_exhausted = False
 
     @property
     def attempt_limit(self) -> int:
@@ -188,12 +190,16 @@ class DigestService:
                 job_type="daily_digest",
             )
             window = await self._prepare_window()
+            self._quota_exhausted = False
             processed: set[tuple[str, int]] = set()
             unaccounted: list[str] = []
             await self._process_candidates(window, processed, counters, errors, unaccounted)
-            await self._process_retryable(processed, counters, errors, unaccounted)
+            await self._process_retryable(window.cycle, processed, counters, errors, unaccounted)
             await self._process_exhausted_ambiguous(processed, counters, errors)
-            if unaccounted:
+            if self._quota_exhausted:
+                errors["global_daily_limit_reached"] += 1
+                outcome = "partial"
+            elif unaccounted:
                 errors["unaccounted_items"] += len(unaccounted)
                 outcome = "partial"
                 log.warning(
@@ -281,8 +287,17 @@ class DigestService:
         end = _as_datetime(state.get("last_window_end"))
         completed = _as_datetime(state.get("last_completed_at"))
         cursor = _as_datetime(state.get("cursor_media_created_at"))
+        now = self._now().astimezone(UTC)
+        due = latest_digest_due_at(now)
+        cycle = due.astimezone(ZoneInfo(DIGEST_TIMEZONE)).date().isoformat()
 
         if start is not None and end is not None and (completed is None or completed < end):
+            previous_cycle = str(state.get("digest_cycle") or cycle)
+            if previous_cycle < cycle:
+                # A full prior-cycle window carries its oldest remaining records
+                # into the newly scheduled cycle without resetting on restart.
+                previous_cycle = cycle
+                end = now if now > end else end
             if cursor is None or cursor < start:
                 cursor = start
             if cursor > end:
@@ -293,10 +308,15 @@ class DigestService:
                 _iso(end),
                 _iso(cursor),
             )
-            return DigestWindow(start=start, end=end, cursor=cursor, resumed=True)
+            await self._repository.update_digest_state(
+                {"digest_cycle": previous_cycle, "last_window_end": _iso(end)}
+            )
+            return DigestWindow(
+                start=start, end=end, cursor=cursor, resumed=True, cycle=previous_cycle
+            )
 
         window_start = end if end is not None else INITIAL_DIGEST_WINDOW_START
-        window_end = self._now().astimezone(UTC)
+        window_end = now
         if window_end < window_start:
             window_end = window_start
         window = DigestWindow(
@@ -304,12 +324,14 @@ class DigestService:
             end=window_end,
             cursor=window_start,
             resumed=False,
+            cycle=cycle,
         )
         await self._repository.update_digest_state(
             {
                 "last_window_start": _iso(window.start),
                 "last_window_end": _iso(window.end),
                 "cursor_media_created_at": _iso(window.cursor),
+                "digest_cycle": window.cycle,
             }
         )
         return window
@@ -336,19 +358,25 @@ class DigestService:
             )
             if not rows:
                 return
+            page_cursor = persisted_cursor
             for media in rows:
                 accounted = await self._process_candidate(
                     media,
+                    window,
                     processed,
                     counters,
                     errors,
                     unaccounted,
                 )
                 if not accounted:
+                    if self._quota_exhausted:
+                        break
                     cursor_writable = False
-            last_created = _as_datetime(rows[-1].get("created_at"))
-            if last_created is not None and last_created > persisted_cursor:
-                persisted_cursor = last_created
+                else:
+                    created_at = _as_datetime(media.get("created_at"))
+                    if created_at is not None and created_at > page_cursor:
+                        page_cursor = created_at
+            persisted_cursor = page_cursor
             if cursor_writable:
                 try:
                     await self._repository.update_digest_state(
@@ -362,12 +390,15 @@ class DigestService:
                     errors[f"digest_cursor_update_failed:{type(exc).__name__}"] += 1
                     log.warning("Digest cursor update failed (%s)", type(exc).__name__)
             offset += len(rows)
+            if self._quota_exhausted:
+                return
             if len(rows) < self._page_size:
                 return
 
     async def _process_candidate(
         self,
         media: dict[str, Any],
+        window: DigestWindow,
         processed: set[tuple[str, int]],
         counters: dict[str, int],
         errors: Counter[str],
@@ -400,10 +431,21 @@ class DigestService:
         processed.add(key)
         counters["processed_count"] += 1
         try:
-            publication = await self._repository.ensure_digest_publication(
-                media_id,
-                channel_id,
-            )
+            reserve = getattr(self._repository, "reserve_digest_publication", None)
+            if callable(reserve):
+                publication = await reserve(media_id, channel_id, window.cycle, limit=50)
+                if publication.get("quota_exhausted"):
+                    self._quota_exhausted = True
+                    return False
+            else:
+                publication = await self._repository.ensure_digest_publication(
+                    media_id,
+                    channel_id,
+                )
+            try:
+                channel_id = int(publication.get("channel_id") or channel_id)
+            except (TypeError, ValueError):
+                pass
         except Exception as exc:
             counters["failed_count"] += 1
             errors[f"publication_record_failed:{type(exc).__name__}"] += 1
@@ -418,6 +460,7 @@ class DigestService:
             media,
             publication,
             channel_id=channel_id,
+            cycle=window.cycle,
             counters=counters,
             errors=errors,
             unaccounted=unaccounted,
@@ -425,6 +468,7 @@ class DigestService:
 
     async def _process_retryable(
         self,
+        cycle: str,
         processed: set[tuple[str, int]],
         counters: dict[str, int],
         errors: Counter[str],
@@ -447,6 +491,22 @@ class DigestService:
                 channel_id = 0
             if not media_id or channel_id <= 0:
                 continue
+            if any(processed_media_id == media_id for processed_media_id, _ in processed):
+                continue
+            reserve = getattr(self._repository, "reserve_digest_publication", None)
+            if callable(reserve):
+                try:
+                    publication = await reserve(media_id, channel_id, cycle, limit=50)
+                except Exception as exc:
+                    errors[f"retry_reservation_failed:{type(exc).__name__}"] += 1
+                    continue
+                if publication.get("quota_exhausted"):
+                    self._quota_exhausted = True
+                    break
+                try:
+                    channel_id = int(publication.get("channel_id") or channel_id)
+                except (TypeError, ValueError):
+                    pass
             key = (media_id, channel_id)
             if key in processed:
                 continue
@@ -479,6 +539,7 @@ class DigestService:
                 media,
                 publication,
                 channel_id=channel_id,
+                cycle=cycle,
                 counters=counters,
                 errors=errors,
                 unaccounted=unaccounted,
@@ -548,6 +609,7 @@ class DigestService:
         publication: dict[str, Any],
         *,
         channel_id: int,
+        cycle: str,
         counters: dict[str, int],
         errors: Counter[str],
         unaccounted: list[str],
@@ -587,8 +649,37 @@ class DigestService:
                     channel_id,
                 )
                 return True
+            # A conclusive miss retires the ambiguous hold. Any resend in a
+            # newer cycle must acquire that cycle's slot before it can proceed.
+            try:
+                await self._repository.mark_publication_failed(
+                    publication_id, "delivery_reconciled_no_marker"
+                )
+                last_error = "delivery_reconciled_no_marker"
+                ambiguous_failure = False
+                if str(publication.get("digest_cycle") or "") != cycle:
+                    reserve = getattr(self._repository, "reserve_digest_publication", None)
+                    if callable(reserve):
+                        publication = await reserve(
+                            str(media.get("id") or ""), channel_id, cycle, limit=50
+                        )
+                        if publication.get("quota_exhausted"):
+                            self._quota_exhausted = True
+                            return True
+                        channel_id = int(publication.get("channel_id") or channel_id)
+            except Exception as exc:
+                counters["failed_count"] += 1
+                errors[f"retry_reservation_failed:{type(exc).__name__}"] += 1
+                return True
 
         if attempts >= self._attempt_limit:
+            if not _is_ambiguous_delivery_error(last_error):
+                try:
+                    await self._repository.mark_publication_failed(
+                        publication_id, "delivery_attempt_limit_reached"
+                    )
+                except Exception as exc:
+                    errors[f"publication_failure_update_failed:{type(exc).__name__}"] += 1
             counters["skipped_count"] += 1
             log.info(
                 "Digest publication exhausted publication=%s attempts=%s",
@@ -649,9 +740,14 @@ class DigestService:
             )
             return True
 
-        source: dict[str, Any] | None = None
+        source: list[dict[str, Any]] = []
         try:
-            source = await self._repository.source_for_media(media_id)
+            list_sources = getattr(self._repository, "sources_for_media", None)
+            if callable(list_sources):
+                source = await list_sources(media_id)
+            else:
+                legacy_source = await self._repository.source_for_media(media_id)
+                source = [legacy_source] if legacy_source else []
         except Exception as exc:
             log.warning(
                 "Digest source attribution lookup failed item=%s (%s)",
@@ -815,6 +911,12 @@ class DigestService:
             )
 
     def _eligible(self, media: dict[str, Any]) -> bool:
+        if str(media.get("media_type") or "").strip().lower() not in {
+            "image",
+            "animation",
+            "video",
+        }:
+            return False
         if media.get("verification_status") != "verified":
             return False
         if media.get("download_status") != "stored":
@@ -836,19 +938,15 @@ class DigestService:
         return 1 <= size_bytes <= MAX_DIGEST_MEDIA_BYTES
 
     def _destination_channel(self, media: dict[str, Any]) -> int:
-        category = str(media.get("category") or "").strip().lower()
+        media_type = str(media.get("media_type") or "").strip().lower()
         mappings = getattr(self._settings, "category_channels", None) or {}
-        mapped = mappings.get(category) if isinstance(mappings, dict) else None
+        mapped = mappings.get(media_type) if isinstance(mappings, dict) else None
         if mapped:
             try:
                 return int(mapped)
             except (TypeError, ValueError):
                 pass
-        fallback = getattr(self._settings, "discoveries_channel_id", None) or 0
-        try:
-            return int(fallback)
-        except (TypeError, ValueError):
-            return 0
+        return 0
 
     @staticmethod
     def _attempt_count(publication: dict[str, Any]) -> int:

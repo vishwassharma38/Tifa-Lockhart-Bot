@@ -19,6 +19,9 @@ def make_settings() -> Callable[..., Settings]:
             "TIMEZONE": "UTC",
             "PORT": "10000",
             "DISCORD_TOKEN": "test-discord-token",
+            "DISCORD_CATEGORY_CHANNELS_JSON": (
+                '{"image": 999, "animation": 999, "video": 999, "dumpster": 999}'
+            ),
         }
         for key, value in overrides.items():
             if value is None:

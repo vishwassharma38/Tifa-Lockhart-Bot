@@ -16,6 +16,7 @@ VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 MEDIA_CATEGORIES = frozenset(
     {"fanart", "cosplay_photography", "official_artwork", "wallpaper", "video", "other"}
 )
+DIGEST_MEDIA_TYPES = frozenset({"image", "animation", "video", "dumpster"})
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -87,7 +88,7 @@ def _parse_optional_int(env: Mapping[str, str], name: str) -> int | None:
 
 
 def _parse_category_channels(env: Mapping[str, str]) -> dict[str, int]:
-    """Parse the optional category-to-channel routing JSON object."""
+    """Parse the media-type-to-channel routing JSON object."""
     raw = _read(env, "DISCORD_CATEGORY_CHANNELS_JSON")
     if not raw:
         return {}
@@ -100,9 +101,9 @@ def _parse_category_channels(env: Mapping[str, str]) -> dict[str, int]:
 
     channels: dict[str, int] = {}
     for category, channel_id in value.items():
-        if not isinstance(category, str) or category not in MEDIA_CATEGORIES:
+        if not isinstance(category, str) or category not in (DIGEST_MEDIA_TYPES | MEDIA_CATEGORIES):
             raise ConfigurationError(
-                "DISCORD_CATEGORY_CHANNELS_JSON contains an unsupported category name"
+                "DISCORD_CATEGORY_CHANNELS_JSON contains an unsupported media type or legacy category"
             )
         if isinstance(channel_id, bool) or not isinstance(channel_id, int):
             raise ConfigurationError(
@@ -424,6 +425,18 @@ class Settings:
             endpoint_error = _b2_endpoint_error(self.b2_endpoint_url, self.b2_region)
             if endpoint_error:
                 errors.append(endpoint_error)
+
+        if self.supabase_configured and self.b2_configured:
+            missing_digest_types = DIGEST_MEDIA_TYPES - self.category_channels.keys()
+            if missing_digest_types:
+                errors.append(
+                    "DISCORD_CATEGORY_CHANNELS_JSON must configure image, animation, video, "
+                    "and dumpster channel IDs"
+                )
+            elif len({self.category_channels[key] for key in DIGEST_MEDIA_TYPES}) != len(
+                DIGEST_MEDIA_TYPES
+            ):
+                errors.append("DISCORD_CATEGORY_CHANNELS_JSON must use four distinct channel IDs")
 
         if errors:
             raise ConfigurationError("Invalid service configuration: " + "; ".join(errors))

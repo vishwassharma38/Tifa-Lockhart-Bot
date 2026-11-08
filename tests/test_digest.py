@@ -45,6 +45,7 @@ class FakeDigestRepository:
         self.fail_mark_published = False
         self.fail_mark_success = False
         self.fail_source = False
+        self.digest_limit = 50
         self._next_publication = 1
 
     def add_media(
@@ -190,6 +191,40 @@ class FakeDigestRepository:
         row = self.add_publication(media_item_id, channel_id)
         return dict(row)
 
+    async def reserve_digest_publication(
+        self, media_item_id: str, channel_id: int, digest_cycle: str, *, limit: int = 50
+    ) -> dict[str, object]:
+        if self.fail_ensure:
+            raise RuntimeError("publication insert failed")
+        existing_id = next(
+            (pid for (mid, _cid), pid in self.publication_by_key.items() if mid == media_item_id),
+            None,
+        )
+        if existing_id:
+            row = self.publications[existing_id]
+            if row["status"] == "published":
+                return dict(row)
+            if row.get("digest_cycle") not in (None, digest_cycle) and row.get(
+                "digest_slot_reserved"
+            ):
+                return dict(row)
+            if row.get("digest_cycle") == digest_cycle and row.get("digest_slot_reserved"):
+                return dict(row)
+        reserved = sum(
+            1
+            for row in self.publications.values()
+            if row.get("digest_cycle") == digest_cycle and row.get("digest_slot_reserved")
+        )
+        if reserved >= min(limit, self.digest_limit):
+            return {"quota_exhausted": True}
+        if existing_id:
+            row = self.publications[existing_id]
+            row.update(digest_cycle=digest_cycle, digest_slot_reserved=True)
+            return dict(row)
+        row = self.add_publication(media_item_id, channel_id)
+        row.update(digest_cycle=digest_cycle, digest_slot_reserved=True)
+        return dict(row)
+
     async def list_retryable_digest_publications(
         self, *, attempt_limit: int, limit: int = 100
     ) -> list[dict[str, object]]:
@@ -230,6 +265,10 @@ class FakeDigestRepository:
         row = self.sources.get(media_item_id)
         return dict(row) if row is not None else None
 
+    async def sources_for_media(self, media_item_id: str) -> list[dict[str, object]]:
+        source = await self.source_for_media(media_item_id)
+        return [source] if source else []
+
     async def record_publication_attempt(
         self, publication_id: str, *, expected_attempt_count: int
     ) -> dict[str, object]:
@@ -256,6 +295,8 @@ class FakeDigestRepository:
         row = self.publications[publication_id]
         row["status"] = "failed"
         row["last_error"] = error
+        if not error.startswith(("discord_delivery_ambiguous:", "discord_delivery_failed")):
+            row["digest_slot_reserved"] = False
         return dict(row)
 
     async def record_publication_reconciliation_error(
@@ -387,7 +428,7 @@ async def test_first_run_processes_backlog_to_mapped_category_channel(make_setti
         storage,
         publisher,
         DISCORD_DISCOVERIES_CHANNEL_ID="999",
-        DISCORD_CATEGORY_CHANNELS_JSON='{"fanart": 222}',
+        DISCORD_CATEGORY_CHANNELS_JSON='{"image": 222}',
     )
 
     result = await service.run(trigger="scheduled")
@@ -429,7 +470,7 @@ async def test_first_run_processes_backlog_to_mapped_category_channel(make_setti
     assert repository.state["cursor_media_created_at"] == iso(NOW)
 
 
-async def test_unmapped_category_uses_discoveries_fallback(make_settings) -> None:
+async def test_media_type_routing_ignores_content_category(make_settings) -> None:
     repository = FakeDigestRepository()
     repository.add_media("media-1", category="cosplay_photography")
     publisher = FakePublisher()
@@ -438,21 +479,26 @@ async def test_unmapped_category_uses_discoveries_fallback(make_settings) -> Non
         repository,
         FakeStorage(),
         publisher,
-        DISCORD_DISCOVERIES_CHANNEL_ID="999",
-        DISCORD_CATEGORY_CHANNELS_JSON='{"fanart": 222}',
+        DISCORD_CATEGORY_CHANNELS_JSON='{"image": 222}',
     )
 
     result = await service.run()
 
     assert result.outcome == "succeeded"
-    assert publisher.calls[0]["channel_id"] == 999
+    assert publisher.calls[0]["channel_id"] == 222
 
 
 async def test_missing_destination_fails_item_without_false_publication(make_settings) -> None:
     repository = FakeDigestRepository()
     repository.add_media("media-1", category="other")
     publisher = FakePublisher()
-    service = build_service(make_settings, repository, FakeStorage(), publisher)
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_CATEGORY_CHANNELS_JSON="{}",
+    )
 
     result = await service.run()
 
@@ -486,14 +532,14 @@ async def test_unaccounted_item_holds_window_until_destination_is_configured(
         repository,
         FakeStorage(),
         publisher,
-        DISCORD_CATEGORY_CHANNELS_JSON='{"fanart": 222}',
+        DISCORD_CATEGORY_CHANNELS_JSON="{}",
     )
 
     first = await first_service.run()
 
     assert first.outcome == "partial"
-    assert first.published_count == 1
-    assert first.failed_count == 1
+    assert first.published_count == 0
+    assert first.failed_count == 2
     assert "last_completed_at" not in repository.state
     assert repository.state["cursor_media_created_at"] == iso(INITIAL_DIGEST_WINDOW_START)
 
@@ -502,16 +548,16 @@ async def test_unaccounted_item_holds_window_until_destination_is_configured(
         repository,
         FakeStorage(),
         publisher,
-        DISCORD_CATEGORY_CHANNELS_JSON='{"fanart": 222, "other": 333}',
+        DISCORD_CATEGORY_CHANNELS_JSON='{"image": 222}',
     )
 
     second = await second_service.run()
 
     assert second.resumed is True
-    assert second.published_count == 1
-    assert second.skipped_count == 1
+    assert second.published_count == 2
+    assert second.skipped_count == 0
     assert second.outcome == "succeeded"
-    assert [call["channel_id"] for call in publisher.calls] == [222, 333]
+    assert [call["channel_id"] for call in publisher.calls] == [222, 222]
     assert repository.state["last_completed_at"] == iso(NOW)
 
 
@@ -834,6 +880,7 @@ async def test_failed_ambiguous_delivery_stays_reconcilable_across_runs(make_set
     second = await service.run()
 
     assert first_error.startswith("discord_delivery_ambiguous:TimeoutError;")
+    assert repository.publications[publication["id"]]["digest_slot_reserved"] is True
     assert str(repository.publications[publication["id"]]["last_error"]).startswith(
         "discord_delivery_ambiguous:TimeoutError;"
     )
@@ -957,6 +1004,7 @@ async def test_definite_discord_rejection_leaves_retryable_failed_record(make_se
     publication = repository.publications["publication-1"]
     assert publication["status"] == "failed"
     assert publication["last_error"] == "discord_delivery_rejected:DiscordPublicationRejectedError"
+    assert publication["digest_slot_reserved"] is False
 
     retry = await service.run()
 
@@ -1288,7 +1336,7 @@ async def test_retry_is_skipped_when_resolved_destination_changed(make_settings)
         FakeStorage(),
         publisher,
         DISCORD_DISCOVERIES_CHANNEL_ID="999",
-        DISCORD_CATEGORY_CHANNELS_JSON='{"fanart": 222}',
+        DISCORD_CATEGORY_CHANNELS_JSON='{"image": 222}',
     )
 
     result = await service.run()
@@ -1297,6 +1345,29 @@ async def test_retry_is_skipped_when_resolved_destination_changed(make_settings)
     assert result.skipped_count == 1
     assert publisher.calls == []
     assert repository.publications[existing["id"]]["attempt_count"] == 1
+
+
+async def test_published_history_is_not_reposted_after_routing_change(make_settings) -> None:
+    repository = FakeDigestRepository()
+    repository.add_media("media-1", category="fanart")
+    existing = repository.add_publication("media-1", 999, status="published")
+    publisher = FakePublisher()
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_CATEGORY_CHANNELS_JSON=(
+            '{"image": 222, "animation": 333, "video": 444, "dumpster": 555}'
+        ),
+    )
+
+    result = await service.run()
+
+    assert result.published_count == 0
+    assert publisher.calls == []
+    assert len(repository.publications) == 1
+    assert repository.publications[existing["id"]]["channel_id"] == 999
 
 
 async def test_publication_record_failure_is_isolated(make_settings) -> None:
@@ -1621,3 +1692,179 @@ async def test_concurrent_runs_are_serialized(make_settings) -> None:
 
     assert {first.outcome, second.outcome} == {"succeeded", "skipped"}
     assert len(publisher.calls) == 1
+
+
+async def test_global_digest_budget_stops_after_fifty_unique_items(make_settings) -> None:
+    repository = FakeDigestRepository()
+    for index in range(60):
+        row = repository.add_media(
+            f"media-{index:03}",
+            created_at=iso(NOW - timedelta(days=60 - index)),
+        )
+        row["media_type"] = ("image", "animation", "video")[index % 3]
+    publisher = FakePublisher()
+    routes = '{"image": 111, "animation": 222, "video": 333, "dumpster": 444}'
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        page_size=17,
+        DISCORD_CATEGORY_CHANNELS_JSON=routes,
+    )
+
+    result = await service.run()
+
+    assert result.outcome == "partial"
+    assert result.published_count == 50
+    assert len(publisher.calls) == 50
+    assert sum(row["status"] == "published" for row in repository.publications.values()) == 50
+    assert len({row["media_item_id"] for row in repository.publications.values()}) == 50
+    assert {row["media_item_id"] for row in repository.publications.values()} == {
+        f"media-{index:03}" for index in range(50)
+    }
+    assert {row["digest_cycle"] for row in repository.publications.values()} == {"2026-01-02"}
+    assert "global_daily_limit_reached" in (result.error_summary or "")
+    assert "last_completed_at" not in repository.state
+
+
+async def test_exactly_fifty_single_category_completes_the_cycle(make_settings) -> None:
+    repository = FakeDigestRepository()
+    for index in range(50):
+        repository.add_media(f"image-{index:02}")
+    publisher = FakePublisher()
+    service = build_service(make_settings, repository, FakeStorage(), publisher)
+
+    result = await service.run()
+
+    assert result.outcome == "succeeded"
+    assert result.published_count == 50
+    assert len({call["channel_id"] for call in publisher.calls}) == 1
+    assert repository.state["last_completed_at"] == iso(NOW)
+
+
+async def test_unknown_and_dumpster_types_remain_unpublished(make_settings) -> None:
+    repository = FakeDigestRepository()
+    ordinary = repository.add_media("unknown")
+    ordinary["media_type"] = "unknown"
+    dumpster = repository.add_media("misc")
+    dumpster["media_type"] = "other"
+    dumpster["verification_status"] = "dumpster"
+    publisher = FakePublisher()
+    service = build_service(make_settings, repository, FakeStorage(), publisher)
+
+    result = await service.run()
+
+    assert result.published_count == 0
+    assert publisher.calls == []
+    assert repository.publications == {}
+
+
+async def test_digest_backlog_carries_forward_and_cycle_resets_once(make_settings) -> None:
+    repository = FakeDigestRepository()
+    for index in range(55):
+        repository.add_media(
+            f"media-{index:03}",
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+    settings = make_settings(
+        DISCORD_CATEGORY_CHANNELS_JSON=(
+            '{"image": 111, "animation": 222, "video": 333, "dumpster": 444}'
+        )
+    )
+    first_publisher = FakePublisher()
+    first = DigestService(
+        settings=settings,
+        repository=repository,
+        storage=FakeStorage(),
+        publisher=first_publisher,
+        now=lambda: NOW,
+    )
+    first_result = await first.run()
+
+    assert first_result.published_count == 50
+    assert [call["context"].title for call in first_publisher.calls][-1] == "Archived artwork"
+    assert repository.state.get("last_completed_at") is None
+
+    # Restarting in the same scheduled cycle reuses the persisted reservations.
+    same_cycle_publisher = FakePublisher()
+    same_cycle = DigestService(
+        settings=settings,
+        repository=repository,
+        storage=FakeStorage(),
+        publisher=same_cycle_publisher,
+        now=lambda: NOW + timedelta(hours=1),
+    )
+    same_result = await same_cycle.run()
+    assert same_result.published_count == 0
+    assert len(same_cycle_publisher.calls) == 0
+
+    # The next 04:00 IST cycle resumes the oldest remaining item.
+    next_day_publisher = FakePublisher()
+    next_day = DigestService(
+        settings=settings,
+        repository=repository,
+        storage=FakeStorage(),
+        publisher=next_day_publisher,
+        now=lambda: NOW + timedelta(days=1),
+    )
+    next_result = await next_day.run()
+    assert next_result.published_count == 5
+    assert len(next_day_publisher.calls) == 5
+    assert {row["digest_cycle"] for row in repository.publications.values()} == {
+        "2026-01-02",
+        "2026-01-03",
+    }
+
+
+async def test_media_type_routes_to_one_dedicated_channel(make_settings) -> None:
+    repository = FakeDigestRepository()
+    expected = {"image": 111, "animation": 222, "video": 333}
+    for index, media_type in enumerate(expected):
+        row = repository.add_media(f"media-{index}")
+        row["media_type"] = media_type
+    publisher = FakePublisher()
+    service = build_service(
+        make_settings,
+        repository,
+        FakeStorage(),
+        publisher,
+        DISCORD_CATEGORY_CHANNELS_JSON=(
+            '{"image": 111, "animation": 222, "video": 333, "dumpster": 444}'
+        ),
+    )
+
+    result = await service.run()
+
+    assert result.published_count == 3
+    assert {
+        row["media_item_id"]: row["channel_id"] for row in repository.publications.values()
+    } == {"media-0": 111, "media-1": 222, "media-2": 333}
+
+
+async def test_retry_uses_its_existing_slot_and_blocks_a_new_item(make_settings) -> None:
+    repository = FakeDigestRepository()
+    cycle = "2026-01-02"
+    for index in range(49):
+        media_id = f"published-{index:02}"
+        repository.add_media(media_id)
+        row = repository.add_publication(media_id, 999, status="published")
+        row.update(digest_cycle=cycle, digest_slot_reserved=True)
+    retry_media = repository.add_media("retry")
+    retry_media["created_at"] = "2026-01-01T00:00:01+00:00"
+    retry = repository.add_publication(
+        "retry", 999, status="failed", attempt_count=1, last_error="storage_download_failed"
+    )
+    retry.update(digest_cycle=cycle, digest_slot_reserved=True)
+    fresh = repository.add_media("fresh")
+    fresh["created_at"] = "2026-01-01T00:00:02+00:00"
+    publisher = FakePublisher()
+    service = build_service(make_settings, repository, FakeStorage(), publisher)
+
+    result = await service.run()
+
+    assert result.published_count == 1
+    assert [call["context"].title for call in publisher.calls] == ["Archived artwork"]
+    assert retry["status"] == "published"
+    assert retry["digest_slot_reserved"] is True
+    assert "fresh" not in {row["media_item_id"] for row in repository.publications.values()}

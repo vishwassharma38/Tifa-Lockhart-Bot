@@ -72,6 +72,18 @@ def test_digest_publication_idempotency_index_exists() -> None:
     assert "where purpose = 'daily_digest'" in sql
 
 
+def test_global_digest_reservation_migration_is_additive_and_atomic() -> None:
+    sql = read_migration("008_global_digest_budget.sql").lower()
+    assert "add column if not exists digest_cycle" in sql
+    assert "add column if not exists digest_slot_reserved" in sql
+    assert "uq_publications_digest_item_global" in sql
+    assert "reserve_daily_digest_publication" in sql
+    assert "for update" in sql
+    assert "asia/kolkata" in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+
+
 def test_runtime_and_digest_singletons_are_seeded() -> None:
     _files, sql = read_migrations()
 

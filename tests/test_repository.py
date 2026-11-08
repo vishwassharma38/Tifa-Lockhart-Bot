@@ -154,9 +154,23 @@ class FakeTable:
 class FakeClient:
     def __init__(self) -> None:
         self.tables: dict[str, FakeTable] = {}
+        self.rpc_calls: list[tuple[str, dict[str, object]]] = []
+        self.rpc_data: object = {"id": "publication-1", "quota_exhausted": False}
 
     def table(self, name: str) -> FakeTable:
         return self.tables.setdefault(name, FakeTable(name))
+
+    def rpc(self, name: str, params: dict[str, object]):
+        self.rpc_calls.append((name, params))
+        return FakeQueryResult(self.rpc_data)
+
+
+class FakeQueryResult:
+    def __init__(self, data: object) -> None:
+        self.data = data
+
+    def execute(self) -> FakeResponse:
+        return FakeResponse(self.data)  # type: ignore[arg-type]
 
 
 async def immediate_thread(function, *args, **kwargs):
@@ -339,6 +353,41 @@ async def test_record_source_upserts_reddit_attribution() -> None:
     assert payload["media_url"] == "https://i.redd.it/example.png"
     assert payload["creator_name"] == "artist_name"
     assert payload["caption"] == "Original artwork"
+
+
+async def test_sources_for_media_retrieves_every_association_in_stable_order() -> None:
+    client = FakeClient()
+    sources = [{"id": "source-1"}, {"id": "source-2"}]
+    client.table("media_sources").results["select"] = sources
+    repository = make_repository(client)
+
+    result = await repository.sources_for_media("media-1")
+
+    assert result == sources
+    query = client.table("media_sources").queries[0]
+    assert query.filters == [("media_item_id", "media-1")]
+    assert query.orders == [("discovered_at", False), ("id", False)]
+    assert query.range_value == (0, 999)
+
+
+async def test_digest_reservation_uses_atomic_database_function() -> None:
+    client = FakeClient()
+    repository = make_repository(client)
+
+    result = await repository.reserve_digest_publication("media-1", 123, "2026-11-08", limit=50)
+
+    assert result == {"id": "publication-1", "quota_exhausted": False}
+    assert client.rpc_calls == [
+        (
+            "reserve_daily_digest_publication",
+            {
+                "p_media_item_id": "media-1",
+                "p_channel_id": 123,
+                "p_digest_cycle": "2026-11-08",
+                "p_limit": 50,
+            },
+        )
+    ]
 
 
 async def test_create_publication_starts_pending() -> None:

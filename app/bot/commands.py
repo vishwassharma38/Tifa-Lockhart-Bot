@@ -13,6 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from app.bot.publisher import PublicationContext, build_publication_message
 from app.config import Settings
 from app.health.status import StatusReport
 from app.jobs.digest import DEFAULT_DIGEST_ATTEMPT_LIMIT, digest_window_incomplete
@@ -183,28 +184,24 @@ class PhaseFourCommands(commands.Cog):
             if hashlib.sha256(data).hexdigest() != row["sha256"]:
                 await interaction.followup.send("The archived file failed integrity verification.")
                 return
-            source = await repo.source_for_media(row["id"])
+            list_sources = getattr(repo, "sources_for_media", None)
+            if callable(list_sources):
+                sources = await list_sources(row["id"])
+            else:
+                source = await repo.source_for_media(row["id"])
+                sources = [source] if source else []
             channel_id = interaction.channel_id or self.bot.settings.saves_channel_id or 0
             publication = await repo.create_publication(str(row["id"]), channel_id, "random")
             publication_id = str(publication["id"])
             filename = row.get("filename") or f"archive.{row.get('extension', 'bin')}"
             file = discord.File(io.BytesIO(data), filename=filename)
-            details = [
-                (source or {}).get("title")
-                or (source or {}).get("caption")
-                or row.get("title")
-                or row.get("caption")
-                or "Archived Tifa media"
-            ]
-            if source:
-                if source.get("creator_name"):
-                    creator = f"Creator: {source['creator_name']}"
-                    if source.get("creator_profile_url"):
-                        creator += f" ({source['creator_profile_url']})"
-                    details.append(creator)
-                if source.get("source_url"):
-                    details.append(f"Source: {source['source_url']}")
-            message = await interaction.followup.send("\n".join(details), file=file, wait=True)
+            context = PublicationContext.from_media_record(row, sources)
+            message = await interaction.followup.send(
+                build_publication_message(context),
+                file=file,
+                suppress_embeds=True,
+                wait=True,
+            )
             await repo.update_publication(publication_id, status="published", message_id=message.id)
         except Exception as exc:
             log.warning("Random command failed (%s)", type(exc).__name__)

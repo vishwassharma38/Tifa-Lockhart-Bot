@@ -18,6 +18,7 @@ _DIGEST_STATE_FIELDS = frozenset(
         "last_window_end",
         "last_completed_at",
         "cursor_media_created_at",
+        "digest_cycle",
     }
 )
 _DISCOVERY_STATUSES = frozenset(
@@ -329,6 +330,30 @@ class MediaRepository:
             .execute()
         )
         return rows[0] if rows else None
+
+    async def sources_for_media(self, media_item_id: str) -> list[dict[str, Any]]:
+        """Return every source association for one canonical media item."""
+        return await self._to_thread(self._sources_for_media_sync, media_item_id)
+
+    def _sources_for_media_sync(self, media_item_id: str) -> list[dict[str, Any]]:
+        size = 1000
+        offset = 0
+        results: list[dict[str, Any]] = []
+        while True:
+            page = self._rows(
+                self._client()
+                .table("media_sources")
+                .select("*")
+                .eq("media_item_id", media_item_id)
+                .order("discovered_at")
+                .order("id")
+                .range(offset, offset + size - 1)
+                .execute()
+            )
+            results.extend(page)
+            if len(page) < size:
+                return results
+            offset += len(page)
 
     async def asset_stats(self, start: str | None = None) -> dict[str, int]:
         return await self._to_thread(self._asset_stats_sync, start)
@@ -881,6 +906,50 @@ class MediaRepository:
             self._ensure_digest_publication_sync, media_item_id, channel_id
         )
 
+    async def reserve_digest_publication(
+        self,
+        media_item_id: str,
+        channel_id: int,
+        digest_cycle: str,
+        *,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Atomically reserve one global digest slot through PostgreSQL."""
+        return await self._to_thread(
+            self._reserve_digest_publication_sync,
+            media_item_id,
+            channel_id,
+            digest_cycle,
+            limit,
+        )
+
+    def _reserve_digest_publication_sync(
+        self,
+        media_item_id: str,
+        channel_id: int,
+        digest_cycle: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        response = (
+            self._client()
+            .rpc(
+                "reserve_daily_digest_publication",
+                {
+                    "p_media_item_id": media_item_id,
+                    "p_channel_id": channel_id,
+                    "p_digest_cycle": digest_cycle,
+                    "p_limit": max(0, limit),
+                },
+            )
+            .execute()
+        )
+        data = getattr(response, "data", None)
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, dict):
+            raise RepositoryError("Digest reservation returned an invalid response")
+        return data
+
     def _ensure_digest_publication_sync(
         self, media_item_id: str, channel_id: int
     ) -> dict[str, Any]:
@@ -989,6 +1058,8 @@ class MediaRepository:
 
     def _mark_publication_failed_sync(self, publication_id: str, error: str) -> dict[str, Any]:
         payload = {"status": "failed", "last_error": error[:500]}
+        if not error.startswith(("discord_delivery_ambiguous:", "discord_delivery_failed")):
+            payload["digest_slot_reserved"] = False
         response = (
             self._client().table("publications").update(payload).eq("id", publication_id).execute()
         )

@@ -45,6 +45,9 @@ def test_parses_phase_one_settings() -> None:
             "B2_BUCKET_NAME": "private-bucket",
             "B2_KEY_ID": "key-id",
             "B2_APPLICATION_KEY": "application-key",
+            "DISCORD_CATEGORY_CHANNELS_JSON": (
+                '{"image": 1, "animation": 2, "video": 3, "dumpster": 4}'
+            ),
             "REDDIT_ACCESS_APPROVED": "true",
             "BRAVE_HTML_ENABLED": "false",
             "PERCEPTUAL_HASH_ENABLED": "true",
@@ -374,10 +377,33 @@ def test_complete_service_configuration_passes() -> None:
             "B2_BUCKET_NAME": "bucket",
             "B2_KEY_ID": "key-id",
             "B2_APPLICATION_KEY": "application-key",
+            "DISCORD_CATEGORY_CHANNELS_JSON": (
+                '{"image": 1, "animation": 2, "video": 3, "dumpster": 4}'
+            ),
         },
         load_env_file=False,
     )
     settings.validate_service_configuration()
+
+
+def test_digest_requires_four_distinct_channels() -> None:
+    settings = Settings.from_env(
+        env={
+            "SUPABASE_URL": "https://example.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "service-key",
+            "B2_ENDPOINT_URL": "https://s3.us-west-004.backblazeb2.com",
+            "B2_REGION": "us-west-004",
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "application-key",
+            "DISCORD_CATEGORY_CHANNELS_JSON": (
+                '{"image": 1, "animation": 1, "video": 3, "dumpster": 4}'
+            ),
+        },
+        load_env_file=False,
+    )
+    with pytest.raises(ConfigurationError, match="four distinct channel IDs"):
+        settings.validate_service_configuration()
 
 
 def test_secret_values_and_safe_summary(make_settings) -> None:
@@ -450,7 +476,7 @@ def test_category_channel_mapping_is_parsed() -> None:
     [
         ('{"fanart": ', "valid JSON"),
         ('["fanart"]', "JSON object"),
-        ('{"portrait": 123}', "unsupported category"),
+        ('{"portrait": 123}', "unsupported media type"),
         ('{"fanart": "123"}', "integer channel IDs"),
         ('{"fanart": 12.5}', "integer channel IDs"),
         ('{"fanart": true}', "integer channel IDs"),

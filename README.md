@@ -57,10 +57,12 @@ Phase 5 adds Brave HTML discovery, safe crawling, classification, and The Dumpst
 Phase 6 adds the daily digest and restart-safe publication delivery:
 
 - A daily digest job at 04:00 `Asia/Kolkata` on the existing scheduler. It is independent of `/start` and `/stop`; pausing collection never disables digest delivery.
-- Category routing through `DISCORD_CATEGORY_CHANNELS_JSON`, with a mandatory fallback to `DISCORD_DISCOVERIES_CHANNEL_ID`. The mapping applies only to automatic digest delivery; `/save` and `/random` keep their existing destinations.
+- Strict digest routing through `DISCORD_CATEGORY_CHANNELS_JSON`, keyed by validated `media_type` (`image`, `animation`, `video`, `dumpster`). All four channel IDs are required when Supabase and B2 are configured; there is no digest fallback channel.
 - Digest selection is limited to `verification_status='verified'` and `download_status='stored'` items with a valid archived B2 reference and a recorded size within the 10,000,000-byte ceiling.
 - Each item is downloaded from private B2, checked against its stored SHA-256, and published as a real Discord file attachment with truthful title, category, creator, and source attribution.
 - Durable `publications` rows with purpose `daily_digest`, bounded three-attempt retries, deterministic publication markers, and Discord message-history reconciliation for ambiguous deliveries.
+- A persistent, database-serialized budget of 50 unique media items per 04:00 IST cycle, shared across destinations, with oldest-first backlog carry-forward and global per-item digest deduplication.
+- Compact Markdown source attribution with all distinct associated source links; automatic embeds are suppressed while real file attachments remain enabled.
 - A persisted digest window, startup catch-up after downtime, incomplete-window resume, and first-install backlog processing.
 - Expanded `/status` reporting for schedule, last success, latest outcome and error, publication backlog/retry/exhausted counts, and incomplete-window state.
 
@@ -142,6 +144,8 @@ migrations/
                           Adds persistent collection counters and state timestamp
   007_phase5_discovery_controls.sql
                           Adds queue scheduling indexes and Brave pause state
+  008_global_digest_budget.sql
+                          Adds atomic global digest reservation and cycle accounting
 scripts/
   verify_b2.py            Safe temporary upload/download/delete check
   phase2_run.py           Controlled one-submission Phase 2 run
@@ -233,7 +237,7 @@ Command registration behavior:
 1. Create a Supabase project.
 2. Set `SUPABASE_URL` to the project API URL.
 3. Set `SUPABASE_SERVICE_ROLE_KEY` to the server-side service-role key. This key bypasses Row Level Security and must never be exposed to browsers, clients, logs, or source control.
-4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If your project is already at migration 006, apply only `007_phase5_discovery_controls.sql` manually. It adds `discoveries.next_attempt_at`, queue/depth indexes, and the `runtime_state` Brave pause columns. It is additive: it does not recreate or delete existing tables or data. Phase 6 requires no new migration; it reuses the `daily_digest` publication purpose, the existing digest uniqueness index, `digest_state`, `runtime_state`, and `job_runs` created by the Phase 1 schema.
+4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If the project is already at migration 007, apply `008_global_digest_budget.sql` in the Supabase SQL Editor before deploying this version. It adds cycle and reservation columns, preserves historical publication rows, backfills one canonical digest record per media item, and creates the database-side atomic reservation function and indexes. It does not delete publication or media history.
 
 The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. Migration 006 extends the existing `job_runs` and `runtime_state` tables in place. Migration 007 extends `discoveries` and `runtime_state` in place. The migrations do not delete data or store media binaries in PostgreSQL.
 
@@ -534,25 +538,25 @@ Do not clear the pause merely to keep a scheduled job running. If the restrictio
 
 ### 13. Configure and operate the Phase 6 daily digest
 
-Phase 6 is active by default when Supabase, B2, Discord, and the scheduler are available. It requires no new migration and no new environment variable beyond the category mapping.
+Phase 6 is active by default when Supabase, B2, Discord, and the scheduler are available. Migration `008_global_digest_budget.sql` and the four-channel mapping are required.
 
 #### Schedule and collection separation
 
 - The digest runs daily at `04:00 Asia/Kolkata` on the existing `AsyncIOScheduler` job `daily_digest`, with `coalesce=True`, `max_instances=1`, and a one-hour misfire grace period.
 - It is a delivery operation, not a discovery operation. It is not tied to `collection_enabled`, so `/stop` does not disable it and `/start` does not trigger it. Manual `/save`, `/random`, `/stats`, `/about`, and `/status` remain available throughout.
-- An in-process `asyncio.Lock` prevents the scheduled run and startup catch-up from overlapping. The database uniqueness constraint on `(media_item_id, channel_id)` for `purpose='daily_digest'` remains the durable boundary.
+- An in-process `asyncio.Lock` prevents scheduled and startup runs from overlapping. PostgreSQL serializes reservations through the existing `digest_state` singleton, enforces the global 50-item cycle budget, and deduplicates digest publications by canonical media item across channels.
 
 #### Category routing
 
-`DISCORD_CATEGORY_CHANNELS_JSON` accepts a JSON object mapping a supported media category to a positive Discord channel ID:
+`DISCORD_CATEGORY_CHANNELS_JSON` accepts a JSON object mapping each validated media type to its positive Discord channel ID:
 
 ```dotenv
-DISCORD_CATEGORY_CHANNELS_JSON={"fanart":123456789012345678,"cosplay_photography":123456789012345679,"video":123456789012345680}
+DISCORD_CATEGORY_CHANNELS_JSON={"image":123456789012345678,"animation":123456789012345679,"video":123456789012345680,"dumpster":123456789012345681}
 ```
 
-Supported keys are `fanart`, `cosplay_photography`, `official_artwork`, `wallpaper`, `video`, and `other`. An empty object is valid. Malformed JSON, non-object JSON, unsupported category names, non-integer values, booleans, and zero or negative IDs fail configuration loading with an error naming the variable but not exposing secrets.
+The required keys are `image`, `animation`, `video`, and `dumpster`. Legacy category keys can still be parsed for compatibility but do not affect digest routing. Malformed JSON, non-object JSON, unsupported keys, non-integer values, booleans, and zero or negative IDs fail configuration loading. When Supabase and B2 are configured, omitting any required media-type destination fails startup.
 
-For each item, the digest reads `media_items.category`, uses a configured mapping when present, and otherwise falls back to `DISCORD_DISCOVERIES_CHANNEL_ID` (`#tifa-discoveries`). There is no inferred category and no silent drop: an eligible item with no mapped channel and no usable fallback is counted as a failure, exposed through job status and logs, and holds the digest window incomplete rather than being marked published. This mapping applies only to automatic digest delivery. `/save` continues to publish immediately to `#saves` (with its existing fallback) and `/random` continues to answer in the command channel.
+For each item, the digest routes only by `media_items.media_type`: `image` to Pictures, `animation` to GIFs, and `video` to Videos. The validator currently supports no miscellaneous binary format, so no item is routed to Dumpster; unknown types remain out of publication. There is no fallback to another channel. `/save` and `/random` retain their existing destinations.
 
 #### Candidate selection and delivery
 
@@ -564,13 +568,13 @@ For each item the digest downloads the private object through the existing stora
 
 #### Publication records, retries, and reconciliation
 
-Each item and resolved destination uses one `publications` row with `purpose='daily_digest'`, reusing any existing row rather than inserting a duplicate. Delivery attempts are counted in `attempt_count` before download/send. The default limit is three total attempts per item and destination. Published rows are skipped; pending or failed rows below the limit may be retried; exhausted rows stay failed and visible in `/status` rather than disappearing. A successful digest delivery increments the published/stored count; a failed B2 download, size check, integrity check, or Discord send records a bounded `last_error` and does not stop the remaining items.
+Each canonical media item has at most one new `publications` row with `purpose='daily_digest'`, independent of channel. The atomic reservation function assigns one persistent 04:00 IST cycle and reserves one global slot before delivery. Successful and ambiguous deliveries retain their reservation; definitive failures release it only when no message could have been delivered. Delivery attempts remain bounded at three. The digest stops selecting new items at 50 reserved unique media, leaves the window incomplete, and resumes the oldest remaining items in the next cycle.
 
 The message includes the deterministic marker `tifa-digest-publication:<publication UUID>` in its content and embed footer. If a prior attempt is ambiguous (`status='pending'` with `attempt_count > 0`), the digest first scans the destination channel's history for that marker. If found, it records the existing Discord message ID and marks the row published without resending. The scan is bounded to 500 messages; a missing marker is only treated as proof of absence when the scan did not hit that bound. If history is unavailable, the lookup fails, or the scan is inconclusive, the digest fails closed: it records a reconciliation error, leaves the publication unresolved, logs the problem, and does not blindly repost. This is why digest destination channels require **Read Message History**.
 
 #### Window completion, startup catch-up, and first install
 
-`digest_state` stores the window start, fixed window end, completion time, and media cursor. A window is incomplete while it has boundaries but no completion at or after its end. An incomplete window is resumed with its persisted cursor instead of being replaced by a newer one. The cursor is not advanced past an eligible item that lacks a durable publication row (`destination_not_configured`, publication-record creation failure, or a missing publication ID); the window is held incomplete for a later recovery run. Per-item failures that do have durable rows are accounted for and do not by themselves block window completion.
+`digest_state` stores the stable cycle date, window boundaries, completion time, and media cursor. The database reservation function locks the singleton state row before counting/reserving slots, so concurrent processes cannot overbook. The allowance is never reset by a process restart. A capped window remains incomplete and carries forward; its inclusive timestamp cursor and deterministic `(created_at, id)` ordering safely revisit ties.
 
 On startup, after the Discord client is ready, the same digest service checks whether a window is incomplete or whether the last completion predates the most recent 04:00 IST occurrence. If so, it runs one catch-up. This covers downtime longer than the scheduler's misfire grace period. A fresh installation with no digest state uses an initial window from `1970-01-01T00:00:00Z` to the current time, so the existing verified backlog is processed rather than silently ignored. Catch-up is not run merely because `/start` was invoked.
 
@@ -627,9 +631,9 @@ The implemented settings are:
 | `DISCORD_TOKEN` | Discord bot token (required to start) | empty |
 | `DISCORD_GUILD_ID` | Development guild for immediate command sync | empty |
 | `OWNER_DISCORD_ID` | Owner user ID for later owner-only commands | empty |
-| `DISCORD_DISCOVERIES_CHANNEL_ID` | `#tifa-discoveries`; digest fallback destination when the media category has no mapping | empty |
+| `DISCORD_DISCOVERIES_CHANNEL_ID` | `#tifa-discoveries` destination for discovery notices | empty |
 | `DISCORD_SAVES_CHANNEL_ID` | Manual `/save` destination (`#saves`), with existing fallback | empty |
-| `DISCORD_CATEGORY_CHANNELS_JSON` | JSON object mapping digest media categories to Discord channel IDs | `{}` |
+| `DISCORD_CATEGORY_CHANNELS_JSON` | Required JSON map for image, animation, video, and dumpster digest channels when digest services are configured | `{}` |
 | `SUPABASE_URL` | Supabase project URL | empty |
 | `SUPABASE_SERVICE_ROLE_KEY` | Server-only Supabase service-role key | empty |
 | `B2_ENDPOINT_URL` | B2 S3-compatible endpoint; must match the bucket region | empty |
@@ -665,7 +669,7 @@ The implemented settings are:
 
 `BRAVE_SEARCH_PHRASES` uses the same default phrases but is independent of the Reddit list. Both Brave gates are required in addition to enabled collection and Supabase availability. The crawler settings are enforced as hard upper bounds: configuration that exceeds them fails startup rather than silently relaxing SSRF, concurrency, depth, redirect, or size limits. Applying migration 007 is required for durable queue retry scheduling and Brave pause state. Automated crawler acquisitions are archived without immediate Discord publication; `/save` with a public URL applies the same safe fetch and publishes immediately.
 
-The Phase 6 digest needs `DISCORD_DISCOVERIES_CHANNEL_ID` as its fallback destination and optionally `DISCORD_CATEGORY_CHANNELS_JSON` for per-category channels. The bounded retry limit is three total attempts per media item and destination; Phase 6 does not add a separate environment setting for it. The digest reuses the existing schema, so no additional migration is required after 007. The digest job is always scheduled at 04:00 `Asia/Kolkata` and does not derive its schedule from `TIMEZONE`.
+The Phase 6 digest needs all four `DISCORD_CATEGORY_CHANNELS_JSON` destinations and migration 008. The bounded retry limit is three total attempts per canonical media item. The digest job remains scheduled at 04:00 `Asia/Kolkata` and does not derive its schedule from `TIMEZONE`.
 
 ## Security and responsible collection
 
@@ -702,12 +706,12 @@ The Phase 6 digest needs `DISCORD_DISCOVERIES_CHANNEL_ID` as its fallback destin
 - **`/save` returns `invalid_url:<reason>`** - the public URL failed normalization, DNS validation, or the public-address check. `blocked_destination`, `dns_error`, and `credentials_in_url` are deliberate rejections; do not try to bypass them.
 - **`/save` returns `page_extraction_failed`, `preview_only_original_unavailable`, or `original_media_not_found`** - the page did not expose a supported original media file. The discovery may be staged in The Dumpster for review rather than published.
 - **Phase 5 database errors mention missing columns** - apply `migrations/007_phase5_discovery_controls.sql`. The queue retry schedule and Brave pause state depend on it.
-- **Digest reports `destination_not_configured`** - set `DISCORD_DISCOVERIES_CHANNEL_ID` as the mandatory fallback, and check that any category-specific ID in `DISCORD_CATEGORY_CHANNELS_JSON` is a positive channel ID. The window is held incomplete rather than recording a false publication.
+- **Digest reports `destination_not_configured`** - configure the required `image`, `animation`, `video`, and `dumpster` IDs in `DISCORD_CATEGORY_CHANNELS_JSON`. The digest does not fall back to another channel.
 - **Digest reports `delivery_unreconciled` or `reconciliation_failed`** - an earlier attempt may have reached Discord, but the bot could not inspect channel history. Grant Read Message History in the digest destination, confirm the channel is still accessible, then let a later recovery run reconcile it. Do not delete the pending publication row to force a resend.
 - **Digest reports `integrity_verification_failed` or `invalid_downloaded_size`** - the B2 object does not match the recorded SHA-256 or size bound. The item is not published; inspect the archived object before retrying or repairing the record.
 - **Digest publications are exhausted** - each item and destination has three total attempts. Review the stored `last_error`; after correcting the cause, an operator may reset the specific publication row only with a deliberate, reviewed database change. Do not raise retries globally or delete history to hide repeated failures.
 - **Digest job is registered but nothing was delivered** - `/status` distinguishes schedule from outcome. Check the latest `daily_digest` job run, the persisted window, publication counts, and whether collection state is irrelevant (the digest does not depend on `/start`).
-- **`DISCORD_CATEGORY_CHANNELS_JSON must ...` on startup** - fix the JSON object, category key, or channel ID. Supported keys are `fanart`, `cosplay_photography`, `official_artwork`, `wallpaper`, `video`, and `other`; channel IDs must be positive integers.
+- **`DISCORD_CATEGORY_CHANNELS_JSON must ...` on startup** - fix the JSON object or channel IDs. Digest keys are `image`, `animation`, `video`, and `dumpster`; each ID must be a positive integer.
 - **Port already in use** - change `PORT` or stop the other process. The health endpoint binds to `0.0.0.0`.
 
 ## Development roadmap

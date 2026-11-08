@@ -7,6 +7,7 @@ import pytest
 
 from app.bot.publisher import (
     DiscordPublicationError,
+    DiscordPublicationRejectedError,
     DiscordPublisher,
     MarkerLookup,
     PublicationContext,
@@ -71,9 +72,9 @@ def test_message_includes_title_creator_and_clickable_source() -> None:
 
     assert "Tifa at the bar" in message
     assert "Original artwork" in message
-    assert "Creator: artist_name (https://www.reddit.com/user/artist_name)" in message
-    assert "Source: https://www.reddit.com/r/Tifa/comments/abc123/a_post" in message
-    assert "Reddit post ID: abc123" in message
+    assert "Creator: [artist\\_name](https://www.reddit.com/user/artist_name)" in message
+    assert "[Original source](https://www.reddit.com/r/Tifa/comments/abc123/a_post)" in message
+    assert "Source ID: abc123" in message
 
 
 def test_message_does_not_invent_missing_creator() -> None:
@@ -98,6 +99,7 @@ async def test_publisher_sends_an_actual_file_attachment() -> None:
     call = channel.calls[0]
     assert isinstance(call["file"], discord.File)
     assert call["file"].filename == "reddit-abc123.png"
+    assert call["suppress_embeds"] is True
     assert "Tifa at the bar" in str(call["content"])
     assert "https://www.reddit.com/r/Tifa/comments/abc123/a_post" in str(call["content"])
 
@@ -177,8 +179,8 @@ def test_neutral_context_message_includes_category_marker_and_web_source() -> No
 
     assert "Tifa at the bar" in message
     assert "Category: fanart" in message
-    assert "Creator: artist (https://example.com/artist)" in message
-    assert "Source: https://example.com/post" in message
+    assert "Creator: [artist](https://example.com/artist)" in message
+    assert "[Original source](https://example.com/post)" in message
     assert "Source platform: web" in message
     assert "Reddit post ID" not in message
     assert "Source ID:" not in message
@@ -217,6 +219,55 @@ def test_creator_without_profile_is_reported_as_incomplete() -> None:
     )
 
     assert "Creator: artist (profile not provided by source)" in message
+
+
+def test_all_distinct_source_associations_are_clickable_once() -> None:
+    context = PublicationContext.from_media_record(
+        {"title": "Tifa", "media_type": "animation"},
+        [
+            {
+                "source_url": "https://example.com/post",
+                "creator_name": "Artist One",
+                "creator_profile_url": "https://example.com/artist-one",
+            },
+            {
+                "source_url": "https://example.com/post",
+                "creator_name": "Artist Two",
+                "creator_profile_url": "https://example.com/artist-two",
+            },
+            {"source_url": "https://other.example/post"},
+        ],
+    )
+
+    message = build_publication_message(context)
+
+    assert "TIFA ARCHIVE · ANIMATION" in message
+    assert "Artist One" in message and "Artist Two" in message
+    assert message.count("https://example.com/post") == 1
+    assert "https://other.example/post" in message
+    assert "[Original source](https://example.com/post)" in message
+
+
+def test_malformed_and_dangerous_urls_are_omitted() -> None:
+    context = PublicationContext(
+        title="Tifa",
+        source_url="javascript:alert(1)",
+        creator_name="Artist",
+        creator_profile_url="https://example.com:invalid/profile",
+    )
+
+    message = build_publication_message(context)
+
+    assert "javascript:" not in message
+    assert "example.com:invalid" not in message
+    assert "Creator: Artist (profile not provided by source)" in message
+
+
+def test_oversized_attribution_fails_before_discord_send() -> None:
+    sources = [{"source_url": f"https://example.com/{index}/" + "x" * 100} for index in range(30)]
+    context = PublicationContext.from_media_record({"media_type": "image"}, sources)
+    with pytest.raises(DiscordPublicationRejectedError, match="message length"):
+        build_publication_message(context)
 
 
 async def test_publisher_uses_per_call_channel_override() -> None:
