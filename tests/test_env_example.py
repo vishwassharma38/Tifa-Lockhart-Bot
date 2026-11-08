@@ -24,6 +24,7 @@ REQUIRED_KEYS = {
     "B2_KEY_ID",
     "B2_APPLICATION_KEY",
     "REDDIT_ACCESS_APPROVED",
+    "REDDIT_SEED_DISCOVERY_ENABLED",
     "BRAVE_HTML_ENABLED",
     "BRAVE_HTML_ACCESS_APPROVED",
     "BRAVE_SEARCH_BASE_URL",
@@ -77,6 +78,7 @@ def test_template_contains_only_placeholders_and_safe_defaults() -> None:
     assert values["B2_KEY_ID"] == ""
     assert values["B2_APPLICATION_KEY"] == ""
     assert values["REDDIT_ACCESS_APPROVED"] == "false"
+    assert values["REDDIT_SEED_DISCOVERY_ENABLED"] == "true"
     assert values["BRAVE_HTML_ENABLED"] == "false"
     assert values["BRAVE_HTML_ACCESS_APPROVED"] == "false"
     assert values["BRAVE_SEARCH_INTERVAL_HOURS"] == "8"

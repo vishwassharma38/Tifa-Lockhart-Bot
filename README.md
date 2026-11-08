@@ -435,14 +435,16 @@ When `REDDIT_SEED_DISCOVERY_ENABLED=true` (the default), each collected submissi
 
 #### Persistent queue and discovery path
 
-Brave results, Reddit external links, crawler-discovered child links, and manual public-URL saves share the existing `discoveries` table. There is no second queue or scheduler. A queue row moves through statuses such as `queued`, `processing`, `verified`, `dumpster`, `rejected`, `blocked`, `failed`, and `oversize`.
+Brave search results and external links from Reddit submission destinations or self-text independently supply initial discovery URLs. Both sources insert root records into the existing Supabase `discoveries` infrastructure; the existing crawler processes eligible records, discovers child links recursively, and sends eligible pages through the existing media classification and archive pipeline. Manual public-URL saves use this same infrastructure. There is no second queue, crawler, or scheduler.
+
+A queue row moves through statuses such as `queued`, `processing`, `verified`, `dumpster`, `rejected`, `blocked`, `failed`, and `oversize`.
 
 - `next_attempt_at` provides durable retry scheduling. HTTP `429` honors `Retry-After` when present and otherwise schedules a later attempt; interrupted or paused work is returned to `queued`.
 - Each crawl pass claims at most `CRAWL_BATCH_SIZE` (default `25`) due rows and atomically moves them to `processing`. A single in-process lock prevents overlapping crawl runs.
 - On startup, job rows left in `running` are marked interrupted and `processing` discoveries are returned to `queued`, so a restart does not strand work.
 - `discovery_edges` records parent/child relationships, the discovered-from URL, and depth. Descendants keep the originating `source_type`; crawler-link evidence is retained in metadata and the edge record.
 - Only `verified` and `dumpster` pages propagate child links. `rejected`, `blocked`, `failed`, and `oversize` pages do not.
-- A crawl job admits at most `MAX_URLS_PER_JOB` URLs, including child admissions, and does not process rows deeper than `MAX_CRAWL_DEPTH`.
+- Each crawler job applies `MAX_URLS_PER_JOB` to child-link admissions and does not process rows deeper than `MAX_CRAWL_DEPTH`.
 
 Verified pages with original media are archived through the existing Phase 2 media pipeline with publication disabled. They become normal archived assets but are not posted to Discord automatically. A verified page that exposes only previews, or no original media, is moved to The Dumpster with a review reason. Direct media links discovered as children are skipped by the crawler; acquisition uses the media pipeline and its safe media fetcher.
 
@@ -452,7 +454,7 @@ The defaults are hard maximums enforced by configuration validation; malformed v
 
 | Limit | Default and maximum | Setting |
 |---|---|---|
-| URLs admitted per job | `300` | `MAX_URLS_PER_JOB` |
+| URL admission budget per applicable run or job | `300` | `MAX_URLS_PER_JOB` |
 | Pages per domain per job | `20` | `MAX_PAGES_PER_DOMAIN` |
 | Globally concurrent requests | `5` | `MAX_CONCURRENT_REQUESTS` |
 | Minimum delay per domain | `2` seconds (configurable up to `60`) | `PER_DOMAIN_DELAY_SECONDS` |
@@ -463,6 +465,8 @@ The defaults are hard maximums enforced by configuration validation; malformed v
 | Read timeout | `20` seconds | `CRAWL_READ_TIMEOUT_SECONDS` |
 | Transient attempts | `3` | `CRAWL_MAX_ATTEMPTS` |
 | Rows claimed per pass | `25` | `CRAWL_BATCH_SIZE` |
+
+`MAX_URLS_PER_JOB` is an independent admission budget for each applicable run or job, not a single global limit. Brave discovery has its own budget, Reddit collection has its own budget for newly created seed records, and each crawler job has its own budget for child-link admissions. For example, a value of `300` does not cap all Brave, Reddit, and crawler admissions combined at 300.
 
 The concurrency limit is global to the crawler instance, not per domain. No two requests to the same domain begin less than the configured delay apart, and a parsed `robots.txt` `Crawl-delay` can increase that spacing. Waits are coordinated through shared throttling rather than scattered fixed sleeps.
 
