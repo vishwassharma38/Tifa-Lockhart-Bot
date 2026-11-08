@@ -146,6 +146,8 @@ migrations/
                           Adds queue scheduling indexes and Brave pause state
   008_global_digest_budget.sql
                           Adds atomic global digest reservation and cycle accounting
+  009_digest_claims_retry_fairness.sql
+                          Adds fenced digest leases, retry scheduling, and safe rollover
 scripts/
   verify_b2.py            Safe temporary upload/download/delete check
   phase2_run.py           Controlled one-submission Phase 2 run
@@ -237,7 +239,7 @@ Command registration behavior:
 1. Create a Supabase project.
 2. Set `SUPABASE_URL` to the project API URL.
 3. Set `SUPABASE_SERVICE_ROLE_KEY` to the server-side service-role key. This key bypasses Row Level Security and must never be exposed to browsers, clients, logs, or source control.
-4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If the project is already at migration 007, apply `008_global_digest_budget.sql` in the Supabase SQL Editor before deploying this version. It adds cycle and reservation columns, preserves historical publication rows, backfills one canonical digest record per media item, and creates the database-side atomic reservation function and indexes. It does not delete publication or media history.
+4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If the project is already at migration 007, apply `008_global_digest_budget.sql` followed by `009_digest_claims_retry_fairness.sql` before deploying this version. Migration 008 adds cycle and reservation columns, preserves historical publication rows, backfills one canonical digest record per media item, and creates the database-side atomic reservation function and indexes. Migration 009 adds expiring, token-fenced delivery claims, persisted retry scheduling, and quota-safe rollover for never-attempted reservations. Both migrations preserve publication and media history.
 
 The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. Migration 006 extends the existing `job_runs` and `runtime_state` tables in place. Migration 007 extends `discoveries` and `runtime_state` in place. The migrations do not delete data or store media binaries in PostgreSQL.
 

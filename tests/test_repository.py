@@ -41,6 +41,7 @@ class FakeQuery:
         self.filters: list[tuple[str, object]] = []
         self.limit_value: int | None = None
         self.or_expression: str | None = None
+        self.or_expressions: list[str] = []
         self.order_value: tuple[str, bool] | None = None
         self.orders: list[tuple[str, bool]] = []
         self.range_value: tuple[int, int] | None = None
@@ -71,9 +72,12 @@ class FakeQuery:
 
     def or_(self, expression: str) -> FakeQuery:
         self.or_expression = expression
+        self.or_expressions.append(expression)
         return self
 
-    def order(self, column: str, *, desc: bool = False) -> FakeQuery:
+    def order(
+        self, column: str, *, desc: bool = False, nullsfirst: bool | None = None
+    ) -> FakeQuery:
         self.orders.append((column, desc))
         self.order_value = (column, desc)
         return self
@@ -792,37 +796,68 @@ async def test_ensure_digest_publication_reraises_non_conflict_errors() -> None:
         await repository.ensure_digest_publication("media-1", 222)
 
 
-async def test_record_publication_attempt_uses_conditional_increment() -> None:
+async def test_record_publication_attempt_requires_and_uses_claim_token() -> None:
     client = FakeClient()
-    publications = client.table("publications")
-    publications.results["update"] = [
-        {"id": "publication-1", "status": "pending", "attempt_count": 2}
-    ]
+    client.rpc_data = {
+        "id": "publication-1",
+        "status": "pending",
+        "attempt_count": 2,
+        "attempt_advanced": True,
+    }
     repository = make_repository(client)
 
-    row = await repository.record_publication_attempt("publication-1", expected_attempt_count=1)
+    row = await repository.record_publication_attempt(
+        "publication-1", expected_attempt_count=1, claim_token="claim-token"
+    )
 
     assert row["attempt_count"] == 2
-    update_payload = next(
-        payload for operation, payload, _conflict in publications.calls if operation == "update"
-    )
-    assert update_payload == {"status": "pending", "attempt_count": 2, "last_error": None}
-    update_query = publications.queries[0]
-    assert update_query.filters == [("id", "publication-1"), ("attempt_count", 1)]
+    assert client.rpc_calls == [
+        (
+            "advance_daily_digest_attempt",
+            {
+                "p_publication_id": "publication-1",
+                "p_claim_token": "claim-token",
+                "p_expected_attempt_count": 1,
+                "p_attempt_limit": 3,
+                "p_lease_seconds": 900,
+            },
+        )
+    ]
 
 
-async def test_record_publication_attempt_returns_current_row_when_update_loses_race() -> None:
-    current = {"id": "publication-1", "status": "pending", "attempt_count": 2}
+async def test_record_publication_attempt_returns_no_claim_when_update_loses_race() -> None:
     client = FakeClient()
-    publications = client.table("publications")
-    publications.results["update"] = []
-    publications.results["select"] = [current]
+    client.rpc_data = {"attempt_advanced": False}
     repository = make_repository(client)
 
-    row = await repository.record_publication_attempt("publication-1", expected_attempt_count=1)
+    row = await repository.record_publication_attempt(
+        "publication-1", expected_attempt_count=1, claim_token="stale-token"
+    )
 
-    assert row == current
-    assert publications.queries[1].filters == [("id", "publication-1")]
+    assert row is None
+    assert client.rpc_calls[0][0] == "advance_daily_digest_attempt"
+
+
+async def test_digest_claim_rpc_preserves_explicit_loser_result() -> None:
+    client = FakeClient()
+    client.rpc_data = {"claim_acquired": False}
+    repository = make_repository(client)
+
+    result = await repository.claim_digest_publication(
+        "publication-1", "claim-token", lease_seconds=600
+    )
+
+    assert result == {"claim_acquired": False}
+    assert client.rpc_calls == [
+        (
+            "claim_daily_digest_publication",
+            {
+                "p_publication_id": "publication-1",
+                "p_claim_token": "claim-token",
+                "p_lease_seconds": 600,
+            },
+        )
+    ]
 
 
 async def test_list_retryable_digest_publications_filters_unresolved_rows() -> None:
@@ -840,7 +875,13 @@ async def test_list_retryable_digest_publications_filters_unresolved_rows() -> N
         ("in.status", ["pending", "failed"]),
         ("lt.attempt_count", 3),
     ]
-    assert query.order_value == ("created_at", False)
+    assert query.or_expression is not None
+    assert query.or_expression.startswith("next_attempt_at.is.null,next_attempt_at.lte.")
+    assert query.orders == [
+        ("next_attempt_at", False),
+        ("created_at", False),
+        ("id", False),
+    ]
     assert query.limit_value == 25
 
 
@@ -862,17 +903,23 @@ async def test_list_exhausted_ambiguous_publications_reads_every_page() -> None:
     assert len(rows) == 207
     assert [query.range_value for query in publications.queries] == [
         (0, 99),
-        (100, 199),
-        (200, 299),
+        (0, 99),
+        (0, 99),
     ]
     assert all(
         query.orders == [("created_at", False), ("id", False)] for query in publications.queries
     )
-    assert all(
-        query.or_expression == "status.eq.pending,last_error.like.discord_delivery_ambiguous:*,"
+    assert publications.queries[0].or_expressions[0] == (
+        "status.eq.pending,last_error.like.discord_delivery_ambiguous:*,"
         "last_error.like.discord_delivery_failed*"
+    )
+    assert all(
+        len(query.or_expressions) >= 2
+        and query.or_expressions[1].startswith("next_attempt_at.is.null,next_attempt_at.lte.")
         for query in publications.queries
     )
+    assert all(len(query.or_expressions) == 3 for query in publications.queries[1:])
+    assert publications.queries[1].or_expressions[2].startswith("created_at.gt.")
 
 
 async def test_record_reconciliation_diagnostic_preserves_ambiguous_error() -> None:

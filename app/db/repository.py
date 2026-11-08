@@ -984,44 +984,135 @@ class MediaRepository:
         publication_id: str,
         *,
         expected_attempt_count: int,
-    ) -> dict[str, Any]:
-        """Advance the real delivery attempt count before any send is attempted."""
-        return await self._to_thread(
-            self._record_publication_attempt_sync,
+        claim_token: str,
+        attempt_limit: int = 3,
+    ) -> dict[str, Any] | None:
+        """Advance attempts only through a live, fenced delivery claim."""
+        result = await self.advance_digest_attempt(
             publication_id,
-            expected_attempt_count,
+            claim_token,
+            expected_attempt_count=expected_attempt_count,
+            attempt_limit=attempt_limit,
+        )
+        return result if result.get("attempt_advanced") else None
+
+    async def claim_digest_publication(
+        self, publication_id: str, claim_token: str, *, lease_seconds: int = 900
+    ) -> dict[str, Any]:
+        return await self._digest_claim_rpc(
+            "claim_daily_digest_publication",
+            {
+                "p_publication_id": publication_id,
+                "p_claim_token": claim_token,
+                "p_lease_seconds": lease_seconds,
+            },
         )
 
-    def _record_publication_attempt_sync(
-        self, publication_id: str, expected_attempt_count: int
+    async def renew_digest_claim(
+        self, publication_id: str, claim_token: str, *, lease_seconds: int = 900
+    ) -> bool:
+        return bool(
+            await self._digest_claim_rpc(
+                "renew_daily_digest_claim",
+                {
+                    "p_publication_id": publication_id,
+                    "p_claim_token": claim_token,
+                    "p_lease_seconds": lease_seconds,
+                },
+            )
+        )
+
+    async def advance_digest_attempt(
+        self,
+        publication_id: str,
+        claim_token: str,
+        *,
+        expected_attempt_count: int,
+        attempt_limit: int,
+        lease_seconds: int = 900,
     ) -> dict[str, Any]:
-        payload = {
-            "status": "pending",
-            "attempt_count": max(0, expected_attempt_count) + 1,
-            "last_error": None,
-        }
-        response = (
-            self._client()
-            .table("publications")
-            .update(payload)
-            .eq("id", publication_id)
-            .eq("attempt_count", max(0, expected_attempt_count))
-            .execute()
+        return await self._digest_claim_rpc(
+            "advance_daily_digest_attempt",
+            {
+                "p_publication_id": publication_id,
+                "p_claim_token": claim_token,
+                "p_expected_attempt_count": expected_attempt_count,
+                "p_attempt_limit": attempt_limit,
+                "p_lease_seconds": lease_seconds,
+            },
         )
-        rows = self._rows(response)
-        if rows:
-            return rows[0]
-        current = self._rows(
-            self._client()
-            .table("publications")
-            .select("*")
-            .eq("id", publication_id)
-            .limit(1)
-            .execute()
+
+    async def finish_digest_failure(
+        self, publication_id: str, claim_token: str, error: str
+    ) -> bool:
+        return bool(
+            await self._digest_claim_rpc(
+                "finish_daily_digest_failure",
+                {
+                    "p_publication_id": publication_id,
+                    "p_claim_token": claim_token,
+                    "p_error": error,
+                },
+            )
         )
-        if current:
-            return current[0]
-        raise RepositoryError("Publication attempt could not be recorded")
+
+    async def finish_digest_reconciliation(
+        self, publication_id: str, claim_token: str, error: str
+    ) -> bool:
+        return bool(
+            await self._digest_claim_rpc(
+                "finish_daily_digest_reconciliation",
+                {
+                    "p_publication_id": publication_id,
+                    "p_claim_token": claim_token,
+                    "p_error": error,
+                },
+            )
+        )
+
+    async def publish_digest_claimed(
+        self, publication_id: str, claim_token: str, message_id: int
+    ) -> bool:
+        return bool(
+            await self._digest_claim_rpc(
+                "publish_daily_digest_publication",
+                {
+                    "p_publication_id": publication_id,
+                    "p_claim_token": claim_token,
+                    "p_message_id": message_id,
+                },
+            )
+        )
+
+    async def rollover_reconciled_digest_publication(
+        self,
+        publication_id: str,
+        claim_token: str,
+        digest_cycle: str,
+        *,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        return await self._digest_claim_rpc(
+            "rollover_reconciled_digest_publication",
+            {
+                "p_publication_id": publication_id,
+                "p_claim_token": claim_token,
+                "p_digest_cycle": digest_cycle,
+                "p_limit": limit,
+            },
+        )
+
+    async def _digest_claim_rpc(self, function: str, params: dict[str, Any]) -> Any:
+        return await self._to_thread(self._digest_claim_rpc_sync, function, params)
+
+    def _digest_claim_rpc_sync(self, function: str, params: dict[str, Any]) -> Any:
+        response = self._client().rpc(function, params).execute()
+        data = getattr(response, "data", None)
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if data is None:
+            raise RepositoryError(f"{function} returned an empty response")
+        return data
 
     async def mark_publication_published(
         self,
@@ -1101,16 +1192,18 @@ class MediaRepository:
         *,
         attempt_limit: int,
         limit: int = 100,
+        now: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return retryable rows and exhausted rows that still need reconciliation."""
         return await self._to_thread(
             self._list_retryable_digest_publications_sync,
             attempt_limit,
             limit,
+            now or datetime.now(tz=UTC).isoformat(),
         )
 
     def _list_retryable_digest_publications_sync(
-        self, attempt_limit: int, limit: int
+        self, attempt_limit: int, limit: int, now: str
     ) -> list[dict[str, Any]]:
         return self._rows(
             self._client()
@@ -1119,7 +1212,10 @@ class MediaRepository:
             .eq("purpose", "daily_digest")
             .in_("status", ["pending", "failed"])
             .lt("attempt_count", max(1, attempt_limit))
+            .or_(f"next_attempt_at.is.null,next_attempt_at.lte.{now}")
+            .order("next_attempt_at", nullsfirst=True)
             .order("created_at")
+            .order("id")
             .limit(max(1, limit))
             .execute()
         )
@@ -1129,22 +1225,25 @@ class MediaRepository:
         *,
         attempt_limit: int,
         page_size: int = 100,
+        now: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return every exhausted ambiguous row, reading the backlog in stable pages."""
         return await self._to_thread(
             self._list_exhausted_ambiguous_digest_publications_sync,
             attempt_limit,
             page_size,
+            now or datetime.now(tz=UTC).isoformat(),
         )
 
     def _list_exhausted_ambiguous_digest_publications_sync(
-        self, attempt_limit: int, page_size: int
+        self, attempt_limit: int, page_size: int, now: str
     ) -> list[dict[str, Any]]:
         size = max(1, page_size)
-        offset = 0
         results: list[dict[str, Any]] = []
+        cursor_created_at: str | None = None
+        cursor_id: str | None = None
         while True:
-            page = self._rows(
+            query = (
                 self._client()
                 .table("publications")
                 .select("*")
@@ -1160,15 +1259,21 @@ class MediaRepository:
                         )
                     )
                 )
+                .or_(f"next_attempt_at.is.null,next_attempt_at.lte.{now}")
                 .order("created_at")
                 .order("id")
-                .range(offset, offset + size - 1)
-                .execute()
             )
+            if cursor_created_at is not None and cursor_id is not None:
+                query = query.or_(
+                    f"created_at.gt.{cursor_created_at},"
+                    f"and(created_at.eq.{cursor_created_at},id.gt.{cursor_id})"
+                )
+            page = self._rows(query.range(0, size - 1).execute())
             results.extend(page)
             if len(page) < size:
                 return results
-            offset += len(page)
+            cursor_created_at = str(page[-1].get("created_at") or "")
+            cursor_id = str(page[-1].get("id") or "")
 
     async def get_media_item(self, media_item_id: str) -> dict[str, Any] | None:
         return await self._to_thread(self._get_media_item_sync, media_item_id)

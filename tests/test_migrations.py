@@ -84,6 +84,28 @@ def test_global_digest_reservation_migration_is_additive_and_atomic() -> None:
     assert "delete from" not in sql
 
 
+def test_digest_claims_retry_fairness_and_rollover_migration_is_fenced() -> None:
+    sql = read_migration("009_digest_claims_retry_fairness.sql").lower()
+    for column in (
+        "delivery_claim_token",
+        "delivery_claim_expires_at",
+        "next_attempt_at",
+        "retry_schedule_count",
+    ):
+        assert f"add column if not exists {column}" in sql
+    assert "claim_daily_digest_publication" in sql
+    assert "renew_daily_digest_claim" in sql
+    assert "advance_daily_digest_attempt" in sql
+    assert "delivery_claim_token = p_claim_token" in sql
+    assert "delivery_claim_expires_at > v_now" in sql
+    assert "attempt_count = greatest(0, p_expected_attempt_count)" in sql
+    assert "rollover_reconciled_digest_publication" in sql
+    assert "attempt_count > 0" in sql
+    assert "grant execute" in sql and "to service_role" in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+
+
 def test_runtime_and_digest_singletons_are_seeded() -> None:
     _files, sql = read_migrations()
 
