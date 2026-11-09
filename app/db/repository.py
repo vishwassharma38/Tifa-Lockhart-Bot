@@ -19,7 +19,6 @@ log = logging.getLogger(__name__)
 
 # Keep simultaneous PostgREST work bounded across overlapping scheduled jobs.
 # The bot currently has at most a handful of jobs sharing one SDK client.
-_MAX_CONCURRENT_DB_REQUESTS = 4
 _MAX_DB_ATTEMPTS = 3
 _RETRY_BASE_DELAY_SECONDS = 0.5
 _TRANSIENT_DB_EXCEPTIONS = (
@@ -91,14 +90,11 @@ class MediaRepository:
         database: SupabaseDatabase,
         *,
         to_thread: Callable[..., Awaitable[Any]] = asyncio.to_thread,
-        max_concurrent_requests: int = _MAX_CONCURRENT_DB_REQUESTS,
         retry_sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         jitter: Callable[[float, float], float] = random.uniform,
     ) -> None:
         self._database = database
         self._to_thread = to_thread
-        self._db_semaphore = asyncio.Semaphore(max(1, max_concurrent_requests))
-        self._inflight_tasks: set[asyncio.Task[Any]] = set()
         self._retry_sleep = retry_sleep
         self._jitter = jitter
 
@@ -113,26 +109,7 @@ class MediaRepository:
         attempts = _MAX_DB_ATTEMPTS if retry else 1
         for attempt in range(1, attempts + 1):
             try:
-                await self._db_semaphore.acquire()
-                operation_task = asyncio.create_task(self._dispatch(function, *args))
-                self._inflight_tasks.add(operation_task)
-                operation_task.add_done_callback(self._inflight_tasks.discard)
-                # Shield the worker from caller cancellation. asyncio.to_thread
-                # cannot stop its thread, so the permit must remain held until
-                # the synchronous request actually finishes.
-                try:
-                    result = await asyncio.shield(operation_task)
-                except asyncio.CancelledError:
-                    # Keep shutdown from closing the shared HTTPX client while
-                    # its synchronous request is still running in a thread.
-                    while not operation_task.done():
-                        try:
-                            await asyncio.shield(operation_task)
-                        except asyncio.CancelledError:
-                            continue
-                        except Exception:
-                            break
-                    raise
+                result = await self._database.run_sync(function, *args, to_thread=self._to_thread)
             except _TRANSIENT_DB_EXCEPTIONS as exc:
                 if attempt >= attempts:
                     log.error(
@@ -166,12 +143,6 @@ class MediaRepository:
                     )
                 return result
         raise AssertionError("unreachable")  # pragma: no cover
-
-    async def _dispatch(self, function: Callable[..., Any], *args: Any) -> Any:
-        try:
-            return await self._to_thread(function, *args)
-        finally:
-            self._db_semaphore.release()
 
     @property
     def configured(self) -> bool:

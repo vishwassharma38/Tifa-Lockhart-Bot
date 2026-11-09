@@ -357,7 +357,10 @@ async def test_concurrency_limit_bounds_operations_and_recovers_after_failure() 
             raise ValueError("controlled failure")
         return "ok"
 
-    repository = MediaRepository(make_database(FakeClient()), max_concurrent_requests=2)
+    database = SupabaseDatabase(
+        "https://example.supabase.co", "service-role-key", max_concurrent_requests=2
+    )
+    repository = MediaRepository(database)
     tasks = [asyncio.create_task(repository._run(operation)) for _ in range(3)]
     assert await asyncio.wait_for(asyncio.to_thread(both_started.wait, 2), timeout=3)
     assert maximum == 2
@@ -384,7 +387,10 @@ async def test_cancelled_caller_keeps_permit_until_thread_finishes() -> None:
         second_entered.set()
         return "second"
 
-    repository = MediaRepository(make_database(FakeClient()), max_concurrent_requests=1)
+    database = SupabaseDatabase(
+        "https://example.supabase.co", "service-role-key", max_concurrent_requests=1
+    )
+    repository = MediaRepository(database)
     first = asyncio.create_task(repository._run(slow))
     assert await asyncio.to_thread(entered.wait, 2)
     first.cancel()

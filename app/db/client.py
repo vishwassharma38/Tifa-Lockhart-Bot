@@ -18,6 +18,8 @@ from app.health.status import DependencyStatus
 log = logging.getLogger(__name__)
 
 SUPABASE_HTTP_TIMEOUT_SECONDS = 30.0
+# One process-wide gate covers repository calls and dependency health checks.
+MAX_CONCURRENT_DB_REQUESTS = 4
 
 
 def create_supabase_http_client() -> httpx.Client:
@@ -49,6 +51,7 @@ class SupabaseDatabase:
         client_factory: Callable[..., Any] = create_client,
         http_client_factory: Callable[[], Any] | None = None,
         to_thread: Callable[..., Awaitable[Any]] = asyncio.to_thread,
+        max_concurrent_requests: int = MAX_CONCURRENT_DB_REQUESTS,
         verify_timeout: float = 5.0,
     ) -> None:
         self._url = url
@@ -56,6 +59,10 @@ class SupabaseDatabase:
         self._client_factory = client_factory
         self._http_client_factory = http_client_factory or create_supabase_http_client
         self._to_thread = to_thread
+        self._db_semaphore = asyncio.Semaphore(
+            max(1, min(max_concurrent_requests, MAX_CONCURRENT_DB_REQUESTS))
+        )
+        self._inflight_tasks: set[asyncio.Task[Any]] = set()
         self._verify_timeout = verify_timeout
         self._client: Any | None = None
         self._http_client: Any | None = None
@@ -91,13 +98,64 @@ class SupabaseDatabase:
                 client = self._client_factory(self._url, self._service_role_key, options)
             except Exception as exc:
                 self._close_http_client(http_client)
-                raise DatabaseInitializationError(
-                    "Supabase client initialization failed"
-                ) from exc
+                raise DatabaseInitializationError("Supabase client initialization failed") from exc
 
             self._http_client = http_client
             self._client = client
         return True
+
+    async def run_sync(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        to_thread: Callable[..., Awaitable[Any]] | None = None,
+        wait_on_cancel: bool = True,
+    ) -> Any:
+        """Run one synchronous database operation under the shared limit.
+
+        The permit belongs to the worker task, not its caller. In particular,
+        a timed-out health check can return while its thread continues, without
+        allowing another request to exceed the global concurrency limit.
+        """
+        await self._db_semaphore.acquire()
+        worker = to_thread or self._to_thread
+        try:
+            operation_task = asyncio.create_task(self._dispatch_sync(worker, function, args))
+        except BaseException:
+            self._db_semaphore.release()
+            raise
+
+        self._inflight_tasks.add(operation_task)
+        operation_task.add_done_callback(self._operation_done)
+        try:
+            return await asyncio.shield(operation_task)
+        except asyncio.CancelledError:
+            if wait_on_cancel:
+                while not operation_task.done():
+                    try:
+                        await asyncio.shield(operation_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+            raise
+
+    async def _dispatch_sync(
+        self,
+        to_thread: Callable[..., Awaitable[Any]],
+        function: Callable[..., Any],
+        args: tuple[Any, ...],
+    ) -> Any:
+        try:
+            return await to_thread(function, *args)
+        finally:
+            self._db_semaphore.release()
+
+    def _operation_done(self, task: asyncio.Task[Any]) -> None:
+        self._inflight_tasks.discard(task)
+        if not task.cancelled():
+            # Retrieve detached health-check failures after their caller timed out.
+            task.exception()
 
     async def verify(self, timeout: float | None = None) -> DependencyStatus:
         """Run a lightweight query and report a truthful dependency state."""
@@ -111,7 +169,7 @@ class SupabaseDatabase:
 
         try:
             await asyncio.wait_for(
-                self._to_thread(self._query_runtime_state),
+                self.run_sync(self._query_runtime_state, wait_on_cancel=False),
                 timeout=timeout if timeout is not None else self._verify_timeout,
             )
         except TimeoutError:
@@ -130,6 +188,8 @@ class SupabaseDatabase:
 
     async def close(self) -> None:
         """Close the SDK transport when supported and release the client."""
+        while self._inflight_tasks:
+            await asyncio.gather(*tuple(self._inflight_tasks), return_exceptions=True)
         with self._init_lock:
             client = self._client
             http_client = self._http_client
