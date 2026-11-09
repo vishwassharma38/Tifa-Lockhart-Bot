@@ -5,15 +5,33 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from supabase import create_client
+import httpx
+from supabase import ClientOptions, create_client
 
 from app.config import Settings
 from app.health.status import DependencyStatus
 
 log = logging.getLogger(__name__)
+
+SUPABASE_HTTP_TIMEOUT_SECONDS = 30.0
+
+
+def create_supabase_http_client() -> httpx.Client:
+    """Build the shared HTTP/1.1 client used by the Supabase SDK transport.
+
+    PostgREST creates its own HTTPX client with HTTP/2 enabled when no client
+    is supplied. Reusing one explicit HTTP/1.1 client avoids that implicit
+    transport and keeps a single connection pool for repository operations.
+    """
+    return httpx.Client(
+        http2=False,
+        timeout=SUPABASE_HTTP_TIMEOUT_SECONDS,
+        follow_redirects=True,
+    )
 
 
 class DatabaseInitializationError(RuntimeError):
@@ -29,15 +47,19 @@ class SupabaseDatabase:
         service_role_key: str,
         *,
         client_factory: Callable[..., Any] = create_client,
+        http_client_factory: Callable[[], Any] | None = None,
         to_thread: Callable[..., Awaitable[Any]] = asyncio.to_thread,
         verify_timeout: float = 5.0,
     ) -> None:
         self._url = url
         self._service_role_key = service_role_key
         self._client_factory = client_factory
+        self._http_client_factory = http_client_factory or create_supabase_http_client
         self._to_thread = to_thread
         self._verify_timeout = verify_timeout
         self._client: Any | None = None
+        self._http_client: Any | None = None
+        self._init_lock = threading.Lock()
 
     @classmethod
     def from_settings(cls, settings: Settings) -> SupabaseDatabase:
@@ -58,12 +80,23 @@ class SupabaseDatabase:
         """Create the client if configured. Returns whether a client exists."""
         if not self.configured:
             return False
-        if self._client is not None:
-            return True
-        try:
-            self._client = self._client_factory(self._url, self._service_role_key)
-        except Exception as exc:
-            raise DatabaseInitializationError("Supabase client initialization failed") from exc
+        with self._init_lock:
+            if self._client is not None:
+                return True
+
+            http_client: Any | None = None
+            try:
+                http_client = self._http_client_factory()
+                options = ClientOptions(httpx_client=http_client)
+                client = self._client_factory(self._url, self._service_role_key, options)
+            except Exception as exc:
+                self._close_http_client(http_client)
+                raise DatabaseInitializationError(
+                    "Supabase client initialization failed"
+                ) from exc
+
+            self._http_client = http_client
+            self._client = client
         return True
 
     async def verify(self, timeout: float | None = None) -> DependencyStatus:
@@ -97,19 +130,40 @@ class SupabaseDatabase:
 
     async def close(self) -> None:
         """Close the SDK transport when supported and release the client."""
-        client = self._client
-        self._client = None
-        if client is None:
+        with self._init_lock:
+            client = self._client
+            http_client = self._http_client
+            self._client = None
+            self._http_client = None
+        if client is None and http_client is None:
             return
 
-        for method_name in ("aclose", "close"):
-            method = getattr(client, method_name, None)
+        if client is not None:
+            for method_name in ("aclose", "close"):
+                method = getattr(client, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    result = method()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception as exc:
+                    log.debug("Ignoring Supabase close error (%s)", type(exc).__name__)
+                break
+
+        self._close_http_client(http_client)
+
+    @staticmethod
+    def _close_http_client(http_client: Any | None) -> None:
+        """Close the SDK-owned HTTP transport without raising during shutdown."""
+        if http_client is None:
+            return
+        for method_name in ("close", "aclose"):
+            method = getattr(http_client, method_name, None)
             if not callable(method):
                 continue
             try:
-                result = method()
-                if inspect.isawaitable(result):
-                    await result
+                method()
             except Exception as exc:
-                log.debug("Ignoring Supabase close error (%s)", type(exc).__name__)
+                log.debug("Ignoring Supabase HTTP client close error (%s)", type(exc).__name__)
             return

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import threading
+from contextlib import suppress
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 
 from app.db.client import SupabaseDatabase
@@ -181,13 +186,217 @@ async def immediate_thread(function, *args, **kwargs):
     return function(*args, **kwargs)
 
 
-def make_repository(client: FakeClient) -> MediaRepository:
-    database = SupabaseDatabase(
+def make_database(client: FakeClient) -> SupabaseDatabase:
+    return SupabaseDatabase(
         "https://example.supabase.co",
         "service-role-key",
         client_factory=lambda *_args: client,
     )
-    return MediaRepository(database, to_thread=immediate_thread)
+
+
+def make_repository(client: FakeClient) -> MediaRepository:
+    return MediaRepository(make_database(client), to_thread=immediate_thread)
+
+
+class FailNTimesThread:
+    """Raise a transport error for the first N dispatches, then execute normally."""
+
+    def __init__(self, failures: int) -> None:
+        self.remaining = failures
+        self.calls = 0
+
+    async def __call__(self, function, *args, **kwargs):
+        self.calls += 1
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise httpx.ReadError("connection reset by peer")
+        return function(*args, **kwargs)
+
+
+class AlwaysFailsThread:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.calls = 0
+
+    async def __call__(self, function, *args, **kwargs):
+        self.calls += 1
+        raise self.error
+
+
+class CommitThenDuplicateThread:
+    """Model a committed insert whose first response was lost by the client."""
+
+    def __init__(self, client: FakeClient) -> None:
+        self.client = client
+        self.calls = 0
+
+    async def __call__(self, function, *args, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            error = RuntimeError("duplicate key")
+            error.code = "23505"  # type: ignore[attr-defined]
+            self.client.table("media_items").errors["insert"] = error
+            raise httpx.ReadError("response lost after commit")
+        return function(*args, **kwargs)
+
+
+def capturing_sleep(delays: list[float]):
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    return sleep
+
+
+def make_retrying_repository(
+    client: FakeClient,
+    thread: object,
+    *,
+    delays: list[float] | None = None,
+    **kwargs: object,
+) -> MediaRepository:
+    return MediaRepository(
+        make_database(client),
+        to_thread=thread,  # type: ignore[arg-type]
+        retry_sleep=capturing_sleep(delays if delays is not None else []),
+        jitter=lambda _low, _high: 0.0,
+        **kwargs,
+    )
+
+
+async def test_transient_transport_error_retries_then_succeeds() -> None:
+    client = FakeClient()
+    client.table("media_items").results["select"] = [{"id": "media-1"}]
+    thread = FailNTimesThread(2)
+    delays: list[float] = []
+    repository = make_retrying_repository(client, thread, delays=delays)
+
+    row = await repository.get_media_by_sha256("abc")
+
+    assert row == {"id": "media-1"}
+    assert thread.calls == 3
+    assert delays == [0.5, 1.0]
+
+
+async def test_transient_transport_error_stops_after_three_attempts(caplog) -> None:
+    thread = AlwaysFailsThread(httpx.ReadError("socket failure"))
+    repository = make_retrying_repository(FakeClient(), thread)
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(httpx.ReadError, match="socket failure"):
+            await repository.get_media_by_sha256("abc")
+
+    assert thread.calls == 3
+    assert "attempt=1/3" in caplog.text
+    assert "attempt=3/3" in caplog.text
+    assert "get_media_by_sha256" in caplog.text
+    assert "service-role-key" not in caplog.text
+
+
+async def test_permanent_exception_is_not_retried() -> None:
+    thread = AlwaysFailsThread(ValueError("invalid query"))
+    repository = make_retrying_repository(FakeClient(), thread)
+
+    with pytest.raises(ValueError, match="invalid query"):
+        await repository.get_media_by_sha256("abc")
+
+    assert thread.calls == 1
+
+
+async def test_repeat_safe_update_retries_and_plain_insert_does_not() -> None:
+    client = FakeClient()
+    thread = FailNTimesThread(1)
+    repository = make_retrying_repository(client, thread)
+
+    await repository.finish_job_run("run-1", {"stored": 3}, "succeeded")
+    assert thread.calls == 2
+    assert len(client.table("job_runs").calls) == 1
+
+    insert_thread = AlwaysFailsThread(httpx.ReadError("response lost"))
+    insert_repository = make_retrying_repository(FakeClient(), insert_thread)
+    with pytest.raises(httpx.ReadError):
+        await insert_repository.create_publication("media-1", 10, "daily_digest")
+    assert insert_thread.calls == 1
+
+
+async def test_media_insert_retries_only_when_unique_content_key_exists() -> None:
+    hash_value = "a" * 64
+    client = FakeClient()
+    client.table("media_items").results["select"] = [{"id": "existing", "sha256": hash_value}]
+    thread = CommitThenDuplicateThread(client)
+    repository = make_retrying_repository(client, thread)
+    recovered = await repository.create_media_item({"sha256": hash_value})
+
+    assert recovered == {"id": "existing", "sha256": hash_value, "_recovered": True}
+    assert thread.calls == 2
+
+    unsafe_thread = AlwaysFailsThread(httpx.ReadError("response lost"))
+    unsafe = make_retrying_repository(FakeClient(), unsafe_thread)
+    with pytest.raises(httpx.ReadError):
+        await unsafe.create_media_item({"url": "https://example.com/file"})
+    assert unsafe_thread.calls == 1
+
+
+async def test_concurrency_limit_bounds_operations_and_recovers_after_failure() -> None:
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+    gate = threading.Event()
+    both_started = threading.Event()
+
+    def operation(fail: bool = False) -> str:
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            if active == 2:
+                both_started.set()
+        gate.wait(timeout=2)
+        with lock:
+            active -= 1
+        if fail:
+            raise ValueError("controlled failure")
+        return "ok"
+
+    repository = MediaRepository(make_database(FakeClient()), max_concurrent_requests=2)
+    tasks = [asyncio.create_task(repository._run(operation)) for _ in range(3)]
+    assert await asyncio.wait_for(asyncio.to_thread(both_started.wait, 2), timeout=3)
+    assert maximum == 2
+    gate.set()
+    results = await asyncio.gather(*tasks)
+    assert results == ["ok", "ok", "ok"]
+
+    with pytest.raises(ValueError, match="controlled failure"):
+        await repository._run(lambda: (_ for _ in ()).throw(ValueError("controlled failure")))
+    assert await repository._run(lambda: "recovered") == "recovered"
+
+
+async def test_cancelled_caller_keeps_permit_until_thread_finishes() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    second_entered = threading.Event()
+
+    def slow() -> str:
+        entered.set()
+        release.wait(timeout=3)
+        return "done"
+
+    def second() -> str:
+        second_entered.set()
+        return "second"
+
+    repository = MediaRepository(make_database(FakeClient()), max_concurrent_requests=1)
+    first = asyncio.create_task(repository._run(slow))
+    assert await asyncio.to_thread(entered.wait, 2)
+    first.cancel()
+    second_task = asyncio.create_task(repository._run(second))
+    await asyncio.sleep(0.05)
+    assert not first.done()
+    assert not second_entered.is_set()
+    release.set()
+    with suppress(asyncio.CancelledError):
+        await first
+    assert await asyncio.wait_for(second_task, timeout=2) == "second"
+    assert second_entered.is_set()
 
 
 async def test_get_media_by_sha256_returns_first_matching_row() -> None:

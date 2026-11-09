@@ -3,13 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import random
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
+
 from app.db.client import SupabaseDatabase
 from app.reddit.models import RedditCandidate
+
+log = logging.getLogger(__name__)
+
+# Keep simultaneous PostgREST work bounded across overlapping scheduled jobs.
+# The bot currently has at most a handful of jobs sharing one SDK client.
+_MAX_CONCURRENT_DB_REQUESTS = 4
+_MAX_DB_ATTEMPTS = 3
+_RETRY_BASE_DELAY_SECONDS = 0.5
+_TRANSIENT_DB_EXCEPTIONS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.ReadTimeout,
+)
 
 _JOB_TYPES = ("reddit_collection", "bing_discovery", "crawl", "daily_digest")
 _DIGEST_STATE_FIELDS = frozenset(
@@ -47,6 +65,11 @@ class RepositoryError(RuntimeError):
     """Raised when a repository operation cannot be completed."""
 
 
+def _operation_name(function: Callable[..., Any]) -> str:
+    name = getattr(function, "__name__", "database_operation")
+    return name.removeprefix("_").removesuffix("_sync")
+
+
 def _is_unique_violation(exc: Exception) -> bool:
     code = getattr(exc, "code", None)
     if str(code) == "23505":
@@ -68,9 +91,87 @@ class MediaRepository:
         database: SupabaseDatabase,
         *,
         to_thread: Callable[..., Awaitable[Any]] = asyncio.to_thread,
+        max_concurrent_requests: int = _MAX_CONCURRENT_DB_REQUESTS,
+        retry_sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        jitter: Callable[[float, float], float] = random.uniform,
     ) -> None:
         self._database = database
         self._to_thread = to_thread
+        self._db_semaphore = asyncio.Semaphore(max(1, max_concurrent_requests))
+        self._inflight_tasks: set[asyncio.Task[Any]] = set()
+        self._retry_sleep = retry_sleep
+        self._jitter = jitter
+
+    async def _run(self, function: Callable[..., Any], *args: Any, retry: bool = False) -> Any:
+        """Dispatch one database operation under the shared concurrency limit.
+
+        Retries are opt-in per repository operation. The caller must only enable
+        them when repeating the whole operation is idempotent or already guarded
+        by a unique constraint and conflict-recovery path.
+        """
+        operation = _operation_name(function)
+        attempts = _MAX_DB_ATTEMPTS if retry else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                await self._db_semaphore.acquire()
+                operation_task = asyncio.create_task(self._dispatch(function, *args))
+                self._inflight_tasks.add(operation_task)
+                operation_task.add_done_callback(self._inflight_tasks.discard)
+                # Shield the worker from caller cancellation. asyncio.to_thread
+                # cannot stop its thread, so the permit must remain held until
+                # the synchronous request actually finishes.
+                try:
+                    result = await asyncio.shield(operation_task)
+                except asyncio.CancelledError:
+                    # Keep shutdown from closing the shared HTTPX client while
+                    # its synchronous request is still running in a thread.
+                    while not operation_task.done():
+                        try:
+                            await asyncio.shield(operation_task)
+                        except asyncio.CancelledError:
+                            continue
+                        except Exception:
+                            break
+                    raise
+            except _TRANSIENT_DB_EXCEPTIONS as exc:
+                if attempt >= attempts:
+                    log.error(
+                        "Database operation failed operation=%s attempt=%s/%s "
+                        "exception=%s retry=false",
+                        operation,
+                        attempt,
+                        attempts,
+                        type(exc).__name__,
+                    )
+                    raise
+                delay = _RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+                delay += self._jitter(0.0, delay * 0.1)
+                log.warning(
+                    "Transient database transport failure operation=%s attempt=%s/%s "
+                    "exception=%s retry=true retry_in_seconds=%.2f",
+                    operation,
+                    attempt,
+                    attempts,
+                    type(exc).__name__,
+                    delay,
+                )
+                await self._retry_sleep(delay)
+            else:
+                if attempt > 1:
+                    log.info(
+                        "Database operation succeeded after retry operation=%s attempt=%s/%s",
+                        operation,
+                        attempt,
+                        attempts,
+                    )
+                return result
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def _dispatch(self, function: Callable[..., Any], *args: Any) -> Any:
+        try:
+            return await self._to_thread(function, *args)
+        finally:
+            self._db_semaphore.release()
 
     @property
     def configured(self) -> bool:
@@ -86,7 +187,7 @@ class MediaRepository:
             raise RepositoryError(f"Supabase client unavailable ({type(exc).__name__})") from None
 
     async def get_runtime_state(self) -> dict[str, Any]:
-        return await self._to_thread(self._runtime_state_sync)
+        return await self._run(self._runtime_state_sync, retry=True)
 
     def _runtime_state_sync(self) -> dict[str, Any]:
         rows = self._rows(
@@ -95,7 +196,7 @@ class MediaRepository:
         return rows[0] if rows else {"id": 1, "collection_enabled": False}
 
     async def set_collection_enabled(self, enabled: bool) -> dict[str, Any]:
-        return await self._to_thread(self._set_collection_enabled_sync, enabled)
+        return await self._run(self._set_collection_enabled_sync, enabled, retry=True)
 
     def _set_collection_enabled_sync(self, enabled: bool) -> dict[str, Any]:
         rows = self._rows(
@@ -118,7 +219,8 @@ class MediaRepository:
     ) -> str:
         if job_type not in _JOB_TYPES:
             raise ValueError(f"Unsupported job type: {job_type}")
-        return await self._to_thread(self._create_job_run_sync, config, job_type)
+        # A plain insert without a unique job identifier is not safe to repeat.
+        return await self._run(self._create_job_run_sync, config, job_type, retry=False)
 
     def _create_job_run_sync(self, config: dict[str, Any], job_type: str) -> str:
         rows = self._rows(
@@ -134,7 +236,7 @@ class MediaRepository:
     async def finish_job_run(
         self, job_id: str, counters: dict[str, Any], outcome: str, error: str | None = None
     ) -> None:
-        await self._to_thread(self._finish_job_run_sync, job_id, counters, outcome, error)
+        await self._run(self._finish_job_run_sync, job_id, counters, outcome, error, retry=True)
 
     def _finish_job_run_sync(
         self, job_id: str, counters: dict[str, Any], outcome: str, error: str | None
@@ -148,7 +250,7 @@ class MediaRepository:
         self._client().table("job_runs").update(payload).eq("id", job_id).execute()
 
     async def mark_interrupted_jobs(self) -> None:
-        await self._to_thread(self._mark_interrupted_sync)
+        await self._run(self._mark_interrupted_sync, retry=True)
 
     def _mark_interrupted_sync(self) -> None:
         client = self._client()
@@ -170,7 +272,7 @@ class MediaRepository:
                 ).eq("id", row["id"]).execute()
 
     async def recover_processing_discoveries(self) -> int:
-        return await self._to_thread(self._recover_processing_discoveries_sync)
+        return await self._run(self._recover_processing_discoveries_sync, retry=True)
 
     def _recover_processing_discoveries_sync(self) -> int:
         client = self._client()
@@ -189,7 +291,7 @@ class MediaRepository:
         return len(rows)
 
     async def latest_jobs(self, job_type: str, limit: int = 1) -> list[dict[str, Any]]:
-        return await self._to_thread(self._latest_jobs_sync, job_type, limit)
+        return await self._run(self._latest_jobs_sync, job_type, limit, retry=True)
 
     def _latest_jobs_sync(self, job_type: str, limit: int) -> list[dict[str, Any]]:
         return self._rows(
@@ -209,10 +311,10 @@ class MediaRepository:
         return await self.latest_jobs("crawl", limit)
 
     async def latest_reddit_runs(self, limit: int = 2) -> list[dict[str, Any]]:
-        return await self._to_thread(self._latest_reddit_runs_sync, limit)
+        return await self._run(self._latest_reddit_runs_sync, limit, retry=True)
 
     async def operational_counts(self) -> dict[str, Any]:
-        return await self._to_thread(self._operational_counts_sync)
+        return await self._run(self._operational_counts_sync, retry=True)
 
     def _operational_counts_sync(self) -> dict[str, Any]:
         client = self._client()
@@ -244,7 +346,7 @@ class MediaRepository:
         }
 
     async def mark_reddit_success(self) -> None:
-        await self._to_thread(self._mark_reddit_success_sync)
+        await self._run(self._mark_reddit_success_sync, retry=True)
 
     def _mark_reddit_success_sync(self) -> None:
         self._client().table("runtime_state").update(
@@ -252,7 +354,7 @@ class MediaRepository:
         ).eq("id", 1).execute()
 
     async def mark_bing_success(self) -> None:
-        await self._to_thread(self._mark_bing_success_sync)
+        await self._run(self._mark_bing_success_sync, retry=True)
 
     def _mark_bing_success_sync(self) -> None:
         self._client().table("runtime_state").update(
@@ -260,7 +362,7 @@ class MediaRepository:
         ).eq("id", 1).execute()
 
     async def pause_bing(self, reason: str) -> None:
-        await self._to_thread(self._pause_bing_sync, reason)
+        await self._run(self._pause_bing_sync, reason, retry=True)
 
     def _pause_bing_sync(self, reason: str) -> None:
         self._client().table("runtime_state").update(
@@ -277,7 +379,7 @@ class MediaRepository:
         No Discord command calls this. It exists for a deliberate operator
         action and never runs automatically on startup or from ``/start``.
         """
-        await self._to_thread(self._clear_bing_pause_sync)
+        await self._run(self._clear_bing_pause_sync, retry=True)
 
     def _clear_bing_pause_sync(self) -> None:
         self._client().table("runtime_state").update(
@@ -300,7 +402,7 @@ class MediaRepository:
         )
 
     async def random_asset(self) -> dict[str, Any] | None:
-        return await self._to_thread(self._random_asset_sync)
+        return await self._run(self._random_asset_sync, retry=True)
 
     def _random_asset_sync(self) -> dict[str, Any] | None:
         rows = self._rows(
@@ -317,7 +419,7 @@ class MediaRepository:
         return random.choice(rows) if rows else None
 
     async def source_for_media(self, media_item_id: str) -> dict[str, Any] | None:
-        return await self._to_thread(self._source_for_media_sync, media_item_id)
+        return await self._run(self._source_for_media_sync, media_item_id, retry=True)
 
     def _source_for_media_sync(self, media_item_id: str) -> dict[str, Any] | None:
         rows = self._rows(
@@ -333,7 +435,7 @@ class MediaRepository:
 
     async def sources_for_media(self, media_item_id: str) -> list[dict[str, Any]]:
         """Return every source association for one canonical media item."""
-        return await self._to_thread(self._sources_for_media_sync, media_item_id)
+        return await self._run(self._sources_for_media_sync, media_item_id, retry=True)
 
     def _sources_for_media_sync(self, media_item_id: str) -> list[dict[str, Any]]:
         size = 1000
@@ -356,7 +458,7 @@ class MediaRepository:
             offset += len(page)
 
     async def asset_stats(self, start: str | None = None) -> dict[str, int]:
-        return await self._to_thread(self._asset_stats_sync, start)
+        return await self._run(self._asset_stats_sync, start, retry=True)
 
     def _asset_stats_sync(self, start: str | None) -> dict[str, int]:
         client = self._client()
@@ -395,7 +497,7 @@ class MediaRepository:
         return []
 
     async def get_media_by_sha256(self, sha256: str) -> dict[str, Any] | None:
-        return await self._to_thread(self._get_media_by_sha256_sync, sha256)
+        return await self._run(self._get_media_by_sha256_sync, sha256, retry=True)
 
     def _get_media_by_sha256_sync(self, sha256: str) -> dict[str, Any] | None:
         response = (
@@ -414,7 +516,7 @@ class MediaRepository:
         normalized_url = payload.get("normalized_url")
         if not isinstance(normalized_url, str) or not normalized_url:
             raise RepositoryError("Discovery payload requires normalized_url")
-        return await self._to_thread(self._upsert_discovery_record_sync, dict(payload))
+        return await self._run(self._upsert_discovery_record_sync, dict(payload), retry=True)
 
     def _upsert_discovery_record_sync(self, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         normalized_url = str(payload["normalized_url"])
@@ -449,7 +551,7 @@ class MediaRepository:
         return rows[0] if rows else None
 
     async def get_discovery(self, discovery_id: str) -> dict[str, Any] | None:
-        return await self._to_thread(self._get_discovery_sync, discovery_id)
+        return await self._run(self._get_discovery_sync, discovery_id, retry=True)
 
     def _get_discovery_sync(self, discovery_id: str) -> dict[str, Any] | None:
         rows = self._rows(
@@ -469,7 +571,9 @@ class MediaRepository:
         max_depth: int,
     ) -> list[dict[str, Any]]:
         """Atomically claim up to ``limit`` due queued discoveries."""
-        return await self._to_thread(self._claim_discoveries_sync, limit, max_depth)
+        # Repeating the whole select-and-claim could exceed the requested batch
+        # after a partially committed attempt, so leave this operation unretried.
+        return await self._run(self._claim_discoveries_sync, limit, max_depth, retry=False)
 
     def _claim_discoveries_sync(self, limit: int, max_depth: int) -> list[dict[str, Any]]:
         if limit < 1:
@@ -505,7 +609,7 @@ class MediaRepository:
         return claimed
 
     async def update_discovery(self, discovery_id: str, fields: dict[str, Any]) -> dict[str, Any]:
-        return await self._to_thread(self._update_discovery_sync, discovery_id, dict(fields))
+        return await self._run(self._update_discovery_sync, discovery_id, dict(fields), retry=True)
 
     def _update_discovery_sync(self, discovery_id: str, fields: dict[str, Any]) -> dict[str, Any]:
         payload = {key: value for key, value in fields.items() if key in _DISCOVERY_UPDATE_FIELDS}
@@ -549,13 +653,14 @@ class MediaRepository:
         discovered_from_url: str,
         depth: int,
     ) -> dict[str, Any]:
-        return await self._to_thread(
+        return await self._run(
             self._record_discovery_edge_sync,
             parent_discovery_id,
             child_discovery_id,
             child_normalized_url,
             discovered_from_url,
             depth,
+            retry=True,
         )
 
     def _edge_query(self, parent_discovery_id: str | None, child_normalized_url: str) -> Any:
@@ -603,7 +708,7 @@ class MediaRepository:
         return rows[0] if rows else payload
 
     async def upsert_discovery(self, candidate: RedditCandidate) -> dict[str, Any]:
-        return await self._to_thread(self._upsert_discovery_sync, candidate)
+        return await self._run(self._upsert_discovery_sync, candidate, retry=True)
 
     def _upsert_discovery_sync(self, candidate: RedditCandidate) -> dict[str, Any]:
         discovery_id = getattr(candidate, "discovery_id", None)
@@ -661,7 +766,11 @@ class MediaRepository:
         raise RepositoryError("Discovery upsert returned no row")
 
     async def create_media_item(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._to_thread(self._create_media_item_sync, payload)
+        # A unique SHA-256 key and duplicate recovery make this insert repeatable.
+        # Without that key, an ambiguous response must not trigger another insert.
+        sha256 = payload.get("sha256")
+        retry = isinstance(sha256, str) and len(sha256) == 64
+        return await self._run(self._create_media_item_sync, payload, retry=retry)
 
     def _create_media_item_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -687,10 +796,11 @@ class MediaRepository:
         metadata: dict[str, Any],
     ) -> dict[str, Any]:
         """Fill non-null technical metadata without erasing existing values."""
-        return await self._to_thread(
+        return await self._run(
             self._update_media_item_metadata_sync,
             media_item_id,
             metadata,
+            retry=True,
         )
 
     def _update_media_item_metadata_sync(
@@ -725,7 +835,7 @@ class MediaRepository:
         limit: int = 500,
     ) -> list[dict[str, Any]]:
         """Return recent rows with perceptual hashes for similarity review."""
-        return await self._to_thread(self._list_perceptual_hashes_sync, limit)
+        return await self._run(self._list_perceptual_hashes_sync, limit, retry=True)
 
     def _list_perceptual_hashes_sync(self, limit: int) -> list[dict[str, Any]]:
         response = (
@@ -746,13 +856,14 @@ class MediaRepository:
         media_url: str | None = None,
         source_media_id: str | None = None,
     ) -> dict[str, Any]:
-        return await self._to_thread(
+        return await self._run(
             self._record_source_sync,
             media_item_id,
             candidate,
             discovery_id,
             media_url,
             source_media_id,
+            retry=True,
         )
 
     def _record_source_sync(
@@ -802,12 +913,13 @@ class MediaRepository:
         *,
         attempt_count: int = 1,
     ) -> dict[str, Any]:
-        return await self._to_thread(
+        return await self._run(
             self._create_publication_sync,
             media_item_id,
             channel_id,
             purpose,
             attempt_count,
+            retry=False,
         )
 
     def _create_publication_sync(
@@ -838,12 +950,13 @@ class MediaRepository:
         message_id: int | None = None,
         last_error: str | None = None,
     ) -> dict[str, Any]:
-        return await self._to_thread(
+        return await self._run(
             self._update_publication_sync,
             publication_id,
             status,
             message_id,
             last_error,
+            retry=True,
         )
 
     def _update_publication_sync(
@@ -873,7 +986,9 @@ class MediaRepository:
         self, media_item_id: str, channel_id: int
     ) -> dict[str, Any] | None:
         """Return the durable daily-digest delivery row for one item and channel."""
-        return await self._to_thread(self._get_digest_publication_sync, media_item_id, channel_id)
+        return await self._run(
+            self._get_digest_publication_sync, media_item_id, channel_id, retry=True
+        )
 
     def _get_digest_publication_sync(
         self, media_item_id: str, channel_id: int
@@ -902,8 +1017,8 @@ class MediaRepository:
         :meth:`record_publication_attempt`, so a freshly created row starts at
         zero.
         """
-        return await self._to_thread(
-            self._ensure_digest_publication_sync, media_item_id, channel_id
+        return await self._run(
+            self._ensure_digest_publication_sync, media_item_id, channel_id, retry=True
         )
 
     async def reserve_digest_publication(
@@ -915,12 +1030,13 @@ class MediaRepository:
         limit: int = 50,
     ) -> dict[str, Any]:
         """Atomically reserve one global digest slot through PostgreSQL."""
-        return await self._to_thread(
+        return await self._run(
             self._reserve_digest_publication_sync,
             media_item_id,
             channel_id,
             digest_cycle,
             limit,
+            retry=False,
         )
 
     async def retarget_digest_publication(
@@ -1141,7 +1257,9 @@ class MediaRepository:
         )
 
     async def _digest_claim_rpc(self, function: str, params: dict[str, Any]) -> Any:
-        return await self._to_thread(self._digest_claim_rpc_sync, function, params)
+        # Digest claim RPCs are stateful (leases and attempt counters), so they
+        # are deliberately excluded from automatic transport retries.
+        return await self._run(self._digest_claim_rpc_sync, function, params, retry=False)
 
     def _digest_claim_rpc_sync(self, function: str, params: dict[str, Any]) -> Any:
         response = self._client().rpc(function, params).execute()
@@ -1157,8 +1275,8 @@ class MediaRepository:
         publication_id: str,
         message_id: int,
     ) -> dict[str, Any]:
-        return await self._to_thread(
-            self._mark_publication_published_sync, publication_id, message_id
+        return await self._run(
+            self._mark_publication_published_sync, publication_id, message_id, retry=True
         )
 
     def _mark_publication_published_sync(
@@ -1183,7 +1301,9 @@ class MediaRepository:
         publication_id: str,
         error: str,
     ) -> dict[str, Any]:
-        return await self._to_thread(self._mark_publication_failed_sync, publication_id, error)
+        return await self._run(
+            self._mark_publication_failed_sync, publication_id, error, retry=True
+        )
 
     def _mark_publication_failed_sync(self, publication_id: str, error: str) -> dict[str, Any]:
         payload = {"status": "failed", "last_error": error[:500]}
@@ -1205,11 +1325,12 @@ class MediaRepository:
         preserve_error: str | None = None,
     ) -> dict[str, Any]:
         """Record a reconciliation diagnostic without losing prior uncertainty."""
-        return await self._to_thread(
+        return await self._run(
             self._record_publication_reconciliation_error_sync,
             publication_id,
             error,
             preserve_error,
+            retry=True,
         )
 
     def _record_publication_reconciliation_error_sync(
@@ -1233,11 +1354,12 @@ class MediaRepository:
         now: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return retryable rows and exhausted rows that still need reconciliation."""
-        return await self._to_thread(
+        return await self._run(
             self._list_retryable_digest_publications_sync,
             attempt_limit,
             limit,
             now or datetime.now(tz=UTC).isoformat(),
+            retry=True,
         )
 
     def _list_retryable_digest_publications_sync(
@@ -1271,11 +1393,12 @@ class MediaRepository:
         now: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return every exhausted ambiguous row, reading the backlog in stable pages."""
-        return await self._to_thread(
+        return await self._run(
             self._list_exhausted_ambiguous_digest_publications_sync,
             attempt_limit,
             page_size,
             now or datetime.now(tz=UTC).isoformat(),
+            retry=True,
         )
 
     def _list_exhausted_ambiguous_digest_publications_sync(
@@ -1320,7 +1443,7 @@ class MediaRepository:
             cursor_id = str(page[-1].get("id") or "")
 
     async def get_media_item(self, media_item_id: str) -> dict[str, Any] | None:
-        return await self._to_thread(self._get_media_item_sync, media_item_id)
+        return await self._run(self._get_media_item_sync, media_item_id, retry=True)
 
     def _get_media_item_sync(self, media_item_id: str) -> dict[str, Any] | None:
         rows = self._rows(
@@ -1348,13 +1471,14 @@ class MediaRepository:
         is safe because publication records decide whether delivery already
         happened, and it prevents ties from being skipped permanently.
         """
-        return await self._to_thread(
+        return await self._run(
             self._list_digest_candidates_sync,
             window_start,
             window_end,
             cursor,
             limit,
             offset,
+            retry=True,
         )
 
     def _list_digest_candidates_sync(
@@ -1382,7 +1506,7 @@ class MediaRepository:
         return self._rows(query.execute())
 
     async def digest_publication_counts(self, *, attempt_limit: int = 3) -> dict[str, int]:
-        return await self._to_thread(self._digest_publication_counts_sync, attempt_limit)
+        return await self._run(self._digest_publication_counts_sync, attempt_limit, retry=True)
 
     def _digest_publication_counts_sync(self, attempt_limit: int) -> dict[str, int]:
         client = self._client()
@@ -1409,7 +1533,7 @@ class MediaRepository:
         }
 
     async def get_digest_state(self) -> dict[str, Any]:
-        return await self._to_thread(self._get_digest_state_sync)
+        return await self._run(self._get_digest_state_sync, retry=True)
 
     def _get_digest_state_sync(self) -> dict[str, Any]:
         rows = self._rows(
@@ -1418,7 +1542,7 @@ class MediaRepository:
         return rows[0] if rows else {"id": 1}
 
     async def update_digest_state(self, fields: dict[str, Any]) -> dict[str, Any]:
-        return await self._to_thread(self._update_digest_state_sync, dict(fields))
+        return await self._run(self._update_digest_state_sync, dict(fields), retry=True)
 
     def _update_digest_state_sync(self, fields: dict[str, Any]) -> dict[str, Any]:
         payload = {
@@ -1433,7 +1557,7 @@ class MediaRepository:
         return rows[0] if rows else {"id": 1, **payload}
 
     async def mark_digest_success(self) -> None:
-        await self._to_thread(self._mark_digest_success_sync)
+        await self._run(self._mark_digest_success_sync, retry=True)
 
     def _mark_digest_success_sync(self) -> None:
         self._client().table("runtime_state").update(

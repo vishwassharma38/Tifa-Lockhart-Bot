@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from app.db.client import DatabaseInitializationError, SupabaseDatabase
+from app.db.repository import MediaRepository
 from app.health.status import ServiceState
 
 
@@ -18,6 +20,9 @@ class FakeQuery:
 
     def select(self, *columns: str) -> FakeQuery:
         self.selected = list(columns)
+        return self
+
+    def eq(self, _column: str, _value: object) -> FakeQuery:
         return self
 
     def limit(self, count: int) -> FakeQuery:
@@ -151,3 +156,86 @@ async def test_close_releases_and_closes_the_client() -> None:
     await database.close()
 
     assert client.closed is True
+
+
+class FakeHttpClient:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_initialize_injects_http_client_options_into_supabase() -> None:
+    http_client = FakeHttpClient()
+    factory = FakeFactory(FakeClient())
+    database = SupabaseDatabase(
+        "https://example.supabase.co",
+        "service-role-key",
+        client_factory=factory,
+        http_client_factory=lambda: http_client,
+    )
+
+    assert database.initialize() is True
+
+    assert len(factory.calls) == 1
+    url, key, options = factory.calls[0]
+    assert url == "https://example.supabase.co"
+    assert key == "service-role-key"
+    assert options.httpx_client is http_client
+
+
+async def test_initialize_builds_a_shared_http1_transport() -> None:
+    database = SupabaseDatabase("https://example.supabase.co", "service-role-key")
+    try:
+        assert database.initialize() is True
+
+        http_client = database._http_client
+        assert isinstance(http_client, httpx.Client)
+        assert http_client.timeout == httpx.Timeout(30.0)
+        assert http_client._transport._pool._http2 is False
+        assert database.client.postgrest.session is http_client
+    finally:
+        await database.close()
+
+
+async def test_repository_reuses_one_http_client_for_multiple_operations() -> None:
+    http_client = FakeHttpClient()
+    factory = FakeFactory(FakeClient())
+    database = SupabaseDatabase(
+        "https://example.supabase.co",
+        "service-role-key",
+        client_factory=factory,
+        http_client_factory=lambda: http_client,
+        to_thread=immediate_thread,
+    )
+    repository = MediaRepository(database, to_thread=immediate_thread)
+
+    await repository.get_media_by_sha256("abc")
+    await repository.get_media_by_sha256("def")
+
+    assert len(factory.calls) == 1
+    assert factory.calls[0][2].httpx_client is http_client
+
+    await database.close()
+    assert http_client.closed is True
+
+
+def test_initialization_failure_closes_the_owned_http_client() -> None:
+    http_client = FakeHttpClient()
+
+    def factory(*_args: object) -> object:
+        raise RuntimeError("bad credentials: service-role-key")
+
+    database = SupabaseDatabase(
+        "https://example.supabase.co",
+        "service-role-key",
+        client_factory=factory,
+        http_client_factory=lambda: http_client,
+    )
+
+    with pytest.raises(DatabaseInitializationError):
+        database.initialize()
+
+    assert http_client.closed is True
+    assert database._http_client is None
