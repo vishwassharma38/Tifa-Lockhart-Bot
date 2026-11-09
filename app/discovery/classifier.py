@@ -91,7 +91,7 @@ def classify_page(
 ) -> Classification:
     """Classify one page from its own content plus separate search metadata.
 
-    A Brave phrase (or any other single search-only signal) contributes at most
+    A search phrase (or any other single search-only signal) contributes at most
     one point and can never reach the verified threshold on its own.
     """
     title_text = _clean(title, 2_000)

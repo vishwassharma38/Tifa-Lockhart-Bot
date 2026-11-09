@@ -481,11 +481,11 @@ async def test_create_job_run_supports_phase5_job_types() -> None:
     client.table("job_runs").results["insert"] = [{"id": "job-1"}]
     repository = make_repository(client)
 
-    job_id = await repository.create_job_run({"phrase": "Tifa"}, job_type="brave_discovery")
+    job_id = await repository.create_job_run({"phrase": "Tifa"}, job_type="bing_discovery")
 
     assert job_id == "job-1"
     _, payload, _ = client.table("job_runs").calls[0]
-    assert payload["job_type"] == "brave_discovery"
+    assert payload["job_type"] == "bing_discovery"
     assert payload["config_snapshot"] == {"phrase": "Tifa"}
     with pytest.raises(ValueError, match="Unsupported job type"):
         await repository.create_job_run({}, job_type="manual_save")
@@ -501,7 +501,7 @@ async def test_mark_interrupted_jobs_covers_worker_and_digest_jobs() -> None:
     queries = [query for query in client.table("job_runs").queries if query.operation == "select"]
     assert [query.filters for query in queries] == [
         [("job_type", "reddit_collection"), ("outcome", "running")],
-        [("job_type", "brave_discovery"), ("outcome", "running")],
+        [("job_type", "bing_discovery"), ("outcome", "running")],
         [("job_type", "crawl"), ("outcome", "running")],
         [("job_type", "daily_digest"), ("outcome", "running")],
     ]
@@ -513,38 +513,38 @@ async def test_mark_interrupted_jobs_covers_worker_and_digest_jobs() -> None:
     )
 
 
-async def test_brave_pause_state_is_persisted_and_clearable() -> None:
+async def test_bing_pause_state_is_persisted_and_clearable() -> None:
     client = FakeClient()
     client.table("runtime_state").results["update"] = [{"id": 1}]
     repository = make_repository(client)
 
-    await repository.pause_brave("http_403_access_denied")
+    await repository.pause_bing("http_403_access_denied")
     pause_payload = client.table("runtime_state").calls[0][1]
-    assert pause_payload["brave_paused"] is True
-    assert pause_payload["brave_pause_reason"] == "http_403_access_denied"
-    assert pause_payload["brave_paused_at"]
+    assert pause_payload["bing_paused"] is True
+    assert pause_payload["bing_pause_reason"] == "http_403_access_denied"
+    assert pause_payload["bing_paused_at"]
 
-    await repository.clear_brave_pause()
+    await repository.clear_bing_pause()
     clear_payload = client.table("runtime_state").calls[1][1]
     assert clear_payload == {
-        "brave_paused": False,
-        "brave_pause_reason": None,
-        "brave_paused_at": None,
+        "bing_paused": False,
+        "bing_pause_reason": None,
+        "bing_paused_at": None,
     }
 
-    await repository.mark_brave_success()
+    await repository.mark_bing_success()
     success_payload = client.table("runtime_state").calls[2][1]
-    assert "last_brave_success_at" in success_payload
+    assert "last_bing_success_at" in success_payload
 
 
-async def test_operational_counts_include_queue_brave_and_pause_state() -> None:
+async def test_operational_counts_include_queue_bing_and_pause_state() -> None:
     client = FakeClient()
     client.table("runtime_state").results["select"] = [
         {
             "collection_enabled": True,
-            "brave_paused": True,
-            "brave_pause_reason": "http_403_access_denied",
-            "last_brave_success_at": "2026-01-01T00:00:00+00:00",
+            "bing_paused": True,
+            "bing_pause_reason": "http_403_access_denied",
+            "last_bing_success_at": "2026-01-01T00:00:00+00:00",
             "last_digest_success_at": None,
         }
     ]
@@ -567,9 +567,9 @@ async def test_operational_counts_include_queue_brave_and_pause_state() -> None:
     assert counts["processing"] == 1
     assert counts["verified"] == 4
     assert counts["dumpster"] == 3
-    assert counts["brave_paused"] is True
-    assert counts["brave_pause_reason"] == "http_403_access_denied"
-    assert counts["last_brave_success_at"] == "2026-01-01T00:00:00+00:00"
+    assert counts["bing_paused"] is True
+    assert counts["bing_pause_reason"] == "http_403_access_denied"
+    assert counts["last_bing_success_at"] == "2026-01-01T00:00:00+00:00"
     count_query = discoveries.queries[0]
     assert count_query.count == "exact"
     assert count_query.filters == [("status", "queued")]
@@ -663,7 +663,7 @@ async def test_record_discovery_edge_deduplicates_and_preserves_root_paths() -> 
         parent_discovery_id=None,
         child_discovery_id="child-1",
         child_normalized_url="https://example.com/child",
-        discovered_from_url="https://search.brave.com/search?q=tifa",
+        discovered_from_url="https://www.bing.com/search?q=tifa",
         depth=0,
     )
 
@@ -712,13 +712,13 @@ async def test_latest_phase5_runs_filter_job_type_and_order_descending() -> None
     client.table("job_runs").results["select"] = [{"id": "run-1"}]
     repository = make_repository(client)
 
-    brave = await repository.latest_brave_runs(2)
+    bing = await repository.latest_bing_runs(2)
     crawl = await repository.latest_crawl_runs(1)
 
-    assert brave == [{"id": "run-1"}]
+    assert bing == [{"id": "run-1"}]
     assert crawl == [{"id": "run-1"}]
     queries = client.table("job_runs").queries
-    assert queries[0].filters == [("job_type", "brave_discovery")]
+    assert queries[0].filters == [("job_type", "bing_discovery")]
     assert queries[0].order_value == ("started_at", True)
     assert queries[0].limit_value == 2
     assert queries[1].filters == [("job_type", "crawl")]

@@ -781,7 +781,7 @@ class DiscoveryCrawler:
             },
             extraction_reason="web_original_media",
             discovery_id=str(row.get("id")),
-            source_type=str(row.get("source_type") or "brave_html"),
+            source_type=str(row.get("source_type") or "web_legacy"),
             source_platform="web",
             normalized_url=page.final_url,
             crawl_depth=int(row.get("depth") or 0),
@@ -832,7 +832,7 @@ class DiscoveryCrawler:
             return 0
         parent_id = str(row.get("id") or "")
         parent_url = page.final_url
-        source_type = str(row.get("source_type") or "brave_html")
+        source_type = str(row.get("source_type") or "web_legacy")
         metadata = _metadata(row)
         admitted = 0
         for index, link in enumerate(page.links):

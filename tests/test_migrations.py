@@ -240,7 +240,7 @@ def test_phase4_migration_extends_existing_runtime_and_job_tables() -> None:
     assert "create table" not in sql
 
 
-def test_phase5_migration_adds_durable_discovery_and_brave_controls() -> None:
+def test_phase5_migration_adds_durable_discovery_controls() -> None:
     files, _sql = read_migrations()
     names = [path.name for path in files]
 
@@ -251,12 +251,36 @@ def test_phase5_migration_adds_durable_discovery_and_brave_controls() -> None:
 
     assert "add column if not exists next_attempt_at" in lowered
     assert "idx_discoveries_queue_claim" in lowered
-    assert "add column if not exists brave_paused" in lowered
-    assert "add column if not exists brave_pause_reason" in lowered
-    assert "add column if not exists brave_paused_at" in lowered
+    assert "alter table public.runtime_state" in lowered
+    assert lowered.count("add column if not exists") == 4
     assert "create table" not in lowered
     assert "drop table" not in lowered
     assert "drop column" not in lowered
+    assert "delete from" not in lowered
+    assert "truncate" not in lowered
+
+
+def test_bing_search_provider_migration_preserves_history() -> None:
+    files, _sql = read_migrations()
+    names = [path.name for path in files]
+
+    assert "012_bing_search_provider.sql" in names
+
+    sql = read_migration("012_bing_search_provider.sql")
+    lowered = sql.lower()
+
+    assert "add column if not exists bing_paused" in lowered
+    assert "add column if not exists bing_pause_reason" in lowered
+    assert "add column if not exists bing_paused_at" in lowered
+    assert "add column if not exists last_bing_success_at" in lowered
+    assert "update public.discoveries" in lowered
+    assert "set source_type = 'web_legacy'" in lowered
+    assert "drop constraint if exists discoveries_source_type_check" in lowered
+    assert "source_type in ('reddit', 'web_legacy', 'bing_html', 'seed', 'manual_save')" in lowered
+    assert "drop constraint if exists job_runs_job_type_check" in lowered
+    assert "'bing_discovery'" in lowered
+    assert lowered.count("drop column if exists") == 4
+    assert "drop table" not in lowered
     assert "delete from" not in lowered
     assert "truncate" not in lowered
 

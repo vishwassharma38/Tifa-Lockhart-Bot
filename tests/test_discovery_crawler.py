@@ -623,7 +623,7 @@ def row(
         "depth": depth,
         "status": status,
         "retry_count": 0,
-        "source_type": "brave_html",
+        "source_type": "bing_html",
         "metadata_json": metadata or {},
     }
 
@@ -671,7 +671,7 @@ async def test_crawler_verifies_acquires_and_admits_bounded_children(make_settin
     candidate, publish = pipeline.calls[0]
     assert publish is False
     assert candidate.discovery_id == "discovery-1"
-    assert candidate.source_type == "brave_html"
+    assert candidate.source_type == "bing_html"
     assert [asset.url for asset in candidate.media_assets] == ["https://example.com/full.jpg"]
     verified_update = repository.updates[0][1]
     assert verified_update["status"] == "verified"

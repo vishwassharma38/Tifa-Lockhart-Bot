@@ -7,6 +7,7 @@ import pytest
 
 from app.bot import client as bot_client
 from app.bot.client import TifaBot
+from app.discovery.bing import BingDiscoveryService, BingSearchAdapter
 
 
 class DummyStatusService:
@@ -58,6 +59,22 @@ class FakeDigestService:
         self.run_calls.append(trigger)
         if self.run_error is not None:
             raise self.run_error
+
+
+class FakeBingService:
+    def __init__(self) -> None:
+        self.run_calls: list[bool] = []
+
+    async def run(self, *, scheduled: bool = True) -> None:
+        self.run_calls.append(scheduled)
+
+
+class FakeCrawler:
+    def __init__(self) -> None:
+        self.run_calls: list[bool] = []
+
+    async def run_once(self, *, scheduled: bool = True) -> None:
+        self.run_calls.append(scheduled)
 
 
 def build_bot(
@@ -171,6 +188,46 @@ async def test_setup_hook_registers_daily_digest_at_four_ist(make_settings) -> N
         assert bot.scheduler.get_job("reddit_collection_hourly") is not None
     finally:
         await bot.close()
+
+
+async def test_setup_hook_registers_bing_discovery_with_shared_client(make_settings) -> None:
+    repository = FakeBotRepository()
+    bot = build_bot(
+        make_settings,
+        sync_commands=False,
+        repository=repository,
+        storage=object(),
+    )
+    try:
+        await bot.setup_hook()
+        assert bot.scheduler is not None
+        assert isinstance(bot.bing_service, BingDiscoveryService)
+        assert isinstance(bot.bing_service._adapter, BingSearchAdapter)
+        assert bot.safe_http_client is not None
+        assert bot.bing_service._adapter._client is bot.safe_http_client
+        job = bot.scheduler.get_job("bing_discovery")
+        assert job is not None
+        assert job.trigger.interval.total_seconds() == 8 * 60 * 60
+        assert job.coalesce is True
+        assert job.max_instances == 1
+        assert job.misfire_grace_time == 900
+    finally:
+        await bot.close()
+
+
+async def test_scheduled_bing_discovery_runs_search_then_crawl(make_settings) -> None:
+    bot = build_bot(make_settings, sync_commands=False)
+    bing = FakeBingService()
+    crawler = FakeCrawler()
+    bot.bing_service = bing
+    bot.crawler = crawler
+    try:
+        await bot._scheduled_bing_discovery()
+    finally:
+        await bot.close()
+
+    assert bing.run_calls == [True]
+    assert crawler.run_calls == [True]
 
 
 async def test_scheduled_digest_runs_while_collection_is_paused(make_settings) -> None:

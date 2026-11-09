@@ -286,16 +286,16 @@ class FakeOperationalRepository:
         return {
             "collection_enabled": True,
             "last_reddit_success_at": "2026-01-01T00:00:00+00:00",
-            "last_brave_success_at": None,
+            "last_bing_success_at": None,
             "last_digest_success_at": "2026-01-01T04:00:00+00:00",
-            "brave_paused": False,
-            "brave_pause_reason": None,
+            "bing_paused": False,
+            "bing_pause_reason": None,
         }
 
     async def latest_reddit_runs(self, _limit: int = 1) -> list[dict[str, object]]:
         return []
 
-    async def latest_brave_runs(self, _limit: int = 1) -> list[dict[str, object]]:
+    async def latest_bing_runs(self, _limit: int = 1) -> list[dict[str, object]]:
         return []
 
     async def latest_crawl_runs(self, _limit: int = 1) -> list[dict[str, object]]:
@@ -328,9 +328,9 @@ class FakeOperationalRepository:
             "failed": 1,
             "oversize": 1,
             "last_digest_success_at": "2026-01-01T04:00:00+00:00",
-            "last_brave_success_at": None,
-            "brave_paused": False,
-            "brave_pause_reason": None,
+            "last_bing_success_at": None,
+            "bing_paused": False,
+            "bing_pause_reason": None,
         }
 
     async def asset_stats(self, _start: str | None = None) -> dict[str, int]:
@@ -448,6 +448,40 @@ async def test_status_command_reports_empty_digest_history(make_settings) -> Non
     assert "latest: No runs" in digest
     assert "pending: 0" in digest
     assert "window: not started" in digest
+
+
+async def test_status_command_reports_bing_gates_and_latest_run(make_settings) -> None:
+    class FakeBingService:
+        def block_reason(self, _state: dict[str, object]) -> str:
+            return "BING_HTML_ENABLED is false"
+
+    report = StatusReport(
+        discord_connected=True,
+        app_version="1.2.3",
+        app_env="test",
+        supabase=DependencyStatus.verified(),
+        storage=DependencyStatus.verified(),
+    )
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(report=report),
+        repository=FakeOperationalRepository(),
+    )
+    bot.bing_service = FakeBingService()
+    cog = PhaseFourCommands(bot)
+    interaction = FakeInteraction()
+
+    await PhaseFourCommands.status_command.callback(cog, interaction)
+
+    assert len(interaction.followup.messages) == 1
+    embed = interaction.followup.messages[0]["embed"]
+    fields = {field.name: field.value for field in embed.fields}
+    assert fields["Bing discovery"] == (
+        "Feature: disabled; access: not approved; state: disabled by feature flag; "
+        "pause reason: none; block: BING_HTML_ENABLED is false"
+    )
+    assert fields["Latest Bing run"] == "No runs"
+    assert fields["Last successful Bing discovery"] == "Never"
 
 
 async def test_status_command_survives_unavailable_digest_data(make_settings) -> None:

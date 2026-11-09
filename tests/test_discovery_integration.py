@@ -86,7 +86,7 @@ def command_bot(settings) -> SimpleNamespace:
         status_service=FakeStatusService(status_report()),
         repository=None,
         collector=None,
-        brave_service=None,
+        bing_service=None,
         is_ready=lambda: True,
     )
 
@@ -165,18 +165,18 @@ async def test_save_does_not_leak_internal_failure_details(make_settings) -> Non
 
 class StartRepository:
     def __init__(self) -> None:
-        self.state = {"collection_enabled": False, "brave_paused": True}
+        self.state = {"collection_enabled": False, "bing_paused": True}
         self.clear_calls = 0
 
     async def set_collection_enabled(self, enabled: bool) -> dict[str, Any]:
         self.state["collection_enabled"] = enabled
         return self.state
 
-    async def clear_brave_pause(self) -> None:
+    async def clear_bing_pause(self) -> None:
         self.clear_calls += 1
 
 
-async def test_start_does_not_clear_a_persisted_brave_pause(make_settings) -> None:
+async def test_start_does_not_clear_a_persisted_bing_pause(make_settings) -> None:
     bot = command_bot(make_settings(OWNER_DISCORD_ID="1"))
     repository = StartRepository()
     bot.repository = repository
@@ -186,7 +186,7 @@ async def test_start_does_not_clear_a_persisted_brave_pause(make_settings) -> No
     await PhaseFourCommands.start_collection.callback(cog, interaction)
 
     assert repository.state["collection_enabled"] is True
-    assert repository.state["brave_paused"] is True
+    assert repository.state["bing_paused"] is True
     assert repository.clear_calls == 0
 
 
@@ -194,10 +194,10 @@ class StatusRepository:
     def __init__(self) -> None:
         self.state = {
             "collection_enabled": True,
-            "brave_paused": True,
-            "brave_pause_reason": "http_403_access_denied",
+            "bing_paused": True,
+            "bing_pause_reason": "http_403_access_denied",
             "last_reddit_success_at": "2026-01-01T00:00:00+00:00",
-            "last_brave_success_at": "2026-01-02T00:00:00+00:00",
+            "last_bing_success_at": "2026-01-02T00:00:00+00:00",
         }
 
     async def get_runtime_state(self) -> dict[str, Any]:
@@ -206,8 +206,8 @@ class StatusRepository:
     async def latest_reddit_runs(self, _limit: int):
         return [{"outcome": "succeeded", "error_summary": None}]
 
-    async def latest_brave_runs(self, _limit: int):
-        return [{"outcome": "failed", "error_summary": "brave_access_restriction"}]
+    async def latest_bing_runs(self, _limit: int):
+        return [{"outcome": "failed", "error_summary": "bing_access_restriction"}]
 
     async def latest_crawl_runs(self, _limit: int):
         return [{"outcome": "partial", "error_summary": "rate_limited: 1"}]
@@ -238,28 +238,28 @@ class StatusRepository:
             "failed": 1,
             "oversize": 0,
             "last_digest_success_at": None,
-            "last_brave_success_at": self.state["last_brave_success_at"],
-            "brave_paused": True,
-            "brave_pause_reason": self.state["brave_pause_reason"],
+            "last_bing_success_at": self.state["last_bing_success_at"],
+            "bing_paused": True,
+            "bing_pause_reason": self.state["bing_pause_reason"],
         }
 
 
-class StatusBraveService:
+class StatusBingService:
     def block_reason(self, state: dict[str, Any]) -> str | None:
-        if state.get("brave_paused"):
-            return "Brave adapter persistently paused: http_403_access_denied"
+        if state.get("bing_paused"):
+            return "Bing adapter persistently paused: http_403_access_denied"
         return None
 
 
-async def test_status_reports_brave_pause_runs_and_queue_state(make_settings) -> None:
+async def test_status_reports_bing_pause_runs_and_queue_state(make_settings) -> None:
     settings = make_settings(
-        BRAVE_HTML_ENABLED="true",
-        BRAVE_HTML_ACCESS_APPROVED="true",
+        BING_HTML_ENABLED="true",
+        BING_HTML_ACCESS_APPROVED="true",
         OWNER_DISCORD_ID="1",
     )
     bot = command_bot(settings)
     bot.repository = StatusRepository()
-    bot.brave_service = StatusBraveService()
+    bot.bing_service = StatusBingService()
     bot.collector = SimpleNamespace(block_reason=None)
     cog = PhaseFourCommands(bot)
     interaction = FakeInteraction()
@@ -268,14 +268,14 @@ async def test_status_reports_brave_pause_runs_and_queue_state(make_settings) ->
 
     embed = interaction.followup.messages[0]["embed"]
     fields = {field.name: field.value for field in embed.fields}
-    assert "Brave discovery" in fields
-    assert "persistently paused" in fields["Brave discovery"]
-    assert "http_403_access_denied" in fields["Brave discovery"]
-    assert fields["Latest Brave run"].startswith("failed")
+    assert "Bing discovery" in fields
+    assert "persistently paused" in fields["Bing discovery"]
+    assert "http_403_access_denied" in fields["Bing discovery"]
+    assert fields["Latest Bing run"].startswith("failed")
     assert fields["Latest crawler run"].startswith("partial")
     assert fields["Queue / backlog"] == "12"
     assert fields["Dumpster"] == "4"
-    assert fields["Last successful Brave discovery"] == "2026-01-02T00:00:00+00:00"
+    assert fields["Last successful Bing discovery"] == "2026-01-02T00:00:00+00:00"
     assert "Schedule: 04:00 IST" in fields["Daily digest"]
     assert "latest: succeeded" in fields["Daily digest"]
     assert "pending: 1" in fields["Daily digest"]
@@ -283,10 +283,10 @@ async def test_status_reports_brave_pause_runs_and_queue_state(make_settings) ->
     assert "window: complete" in fields["Daily digest"]
 
 
-async def test_status_labels_disabled_brave_feature(make_settings) -> None:
+async def test_status_labels_disabled_bing_feature(make_settings) -> None:
     bot = command_bot(make_settings())
     bot.repository = StatusRepository()
-    bot.brave_service = StatusBraveService()
+    bot.bing_service = StatusBingService()
     bot.collector = SimpleNamespace(block_reason=None)
     cog = PhaseFourCommands(bot)
     interaction = FakeInteraction()
@@ -294,7 +294,7 @@ async def test_status_labels_disabled_brave_feature(make_settings) -> None:
     await PhaseFourCommands.status_command.callback(cog, interaction)
 
     fields = {field.name: field.value for field in interaction.followup.messages[0]["embed"].fields}
-    assert "state: disabled by feature flag" in fields["Brave discovery"]
+    assert "state: disabled by feature flag" in fields["Bing discovery"]
 
 
 class SetupRepository:
@@ -320,7 +320,7 @@ async def test_scheduler_registers_phase_five_jobs_with_required_intervals(
     make_settings,
 ) -> None:
     settings = make_settings(
-        BRAVE_SEARCH_INTERVAL_HOURS="8",
+        BING_SEARCH_INTERVAL_HOURS="8",
         CRAWL_BATCH_SIZE="25",
     )
     repository = SetupRepository()
@@ -337,18 +337,18 @@ async def test_scheduler_registers_phase_five_jobs_with_required_intervals(
         jobs = {job.id: job for job in bot.scheduler.get_jobs()}
         assert set(jobs) == {
             "reddit_collection_hourly",
-            "brave_discovery",
+            "bing_discovery",
             "crawl_processing",
             "daily_digest",
         }
-        assert jobs["brave_discovery"].trigger.interval.total_seconds() == 8 * 3600
+        assert jobs["bing_discovery"].trigger.interval.total_seconds() == 8 * 3600
         assert jobs["crawl_processing"].trigger.interval.total_seconds() == 300
         assert "hour='4'" in str(jobs["daily_digest"].trigger)
         assert "minute='0'" in str(jobs["daily_digest"].trigger)
         assert jobs["daily_digest"].coalesce is True
         assert jobs["daily_digest"].max_instances == 1
         assert bot.pipeline is not None
-        assert bot.brave_service is not None
+        assert bot.bing_service is not None
         assert bot.crawler is not None
         assert bot.web_save_service is not None
         assert bot.safe_http_client is not None
@@ -358,12 +358,12 @@ async def test_scheduler_registers_phase_five_jobs_with_required_intervals(
         await bot.close()
 
 
-class ScheduledBrave:
+class ScheduledBing:
     def __init__(self, order: list[str]) -> None:
         self.order = order
 
     async def run(self, *, scheduled: bool) -> None:
-        self.order.append(f"brave:{scheduled}")
+        self.order.append(f"bing:{scheduled}")
 
 
 class ScheduledCrawler:
@@ -375,23 +375,23 @@ class ScheduledCrawler:
         self.order.append(f"crawl:{scheduled}")
 
 
-async def test_brave_schedule_runs_discovery_then_the_crawler(make_settings) -> None:
+async def test_bing_schedule_runs_discovery_then_the_crawler(make_settings) -> None:
     bot = TifaBot(make_settings(), FakeStatusService(status_report()), sync_commands=False)
     order: list[str] = []
-    bot.brave_service = ScheduledBrave(order)
+    bot.bing_service = ScheduledBing(order)
     bot.crawler = ScheduledCrawler(order)
     try:
-        await bot._scheduled_brave_discovery()
+        await bot._scheduled_bing_discovery()
     finally:
         await bot.close()
 
-    assert order == ["crawler:created", "brave:True", "crawl:True"]
+    assert order == ["crawler:created", "bing:True", "crawl:True"]
 
 
 async def test_crawl_schedule_runs_only_the_crawler(make_settings) -> None:
     bot = TifaBot(make_settings(), FakeStatusService(status_report()), sync_commands=False)
     order: list[str] = []
-    bot.brave_service = ScheduledBrave(order)
+    bot.bing_service = ScheduledBing(order)
     bot.crawler = ScheduledCrawler(order)
     try:
         await bot._scheduled_crawl_processing()
@@ -433,20 +433,20 @@ def test_phase_five_crawler_defaults_are_locked_and_bounded() -> None:
     assert settings.crawl_read_timeout_seconds == 20.0
     assert settings.max_crawl_depth == 6
     assert settings.crawl_max_attempts == 3
-    assert settings.brave_html_enabled is False
-    assert settings.brave_html_access_approved is False
-    assert settings.brave_search_interval_hours == 8
-    assert settings.brave_search_max_pages_per_phrase == 2
-    assert settings.brave_search_phrases == settings.reddit_search_phrases
+    assert settings.bing_html_enabled is False
+    assert settings.bing_html_access_approved is False
+    assert settings.bing_search_interval_hours == 8
+    assert settings.bing_search_max_pages_per_phrase == 2
+    assert settings.bing_search_phrases == settings.reddit_search_phrases
 
 
 def test_phase_five_settings_are_independently_configurable() -> None:
     settings = Settings.from_env(
         {
-            "BRAVE_SEARCH_BASE_URL": "https://search.brave.com/search?source=web",
-            "BRAVE_SEARCH_INTERVAL_HOURS": "12",
-            "BRAVE_SEARCH_PHRASES": "Tifa|Tifa Lockhart cosplay",
-            "BRAVE_SEARCH_MAX_PAGES_PER_PHRASE": "3",
+            "BING_SEARCH_BASE_URL": "https://www.bing.com/search?source=web",
+            "BING_SEARCH_INTERVAL_HOURS": "12",
+            "BING_SEARCH_PHRASES": "Tifa|Tifa Lockhart cosplay",
+            "BING_SEARCH_MAX_PAGES_PER_PHRASE": "3",
             "MAX_URLS_PER_JOB": "100",
             "MAX_PAGES_PER_DOMAIN": "10",
             "CRAWL_BATCH_SIZE": "10",
@@ -454,10 +454,10 @@ def test_phase_five_settings_are_independently_configurable() -> None:
         load_env_file=False,
     )
 
-    assert settings.brave_search_base_url.endswith("?source=web")
-    assert settings.brave_search_interval_hours == 12
-    assert settings.brave_search_phrases == ("Tifa", "Tifa Lockhart cosplay")
-    assert settings.brave_search_max_pages_per_phrase == 3
+    assert settings.bing_search_base_url.endswith("?source=web")
+    assert settings.bing_search_interval_hours == 12
+    assert settings.bing_search_phrases == ("Tifa", "Tifa Lockhart cosplay")
+    assert settings.bing_search_max_pages_per_phrase == 3
     assert settings.max_urls_per_job == 100
     assert settings.max_pages_per_domain == 10
     assert settings.crawl_batch_size == 10
@@ -466,13 +466,13 @@ def test_phase_five_settings_are_independently_configurable() -> None:
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"BRAVE_SEARCH_PHRASES": ""},
-        {"BRAVE_SEARCH_INTERVAL_HOURS": "0"},
-        {"BRAVE_SEARCH_INTERVAL_HOURS": "169"},
-        {"BRAVE_SEARCH_MAX_PAGES_PER_PHRASE": "0"},
-        {"BRAVE_SEARCH_MAX_PAGES_PER_PHRASE": "11"},
-        {"BRAVE_SEARCH_BASE_URL": "http://search.brave.com/search"},
-        {"BRAVE_SEARCH_BASE_URL": "https://user:pass@search.brave.com/search"},
+        {"BING_SEARCH_PHRASES": ""},
+        {"BING_SEARCH_INTERVAL_HOURS": "0"},
+        {"BING_SEARCH_INTERVAL_HOURS": "169"},
+        {"BING_SEARCH_MAX_PAGES_PER_PHRASE": "0"},
+        {"BING_SEARCH_MAX_PAGES_PER_PHRASE": "11"},
+        {"BING_SEARCH_BASE_URL": "http://www.bing.com/search"},
+        {"BING_SEARCH_BASE_URL": "https://user:pass@www.bing.com/search"},
         {"MAX_PAGE_BYTES": "5000001"},
         {"MAX_CRAWL_DEPTH": "7"},
         {"MAX_URLS_PER_JOB": "301"},

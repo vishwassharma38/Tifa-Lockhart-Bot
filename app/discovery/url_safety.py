@@ -1,6 +1,6 @@
 """Deterministic URL normalization and public-destination enforcement.
 
-The crawler, Brave adapter and manual ``/save`` path all share this module.
+The crawler, Bing adapter and manual ``/save`` path all share this module.
 Normalization is deliberately separate from destination validation: a URL may
 be syntactically valid and still point at a private or internal address, so
 every fetch must validate the destination again, including after redirects.

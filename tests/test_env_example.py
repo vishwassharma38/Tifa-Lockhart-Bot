@@ -25,12 +25,12 @@ REQUIRED_KEYS = {
     "B2_APPLICATION_KEY",
     "REDDIT_ACCESS_APPROVED",
     "REDDIT_SEED_DISCOVERY_ENABLED",
-    "BRAVE_HTML_ENABLED",
-    "BRAVE_HTML_ACCESS_APPROVED",
-    "BRAVE_SEARCH_BASE_URL",
-    "BRAVE_SEARCH_INTERVAL_HOURS",
-    "BRAVE_SEARCH_PHRASES",
-    "BRAVE_SEARCH_MAX_PAGES_PER_PHRASE",
+    "BING_HTML_ENABLED",
+    "BING_HTML_ACCESS_APPROVED",
+    "BING_SEARCH_BASE_URL",
+    "BING_SEARCH_INTERVAL_HOURS",
+    "BING_SEARCH_PHRASES",
+    "BING_SEARCH_MAX_PAGES_PER_PHRASE",
     "MAX_PAGE_BYTES",
     "MAX_CRAWL_DEPTH",
     "MAX_URLS_PER_JOB",
@@ -79,15 +79,16 @@ def test_template_contains_only_placeholders_and_safe_defaults() -> None:
     assert values["B2_APPLICATION_KEY"] == ""
     assert values["REDDIT_ACCESS_APPROVED"] == "false"
     assert values["REDDIT_SEED_DISCOVERY_ENABLED"] == "true"
-    assert values["BRAVE_HTML_ENABLED"] == "false"
-    assert values["BRAVE_HTML_ACCESS_APPROVED"] == "false"
-    assert values["BRAVE_SEARCH_INTERVAL_HOURS"] == "8"
+    assert values["BING_HTML_ENABLED"] == "false"
+    assert values["BING_HTML_ACCESS_APPROVED"] == "false"
+    assert values["BING_SEARCH_BASE_URL"] == "https://www.bing.com/search"
+    assert values["BING_SEARCH_INTERVAL_HOURS"] == "8"
+    assert values["BING_SEARCH_MAX_PAGES_PER_PHRASE"] == "2"
     expected_phrases = (
-        "Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|"
-        "|Tifa Lockhart NSFW"
+        "Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|Tifa Lockhart NSFW"
     )
     assert values["REDDIT_SEARCH_PHRASES"] == expected_phrases
-    assert values["BRAVE_SEARCH_PHRASES"] == expected_phrases
+    assert values["BING_SEARCH_PHRASES"] == expected_phrases
     assert values["MAX_PAGE_BYTES"] == "5000000"
     assert values["MAX_CRAWL_DEPTH"] == "6"
     assert values["MAX_URLS_PER_JOB"] == "300"

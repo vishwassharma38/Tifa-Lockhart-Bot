@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from app.db.client import SupabaseDatabase
 from app.reddit.models import RedditCandidate
 
-_JOB_TYPES = ("reddit_collection", "brave_discovery", "crawl", "daily_digest")
+_JOB_TYPES = ("reddit_collection", "bing_discovery", "crawl", "daily_digest")
 _DIGEST_STATE_FIELDS = frozenset(
     {
         "last_window_start",
@@ -202,8 +202,8 @@ class MediaRepository:
             .execute()
         )
 
-    async def latest_brave_runs(self, limit: int = 1) -> list[dict[str, Any]]:
-        return await self.latest_jobs("brave_discovery", limit)
+    async def latest_bing_runs(self, limit: int = 1) -> list[dict[str, Any]]:
+        return await self.latest_jobs("bing_discovery", limit)
 
     async def latest_crawl_runs(self, limit: int = 1) -> list[dict[str, Any]]:
         return await self.latest_jobs("crawl", limit)
@@ -238,9 +238,9 @@ class MediaRepository:
             "failed": count_status("failed"),
             "oversize": count_status("oversize"),
             "last_digest_success_at": state.get("last_digest_success_at"),
-            "last_brave_success_at": state.get("last_brave_success_at"),
-            "brave_paused": bool(state.get("brave_paused")),
-            "brave_pause_reason": state.get("brave_pause_reason"),
+            "last_bing_success_at": state.get("last_bing_success_at"),
+            "bing_paused": bool(state.get("bing_paused")),
+            "bing_pause_reason": state.get("bing_pause_reason"),
         }
 
     async def mark_reddit_success(self) -> None:
@@ -251,40 +251,40 @@ class MediaRepository:
             {"last_reddit_success_at": datetime.now(tz=UTC).isoformat()}
         ).eq("id", 1).execute()
 
-    async def mark_brave_success(self) -> None:
-        await self._to_thread(self._mark_brave_success_sync)
+    async def mark_bing_success(self) -> None:
+        await self._to_thread(self._mark_bing_success_sync)
 
-    def _mark_brave_success_sync(self) -> None:
+    def _mark_bing_success_sync(self) -> None:
         self._client().table("runtime_state").update(
-            {"last_brave_success_at": datetime.now(tz=UTC).isoformat()}
+            {"last_bing_success_at": datetime.now(tz=UTC).isoformat()}
         ).eq("id", 1).execute()
 
-    async def pause_brave(self, reason: str) -> None:
-        await self._to_thread(self._pause_brave_sync, reason)
+    async def pause_bing(self, reason: str) -> None:
+        await self._to_thread(self._pause_bing_sync, reason)
 
-    def _pause_brave_sync(self, reason: str) -> None:
+    def _pause_bing_sync(self, reason: str) -> None:
         self._client().table("runtime_state").update(
             {
-                "brave_paused": True,
-                "brave_pause_reason": reason[:500],
-                "brave_paused_at": datetime.now(tz=UTC).isoformat(),
+                "bing_paused": True,
+                "bing_pause_reason": reason[:500],
+                "bing_paused_at": datetime.now(tz=UTC).isoformat(),
             }
         ).eq("id", 1).execute()
 
-    async def clear_brave_pause(self) -> None:
+    async def clear_bing_pause(self) -> None:
         """Clear the persisted pause after an owner reviews the restriction.
 
         No Discord command calls this. It exists for a deliberate operator
         action and never runs automatically on startup or from ``/start``.
         """
-        await self._to_thread(self._clear_brave_pause_sync)
+        await self._to_thread(self._clear_bing_pause_sync)
 
-    def _clear_brave_pause_sync(self) -> None:
+    def _clear_bing_pause_sync(self) -> None:
         self._client().table("runtime_state").update(
             {
-                "brave_paused": False,
-                "brave_pause_reason": None,
-                "brave_paused_at": None,
+                "bing_paused": False,
+                "bing_pause_reason": None,
+                "bing_paused_at": None,
             }
         ).eq("id", 1).execute()
 

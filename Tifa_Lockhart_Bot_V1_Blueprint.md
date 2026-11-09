@@ -42,7 +42,7 @@ The following decisions define the initial release and should not be re-opened d
 | Language                     | Python 3.11.8                                                                                                                     |
 | Discord integration          | `discord.py` 2.x, application/slash commands                                                                                     |
 | Primary social source        | Reddit, through a modular PRAW connector                                                                                         |
-| Web discovery                | Brave Search public HTML pages, parsed without using the Brave Search API, subject to applicable access rules and terms          |
+| Web discovery                | Bing Search public HTML pages, parsed without using the retired Bing Search API, subject to applicable access rules and terms     |
 | External web crawling        | Controlled link discovery, inspection, and direct media acquisition from eligible public pages                                   |
 | Maximum crawl depth          | 6 levels, with seed URLs at depth 0                                                                                              |
 | Media delivery               | Upload the actual media file to Discord; do not rely on remote preview embeds                                                    |
@@ -54,7 +54,7 @@ The following decisions define the initial release and should not be re-opened d
 | Binary media storage         | Backblaze B2, private bucket, S3-compatible access                                                                              |
 | Uncertain discoveries        | The Dumpster, represented as a staging status in the database                                                                    |
 | Platform collection schedule | Approximately hourly                                                                                                             |
-| Brave discovery schedule     | Every 8 hours (inside the agreed 6–12-hour range)                                                                                |
+| Bing discovery schedule      | Every 8 hours (inside the agreed 6–12-hour range)                                                                                |
 | Daily digest                 | Every day at 4:00 AM Asia/Kolkata (IST)                                                                                          |
 | Discord channels             | Minimal: `#tifa-discoveries` and `#saves`; category-specific destinations are optional configuration, not required channels      |
 | Discord controls             | `/start`, `/stop`, `/save`, `/random`, `/status`, `/stats`, `/about`                                                             |
@@ -78,7 +78,7 @@ Some values were deliberately left configurable in the planning document. V1 now
 | Network timeout                                   |        10 seconds to connect; 20 seconds to read |
 | Retry attempts                                    | 3 total attempts for eligible transient failures |
 | Reddit candidates examined per hourly run         |           100 maximum across configured searches |
-| Brave HTML discovery interval                     |                                    Every 8 hours |
+| Bing HTML discovery interval                      |                                    Every 8 hours |
 | Digest delivery time                              |                            04:00, `Asia/Kolkata` |
 
 These are configuration defaults, not permission to exceed a site's own limits. A stricter site limit, `Retry-After`, robots directive, access denial, or applicable policy always takes precedence.
@@ -88,7 +88,7 @@ These are configuration defaults, not permission to exceed a site's own limits. 
 ### Included in V1
 
 1. Reddit discovery through the PRAW connector, using broad searches rather than a single hard-coded subreddit.
-2. Brave Search HTML result-page discovery without using the Brave Search API.
+2. Bing Search HTML result-page discovery without using the retired Bing Search API.
 3. Recursive, depth-limited link discovery across eligible public websites.
 4. URL normalization, duplicate detection, domain budgets, request throttling, retry handling, SSRF protection, and provenance tracking.
 5. Relevance classification using available post/page metadata and text.
@@ -100,7 +100,7 @@ These are configuration defaults, not permission to exceed a site's own limits. 
 11. Discord media-file delivery with creator and source attribution.
 12. Manual URL saving through `/save`.
 13. Random archive retrieval, status, statistics, and project information commands.
-14. Hourly Reddit collection, 8-hour Brave discovery, and the 4:00 AM IST digest.
+14. Hourly Reddit collection, 8-hour Bing discovery, and the 4:00 AM IST digest.
 15. Render deployment, HTTP health endpoint, UptimeRobot monitoring, logging, and restart recovery.
 
 ### Explicitly excluded from V1
@@ -122,7 +122,7 @@ The collector must operate independently of Discord command handling wherever pr
 ```mermaid
 flowchart TD
     A[Reddit / PRAW] --> D[Source Normalizer]
-    B[Brave Search HTML] --> E[Discovery Queue]
+    B[Bing Search HTML] --> E[Discovery Queue]
     C[Configured seed URLs] --> E
     D --> F[Candidate and URL Pipeline]
     E --> F
@@ -152,7 +152,7 @@ flowchart TD
 | Component                 | Responsibility                                                                                                            |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | Reddit connector          | Search Reddit broadly, inspect submissions, extract available post and creator metadata, and locate original media assets |
-| Brave discovery adapter   | Fetch public Brave Search result HTML at a conservative interval and extract candidate external URLs                      |
+| Bing discovery adapter     | Fetch public Bing Search result HTML at a conservative interval and extract candidate external URLs                      |
 | Discovery queue           | Store candidate URLs, queue state, depth, parent, source, and retry information                                           |
 | Safe crawler              | Inspect eligible public pages, extract links, enforce domain and request budgets, and stop restricted traversal paths     |
 | Relevance classifier      | Classify candidates as verified, uncertain, or irrelevant using text and metadata signals                                 |
@@ -164,7 +164,7 @@ flowchart TD
 | Repository/database layer | Persist discoveries, media records, source provenance, job runs, and publications in Supabase                             |
 | Discord publisher         | Upload actual files, attach attribution, route by category, and track publication status                                  |
 | Discord command layer     | Expose the V1 command set and invoke application services                                                                 |
-| Scheduler                 | Run hourly, 8-hour, and daily jobs in the configured timezone                                                             |
+| Scheduler                 | Run hourly, 8-hour Bing, and daily jobs in the configured timezone                                                        |
 | Health server             | Expose a minimal HTTP endpoint for Render and UptimeRobot                                                                 |
 
 ### 4.2 Runtime architecture
@@ -192,7 +192,7 @@ Initial configurable search phrases:
 - `Tifa Lockhart fanart`
 - `Tifa cosplay`
 - `Tifa Lockhart cosplay`
-- `Tifa Final Fantasy VII`
+- `Tifa Lockhart NSFW`
 
 For the recurring collection job:
 
@@ -207,22 +207,22 @@ The existing Python/PRAW downloader is a starting point for the connector. Reuse
 
 **Access gate:** the implementation may include the PRAW connector, configuration, and tests, but production data access must use credentials and access that are actually authorized under the platform's current requirements. Do not disguise the use case, evade access limits, or treat a successful test request as proof of permission. If authorization is not available, disable the Reddit collection job and report the condition in `/status` and logs rather than attempting a workaround.
 
-### 5.2 Brave Search — web discovery
+### 5.2 Bing Search — web discovery
 
-Brave Search is used to discover candidate external URLs, not as a media host and not as a substitute for permission to access a result's destination site.
+Bing Search public HTML result pages are used to discover candidate external URLs, not as a media host and not as a substitute for permission to access a result's destination site.
 
-V1 will use HTML parsing of public Brave Search result pages without calling the Brave Search API, as decided. The adapter should:
+V1 uses HTML parsing of public Bing Search result pages at `https://www.bing.com/search` without calling the retired Bing Search API, Azure service, or an API key. The adapter should:
 
-1. Run the configured search phrases every 8 hours.
-2. Fetch only the number of result pages needed for the 300-URL job budget.
-3. Parse result titles, snippets, and destination URLs from the returned HTML.
+1. Run the configured search phrases every 8 hours while both explicit access gates are true.
+2. Fetch only the number of result pages needed for the 300-URL job budget, up to `BING_SEARCH_MAX_PAGES_PER_PHRASE`.
+3. Parse organic result containers, decode Bing click-through links to their real destinations, and extract result titles and snippets.
 4. Normalize and deduplicate destinations before queueing them.
-5. Retain the query and result-page URL as discovery provenance.
-6. Discard search-page navigation, advertisements, and non-destination links.
+5. Retain the query, result-page URL, and `discovered_via: bing_html` provenance.
+6. Discard search-page navigation, advertisements, undecodable tracking links, and non-destination links.
 
-The HTML parser must be isolated behind a `BraveSearchAdapter` interface because result-page markup can change. Parser failures should create a job error and alert through logs/status; they must not cause aggressive retries.
+The HTML parser and click-target decoding must be isolated behind a `BingSearchAdapter` interface because result-page markup can change. Parser failures should create a job error and alert through logs/status; they must not cause aggressive retries.
 
-**Important operating condition:** using HTML rather than an API does not itself establish permission to automate access. Before enabling the live scraper, confirm that the intended access complies with Brave's current Terms of Use and any applicable access restrictions. Keep requests conservative. If Brave returns a CAPTCHA, proof-of-work challenge, access denial, 403, or other anti-automation barrier, stop that discovery run and disable or pause the adapter for review. Do not solve challenges automatically, spoof browser fingerprints, rotate identities/IPs to evade controls, or otherwise bypass a restriction. If the method is not permitted or becomes blocked, the Brave adapter must remain disabled until an allowed discovery method is selected.
+**Important operating condition:** using HTML rather than an API does not itself establish permission to automate access. Before enabling the live scraper, confirm that the intended access complies with Bing's current Terms of Use, `robots.txt`, and any applicable access restrictions. Keep requests conservative. If Bing returns a CAPTCHA, proof-of-work challenge, access denial, HTTP 401, 403, or 429, or another anti-automation barrier, stop that discovery run and persistently pause the adapter for review. Do not solve challenges automatically, spoof browser fingerprints, rotate identities/IPs to evade controls, or otherwise bypass a restriction. If the method is not permitted or becomes blocked, the Bing adapter must remain disabled until an allowed discovery method is selected.
 
 ### 5.3 External website inspection
 
@@ -307,7 +307,7 @@ The same validation applies to user-supplied URLs passed to `/save`.
 Every queued or fetched discovery must preserve:
 
 - Original discovered URL and normalized URL.
-- Discovery method (`reddit`, `brave_html`, `seed`, or `manual_save`).
+- Discovery method (`reddit`, `bing_html`, `web_legacy`, `seed`, or `manual_save`).
 - Search phrase or source record that produced it, where applicable.
 - Parent discovery ID and parent URL.
 - Crawl depth.
@@ -496,7 +496,7 @@ One record per normalized URL/page or source candidate.
 | `id`                                         | Internal UUID                                                                                                |
 | `url`                                        | Original URL                                                                                                 |
 | `normalized_url`                             | Deduplication key; unique where applicable                                                                   |
-| `source_type`                                | `reddit`, `brave_html`, `seed`, or `manual_save`                                                             |
+| `source_type`                                | `reddit`, `bing_html`, `web_legacy`, `seed`, or `manual_save`                                                |
 | `source_platform_id`                         | Reddit post ID or other native ID when available                                                             |
 | `title`, `description`                       | Extracted text metadata                                                                                      |
 | `creator_name`, `creator_profile_url`        | Attribution metadata when available                                                                          |
@@ -573,7 +573,7 @@ Use idempotency/unique constraints for a media item, destination channel, and au
 
 Record each scheduled or manually triggered job:
 
-- Job type (`reddit_collection`, `brave_discovery`, `crawl`, `daily_digest`, or `manual_save`).
+- Job type (`reddit_collection`, `bing_discovery`, `crawl`, `daily_digest`, or `manual_save`).
 - Start/end time, outcome, counts processed, counts stored, counts skipped, and error summary.
 - Job configuration snapshot or key parameters.
 
@@ -587,7 +587,8 @@ Persist the last successful digest window/cursor and its completion time. A dige
 
 ### 10.4 Database integrity and migrations
 
-- Put SQL migrations under `migrations/` and apply them in order.
+- Put SQL migrations under `migrations/` and apply them in order. Earlier migrations are immutable.
+- Migration `012_bing_search_provider.sql` adds Bing pause/success state, converts historical search-provider discoveries to the provider-neutral `web_legacy` source type, admits `bing_html` discoveries and `bing_discovery` job runs, and drops the retired provider's pause columns without transferring that state. Historical discovery metadata and job rows are preserved.
 - Enforce SHA-256 uniqueness in PostgreSQL, not only in Python.
 - Use foreign keys for discoveries, media items, sources, and publications.
 - Use indexes for normalized URL, SHA-256, status, category, discovered/downloaded timestamps, and publication status.
@@ -655,7 +656,7 @@ All commands are Discord application/slash commands. Commands operate only in th
 | `/stop`   | None                                     | Sets the persistent collection-enabled flag to false. Pauses automated source collection and discovery. It does not disconnect the bot. Already stored items may still be delivered by the daily digest; manual `/save`, `/random`, `/status`, `/stats`, and `/about` remain available. |
 | `/save`   | `url` (required)                         | Acquires a supported public media URL/post and publishes the actual file to `#saves` immediately.                                                                                                                                                                                       |
 | `/random` | None                                     | Selects one random verified archived asset, retrieves its file from B2, and sends it with attribution in the command channel.                                                                                                                                                           |
-| `/status` | None                                     | Shows Discord connection state, collection enabled/paused state, last successful Reddit and Brave runs, last digest, current backlog, and latest job error if any.                                                                                                                      |
+| `/status` | None                                     | Shows Discord connection state, collection enabled/paused state, last successful Reddit and Bing runs, last digest, current backlog, and latest job error if any.                                                                                                                       |
 | `/stats`  | `period`: `week`, `month`, or `lifetime` | Shows total unique archived assets and total successful media delivery events for the selected period; show image/video breakdown where metadata permits.                                                                                                                               |
 | `/about`  | None                                     | Shows bot name, purpose, V1 version, developer (`SoftwareFromVish`), and configured developer/contact/project links. Do not invent unavailable contact information.                                                                                                                     |
 
@@ -682,7 +683,7 @@ Use APScheduler's asyncio scheduler with timezone `Asia/Kolkata`. Jobs must have
 | Job               | Schedule                                                    | Work                                                                                                                             |
 | ----------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | Reddit collection | Every 1 hour                                                | Search configured terms, inspect up to 100 candidates total, enqueue/process submissions                                         |
-| Brave discovery   | Every 8 hours                                               | Parse public Brave result pages for configured terms and enqueue candidate URLs, only while the adapter is enabled and permitted |
+| Bing discovery    | Every 8 hours                                               | Parse public Bing result pages for configured terms and enqueue candidate URLs, only while the adapter is enabled and permitted |
 | Crawl processing  | Runs after discovery and/or on a short internal queue cycle | Process queued URLs within the budgets and depth limit                                                                           |
 | Daily digest      | Every day at 04:00 IST                                      | Publish verified, not-yet-published assets to the configured Discord destinations                                                |
 | Health endpoint   | Always available                                            | Return process health; independent of collection enabled/paused state                                                            |
@@ -733,9 +734,9 @@ tifa-lockhart-bot/
 │   │   └── publisher.py        # Discord file publishing
 │   ├── connectors/
 │   │   ├── base.py             # Connector interfaces and normalized records
-│   │   ├── reddit.py           # PRAW Reddit connector
-│   │   └── brave_html.py       # Brave public HTML parser
+│   │   └── reddit.py           # PRAW Reddit connector
 │   ├── discovery/
+│   │   ├── bing.py             # Bing public-HTML parser, adapter, and discovery service
 │   │   ├── queue.py            # Discovery queue operations
 │   │   ├── crawler.py          # Safe, budgeted page crawler
 │   │   ├── url_safety.py       # URL validation and SSRF protection
@@ -810,12 +811,17 @@ REDDIT_CLIENT_SECRET=
 REDDIT_USER_AGENT=
 REDDIT_ACCESS_APPROVED=false
 REDDIT_ENABLED=true
+REDDIT_SEED_DISCOVERY_ENABLED=true
 REDDIT_MAX_ITEMS_PER_RUN=100
+REDDIT_SEARCH_PHRASES=Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|Tifa Lockhart NSFW
 
-# Brave HTML discovery
-BRAVE_HTML_ENABLED=false
-BRAVE_SEARCH_BASE_URL=https://search.brave.com/search
-BRAVE_SEARCH_INTERVAL_HOURS=8
+# Bing HTML discovery
+BING_HTML_ENABLED=false
+BING_HTML_ACCESS_APPROVED=false
+BING_SEARCH_BASE_URL=https://www.bing.com/search
+BING_SEARCH_INTERVAL_HOURS=8
+BING_SEARCH_PHRASES=Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|Tifa Lockhart NSFW
+BING_SEARCH_MAX_PAGES_PER_PHRASE=2
 
 # Supabase
 SUPABASE_URL=
@@ -839,7 +845,7 @@ PER_DOMAIN_DELAY_SECONDS=2
 MAX_REDIRECTS=5
 ```
 
-`BRAVE_HTML_ENABLED` defaults to false until the operator has confirmed that the specific automated HTML access method is permitted and configured. `REDDIT_ACCESS_APPROVED` is an explicit deployment gate; do not set it true until the required permission is actually in place. Secrets should be supplied through Render's environment-variable settings in deployment, not baked into the repository or image.
+`BING_HTML_ENABLED` and `BING_HTML_ACCESS_APPROVED` default to false until the operator has confirmed that the specific automated HTML access method is permitted and configured. On an existing deployment, remove the previous search provider's variables from Render and any local `.env` file, then add the `BING_*` settings; the application reads only these names and does not support legacy aliases. `REDDIT_ACCESS_APPROVED` is an explicit deployment gate; do not set it true until the required permission is actually in place. Secrets should be supplied through Render's environment-variable settings in deployment, not baked into the repository or image.
 
 The sample values above describe configuration names and safe defaults; actual tokens, IDs, URLs, and contact links must be supplied by the project owner.
 
@@ -857,7 +863,7 @@ Implement:
 
 - `GET /healthz` — returns HTTP 200 with a small response when the process and event loop are alive.
 
-The health endpoint should not require a Discord token or reveal secrets, channel IDs, environment variables, database credentials, or internal exception details. It should be lightweight and should not fail merely because Reddit or Brave is temporarily unavailable. Detailed dependency and collection state belongs in `/status` and internal logs.
+The health endpoint should not require a Discord token or reveal secrets, channel IDs, environment variables, database credentials, or internal exception details. It should be lightweight and should not fail merely because Reddit or Bing is temporarily unavailable. Detailed dependency and collection state belongs in `/status` and internal logs.
 
 Configure Render's health-check path as `/healthz` where available. Configure UptimeRobot as an HTTP/HTTPS monitor for the public Render health URL.
 
@@ -882,8 +888,8 @@ Keep the bot and scheduler in the same Render service for V1. A separate worker 
 
 Every source and every media item must fail independently wherever possible:
 
-- A Reddit API error does not stop Brave discovery.
-- A Brave parser failure does not stop Reddit collection.
+- A Reddit API error does not stop Bing discovery.
+- A Bing parser failure does not stop Reddit collection.
 - A 401/403 page abandons only its traversal path.
 - An oversized file does not abort its parent job.
 - A failed B2 upload leaves the database record recoverable and must not be marked stored.
@@ -911,7 +917,7 @@ Never log access tokens, service-role keys, signed URLs containing secrets, or f
 - Discord connection state.
 - Whether scheduled collection is enabled or paused.
 - Reddit connector state and latest successful run.
-- Brave adapter enabled/disabled state and latest successful run.
+- Bing adapter enabled/disabled state and latest successful run.
 - Last successful digest time.
 - Queue backlog count.
 - Number of Dumpster candidates awaiting review.
@@ -972,15 +978,15 @@ Build one end-to-end vertical slice first, then add discovery breadth. The purpo
 
 **Exit condition:** hourly collection can run, stop, resume, survive restart, and expose accurate command/status information.
 
-### Phase 5 — Brave discovery and controlled crawler
+### Phase 5 — Bing discovery and controlled crawler
 
-- Implement the Brave HTML adapter behind a feature flag.
+- Implement the Bing public-HTML adapter behind two explicit feature/approval gates.
 - Confirm the planned HTML access method is permitted before enabling it.
 - Add URL normalization, SSRF protection, link extraction, and discovery queue.
 - Implement all crawl budgets, depth tracking, status handling, and per-domain throttling.
 - Add text/metadata relevance classification and The Dumpster.
 
-**Exit condition:** a permitted Brave result can lead to a bounded chain of eligible public pages, with provenance and correct handling of 401/403, 429, 5xx, blocked paths, and uncertain results.
+**Exit condition:** a permitted Bing result can lead to a bounded chain of eligible public pages, with provenance and correct handling of 401/403, 429, 5xx, blocked paths, and uncertain results.
 
 ### Phase 6 — Digest and publication reliability
 
@@ -1026,7 +1032,7 @@ V1 is ready for release only when all applicable checks below pass.
 
 ### Discovery and crawler
 
-- [ ] Brave HTML access is behind a feature flag and enabled only after the access method is confirmed permissible.
+- [ ] Bing HTML access is behind two explicit gates and enabled only after the access method is confirmed permissible.
 - [ ] URL normalization and duplicate detection work.
 - [ ] Depth never exceeds 6.
 - [ ] URL, domain, concurrency, response-size, redirect, timeout, and per-domain delay budgets are enforced.
@@ -1068,7 +1074,7 @@ V1 is ready for release only when all applicable checks below pass.
 When deployed and enabled, Tifa Lockhart Bot operates as follows:
 
 1. The hourly Reddit job searches broadly for Tifa-related submissions and sends eligible candidates into the common pipeline.
-2. Every 8 hours, the Brave discovery adapter searches configured Tifa-related phrases using the approved public HTML access method and adds new external URLs to the discovery queue.
+2. Every 8 hours, the Bing discovery adapter searches configured Tifa-related phrases using the approved public HTML access method and adds new external URLs to the discovery queue.
 3. The crawler inspects eligible public pages and follows relevant outbound links up to six levels, while enforcing all URL, domain, timing, response, concurrency, and safety limits.
 4. The relevance classifier sends strong matches to verification, uncertain findings to The Dumpster, and irrelevant candidates to rejection.
 5. The media pipeline locates original supported files, validates their true format and size, computes hashes, and skips files above 10 MB.
@@ -1079,7 +1085,7 @@ When deployed and enabled, Tifa Lockhart Bot operates as follows:
 10. `/random`, `/status`, `/stats`, and `/about` provide archive retrieval and visibility; `/start` and `/stop` control automatic collection without disconnecting the bot.
 11. If Render restarts, the bot restores its persistent runtime setting, queued discoveries, and publication state from Supabase and resumes safely.
 
-**The V1 deliverable is a working, restart-safe personal Tifa media archive with Reddit collection, controlled Brave-based web discovery, original-file acquisition, provenance-aware storage, and scheduled Discord delivery.**
+**The V1 deliverable is a working, restart-safe personal Tifa media archive with Reddit collection, controlled Bing-based web discovery, original-file acquisition, provenance-aware storage, and scheduled Discord delivery.**
 
 ---
 
@@ -1091,6 +1097,6 @@ These links are included for deployment and access-policy verification. Review t
 - [Render — Web services and port binding](https://render.com/docs/web-services)
 - [UptimeRobot — Monitoring interval](https://help.uptimerobot.com/en/articles/11360876-what-is-a-monitoring-interval-in-uptimerobot)
 - [Reddit — Responsible Builder Policy](https://mods.reddithelp.com/hc/en-us/articles/16693988535309-Moderation-Bots-Tooling)
-- [Brave — Terms of Use](https://brave.com/terms-of-use/)
+- [Microsoft — Bing Terms of Use](https://www.bing.com/new/termsofuse)
 
 **End of Version 1 blueprint.**

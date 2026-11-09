@@ -166,17 +166,17 @@ class Settings:
     reddit_client_secret: str
     reddit_user_agent: str
     reddit_access_approved: bool
-    brave_html_enabled: bool
+    bing_html_enabled: bool
     perceptual_hash_enabled: bool
     reddit_enabled: bool = True
     reddit_seed_discovery_enabled: bool = True
     reddit_max_items_per_run: int = 100
     reddit_search_phrases: tuple[str, ...] = _DEFAULT_SEARCH_PHRASES
-    brave_html_access_approved: bool = False
-    brave_search_base_url: str = "https://search.brave.com/search"
-    brave_search_interval_hours: int = 8
-    brave_search_phrases: tuple[str, ...] = _DEFAULT_SEARCH_PHRASES
-    brave_search_max_pages_per_phrase: int = 2
+    bing_html_access_approved: bool = False
+    bing_search_base_url: str = "https://www.bing.com/search"
+    bing_search_interval_hours: int = 8
+    bing_search_phrases: tuple[str, ...] = _DEFAULT_SEARCH_PHRASES
+    bing_search_max_pages_per_phrase: int = 2
     max_page_bytes: int = 5_000_000
     max_crawl_depth: int = 6
     max_urls_per_job: int = 300
@@ -242,24 +242,20 @@ class Settings:
                 ).split("|")
                 if x.strip()
             ),
-            brave_html_enabled=_parse_bool(env, "BRAVE_HTML_ENABLED"),
-            brave_html_access_approved=_parse_bool(env, "BRAVE_HTML_ACCESS_APPROVED"),
-            brave_search_base_url=_read(
-                env, "BRAVE_SEARCH_BASE_URL", "https://search.brave.com/search"
-            ),
-            brave_search_interval_hours=_parse_int(env, "BRAVE_SEARCH_INTERVAL_HOURS", 8),
-            brave_search_phrases=tuple(
+            bing_html_enabled=_parse_bool(env, "BING_HTML_ENABLED"),
+            bing_html_access_approved=_parse_bool(env, "BING_HTML_ACCESS_APPROVED"),
+            bing_search_base_url=_read(env, "BING_SEARCH_BASE_URL", "https://www.bing.com/search"),
+            bing_search_interval_hours=_parse_int(env, "BING_SEARCH_INTERVAL_HOURS", 8),
+            bing_search_phrases=tuple(
                 x.strip()
                 for x in _read(
                     env,
-                    "BRAVE_SEARCH_PHRASES",
+                    "BING_SEARCH_PHRASES",
                     "Tifa Lockhart|Tifa Lockhart fanart|Tifa cosplay|Tifa Lockhart cosplay|Tifa Lockhart NSFW",
                 ).split("|")
                 if x.strip()
             ),
-            brave_search_max_pages_per_phrase=_parse_int(
-                env, "BRAVE_SEARCH_MAX_PAGES_PER_PHRASE", 2
-            ),
+            bing_search_max_pages_per_phrase=_parse_int(env, "BING_SEARCH_MAX_PAGES_PER_PHRASE", 2),
             max_page_bytes=_parse_int(env, "MAX_PAGE_BYTES", 5_000_000),
             max_crawl_depth=_parse_int(env, "MAX_CRAWL_DEPTH", 6),
             max_urls_per_job=_parse_int(env, "MAX_URLS_PER_JOB", 300),
@@ -340,24 +336,24 @@ class Settings:
         except (ZoneInfoNotFoundError, ValueError):
             errors.append("TIMEZONE must be a valid IANA timezone")
 
-        if not self.brave_search_phrases:
-            errors.append("BRAVE_SEARCH_PHRASES must contain at least one phrase")
-        if any(len(phrase) > 200 for phrase in self.brave_search_phrases):
-            errors.append("BRAVE_SEARCH_PHRASES phrases must be 200 characters or fewer")
-        if not 1 <= self.brave_search_interval_hours <= 168:
-            errors.append("BRAVE_SEARCH_INTERVAL_HOURS must be between 1 and 168")
-        if not 1 <= self.brave_search_max_pages_per_phrase <= 10:
-            errors.append("BRAVE_SEARCH_MAX_PAGES_PER_PHRASE must be between 1 and 10")
-        parsed_brave = urlparse(self.brave_search_base_url)
+        if not self.bing_search_phrases:
+            errors.append("BING_SEARCH_PHRASES must contain at least one phrase")
+        if any(len(phrase) > 200 for phrase in self.bing_search_phrases):
+            errors.append("BING_SEARCH_PHRASES phrases must be 200 characters or fewer")
+        if not 1 <= self.bing_search_interval_hours <= 168:
+            errors.append("BING_SEARCH_INTERVAL_HOURS must be between 1 and 168")
+        if not 1 <= self.bing_search_max_pages_per_phrase <= 10:
+            errors.append("BING_SEARCH_MAX_PAGES_PER_PHRASE must be between 1 and 10")
+        parsed_bing = urlparse(self.bing_search_base_url)
         if (
-            parsed_brave.scheme != "https"
-            or not parsed_brave.netloc
-            or parsed_brave.username is not None
-            or parsed_brave.password is not None
-            or parsed_brave.fragment
+            parsed_bing.scheme != "https"
+            or not parsed_bing.netloc
+            or parsed_bing.username is not None
+            or parsed_bing.password is not None
+            or parsed_bing.fragment
         ):
             errors.append(
-                "BRAVE_SEARCH_BASE_URL must be a valid https URL without credentials or a fragment"
+                "BING_SEARCH_BASE_URL must be a valid https URL without credentials or a fragment"
             )
         if not 1 <= self.max_page_bytes <= 5_000_000:
             errors.append("MAX_PAGE_BYTES must be between 1 and 5000000")

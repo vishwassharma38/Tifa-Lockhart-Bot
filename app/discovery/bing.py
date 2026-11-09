@@ -1,8 +1,10 @@
-"""Isolated Brave Search HTML parser and gated discovery service."""
+"""Isolated Bing public-HTML parser and gated discovery service."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import logging
 from collections import Counter
@@ -10,7 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
@@ -29,19 +31,13 @@ from app.discovery.url_safety import UrlSafetyError, normalize_url
 
 log = logging.getLogger(__name__)
 
-_BRAVE_INTERNAL_HOSTS = frozenset({"search.brave.com", "brave.com", "www.brave.com"})
-_BRAVE_INTERNAL_PREFIXES = (
-    "/search",
-    "/settings",
-    "/preferences",
-    "/account",
-    "/help",
-    "/about",
-)
+_BING_INTERNAL_HOSTS = frozenset({"bing.com", "www.bing.com", "bing.net", "www.bing.net"})
 _NO_RESULTS_MARKERS = (
     "no results found",
     "no results",
+    "there are no results",
     "we couldn't find any results",
+    "we did not find any results",
     "did not match any documents",
 )
 _ACCESS_DENIAL_MARKERS = (
@@ -56,11 +52,11 @@ _ACCESS_DENIAL_MARKERS = (
 )
 
 
-class BraveParseError(ValueError):
-    """Raised when Brave result markup cannot be identified safely."""
+class BingParseError(ValueError):
+    """Raised when Bing result markup cannot be identified safely."""
 
 
-class BraveBarrierError(RuntimeError):
+class BingBarrierError(RuntimeError):
     """Raised for a challenge or explicit access restriction."""
 
     def __init__(self, reason: str) -> None:
@@ -68,7 +64,7 @@ class BraveBarrierError(RuntimeError):
         self.reason = reason
 
 
-class BraveRequestError(RuntimeError):
+class BingRequestError(RuntimeError):
     """Raised for an ordinary transport or HTTP failure."""
 
     def __init__(self, reason: str) -> None:
@@ -76,12 +72,12 @@ class BraveRequestError(RuntimeError):
         self.reason = reason
 
 
-class BraveAccessNotApprovedError(RuntimeError):
-    """Raised when either explicit Brave access gate is closed."""
+class BingAccessNotApprovedError(RuntimeError):
+    """Raised when either explicit Bing access gate is closed."""
 
 
 @dataclass(frozen=True, slots=True)
-class BraveResult:
+class BingResult:
     title: str
     snippet: str
     url: str
@@ -96,15 +92,15 @@ class BraveResult:
             "search_result_snippet": self.snippet,
             "search_result_page_url": self.result_page_url,
             "search_result_url": self.original_url,
-            "discovered_via": "brave_html",
+            "discovered_via": "bing_html",
         }
 
 
 @dataclass(frozen=True, slots=True)
-class BraveSearchPage:
+class BingSearchPage:
     phrase: str
     page_url: str
-    results: tuple[BraveResult, ...] = field(default_factory=tuple)
+    results: tuple[BingResult, ...] = field(default_factory=tuple)
 
 
 def _clean(value: str | None, limit: int = 2_000) -> str:
@@ -122,17 +118,26 @@ def _is_ad_container(container: Any) -> bool:
         tokens = {part.lower() for part in classes.split()}
     else:
         tokens = {str(part).lower() for part in classes}
+    if any(token.startswith(("b_ad", "b_ads")) for token in tokens):
+        return True
     return bool(tokens & {"ad", "ads", "advertisement", "sponsored"})
+
+
+def _is_bing_host(host: str) -> bool:
+    lowered = host.lower()
+    return (
+        lowered in _BING_INTERNAL_HOSTS
+        or lowered.endswith(".bing.com")
+        or lowered.endswith(".bing.net")
+    )
 
 
 def _is_navigation_url(url: str) -> bool:
     parsed = urlsplit(url)
     host = (parsed.hostname or "").lower()
-    if host in _BRAVE_INTERNAL_HOSTS or host.endswith(".brave.com"):
-        return True
     if not host:
         return True
-    return False
+    return _is_bing_host(host)
 
 
 def _first_text(container: Any, selectors: tuple[str, ...]) -> str:
@@ -145,28 +150,68 @@ def _first_text(container: Any, selectors: tuple[str, ...]) -> str:
     return ""
 
 
-class BraveSearchParser:
-    """Parse one Brave HTML result page without knowledge of the database."""
+def _decode_click_target(value: str) -> str | None:
+    """Decode one Bing click-through ``u`` value into a real web URL."""
+    if not value:
+        return None
+    candidates = [value]
+    if value.startswith("a1"):
+        candidates.insert(0, value[2:])
+    for candidate in candidates:
+        if candidate.lower().startswith(("http://", "https://")):
+            return candidate
+        padded = candidate + "=" * (-len(candidate) % 4)
+        try:
+            raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        except (ValueError, UnicodeEncodeError, binascii.Error):
+            continue
+        try:
+            decoded = raw.decode("utf-8").strip("\x00")
+        except UnicodeDecodeError:
+            continue
+        if decoded.lower().startswith(("http://", "https://")):
+            return decoded
+    return None
 
-    _CONTAINER_SELECTORS = (
-        "div.snippet",
-        "article.result",
-        "div.result",
-        "div[data-type='web']",
-        "main#results div.web-result",
-    )
-    _TITLE_SELECTORS = (
-        ".title",
-        ".snippet-title",
-        "h2",
-        "h3",
-        ".result-header",
-    )
+
+def _resolve_destination(href: str, *, base_url: str) -> str | None:
+    """Return a safe external destination, decoding recognizable Bing trackers."""
+    candidate = href.strip()
+    if not candidate or candidate.startswith(("#", "javascript:", "mailto:", "data:")):
+        return None
+    if candidate.startswith("//"):
+        candidate = f"https:{candidate}"
+    elif candidate.startswith(("/", "?", "./", "../")):
+        candidate = urljoin(base_url, candidate)
+
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if _is_bing_host(host):
+        if not parsed.path.startswith("/ck/"):
+            return None
+        values = parse_qs(parsed.query).get("u") or []
+        for value in values:
+            decoded = _decode_click_target(value)
+            if decoded is not None:
+                return decoded
+        return None
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return None
+    return candidate
+
+
+class BingSearchParser:
+    """Parse one Bing HTML result page without knowledge of the database."""
+
+    _CONTAINER_SELECTORS = ("li.b_algo", "div.b_algo")
+    _TITLE_SELECTORS = ("h2", "h3", ".b_title")
     _SNIPPET_SELECTORS = (
-        ".snippet-description",
-        ".snippet-content",
-        ".description",
-        ".snippet-description-text",
+        ".b_caption p",
+        ".b_caption",
+        ".b_snippet",
         "p",
     )
 
@@ -183,13 +228,13 @@ class BraveSearchParser:
         *,
         search_phrase: str,
         result_page_url: str,
-    ) -> tuple[BraveResult, ...]:
+    ) -> tuple[BingResult, ...]:
         if not html or not html.strip():
             return ()
         try:
             soup = self._soup_factory(html)
         except Exception as exc:
-            raise BraveParseError("Brave HTML could not be parsed") from exc
+            raise BingParseError("Bing HTML could not be parsed") from exc
 
         containers: list[Any] = []
         for selector in self._CONTAINER_SELECTORS:
@@ -197,36 +242,40 @@ class BraveSearchParser:
                 if container not in containers and not _is_ad_container(container):
                     containers.append(container)
 
-        visible_text = _clean(soup.get_text(" ", strip=True), 20_000).lower()
         if not containers:
+            visible_text = _clean(soup.get_text(" ", strip=True), 20_000).lower()
             if any(marker in visible_text for marker in _NO_RESULTS_MARKERS):
                 return ()
-            if soup.select_one("main#results, #results"):
+            result_area = soup.select_one("#b_results, main#b_results")
+            if result_area is not None and not result_area.select("li"):
                 return ()
-            raise BraveParseError("Brave result markup was not recognized")
+            raise BingParseError("Bing result markup was not recognized")
 
-        results: list[BraveResult] = []
+        results: list[BingResult] = []
         seen: set[str] = set()
         for container in containers:
             title = _first_text(container, self._TITLE_SELECTORS)
             snippet = _first_text(container, self._SNIPPET_SELECTORS)
             destination: str | None = None
             original: str | None = None
-            for anchor in container.select("a[href]"):
+            anchors = container.select("h2 a[href], .b_title a[href]")
+            if not anchors:
+                anchors = container.select("a[href]")
+            for anchor in anchors:
                 href = anchor.get("href")
                 if not isinstance(href, str) or not href.strip():
                     continue
-                candidate = href.strip()
-                if candidate.startswith(("#", "javascript:", "mailto:", "data:")):
+                resolved = _resolve_destination(href, base_url=result_page_url)
+                if resolved is None:
                     continue
                 try:
-                    normalized = normalize_url(candidate).normalized
+                    normalized = normalize_url(resolved).normalized
                 except UrlSafetyError:
                     continue
                 if _is_navigation_url(normalized):
                     continue
                 destination = normalized
-                original = candidate
+                original = resolved
                 if not title:
                     title = _clean(anchor.get_text(" ", strip=True))
                 break
@@ -240,7 +289,7 @@ class BraveSearchParser:
             if snippet == title:
                 snippet = ""
             results.append(
-                BraveResult(
+                BingResult(
                     title=title,
                     snippet=snippet,
                     url=destination,
@@ -254,8 +303,8 @@ class BraveSearchParser:
         return tuple(results)
 
 
-def detect_brave_barrier(status: int | None, html: str | None) -> str | None:
-    """Return a stable restriction reason for a Brave response, if any."""
+def detect_bing_barrier(status: int | None, html: str | None) -> str | None:
+    """Return a stable restriction reason for a Bing response, if any."""
     if status == 401:
         return "http_401_access_denied"
     if status == 403:
@@ -269,14 +318,14 @@ def detect_brave_barrier(status: int | None, html: str | None) -> str | None:
         return challenge
     lowered = " ".join(html[:50_000].lower().split())
     matches = sum(1 for marker in _ACCESS_DENIAL_MARKERS if marker in lowered)
-    if matches >= 1 and ("brave" in lowered or "<title>" in lowered):
+    if matches >= 1 and ("bing" in lowered or "<title>" in lowered):
         return "explicit_access_denial_page"
     if matches >= 2:
         return "explicit_access_denial_page"
     return None
 
 
-class BraveSearchAdapter:
+class BingSearchAdapter:
     """Perform gated HTML searches and return parser-independent results."""
 
     def __init__(
@@ -284,35 +333,35 @@ class BraveSearchAdapter:
         settings: Settings,
         *,
         client: SafeHttpClient | None = None,
-        parser: BraveSearchParser | None = None,
+        parser: BingSearchParser | None = None,
         request_override: Callable[[str], Awaitable[FetchResult]] | None = None,
     ) -> None:
         self._settings = settings
         self._client = client
         self._owns_client = client is None
-        self._parser = parser or BraveSearchParser()
+        self._parser = parser or BingSearchParser()
         self._request_override = request_override
 
     @property
     def access_permitted(self) -> bool:
-        return bool(self._settings.brave_html_enabled and self._settings.brave_html_access_approved)
+        return bool(self._settings.bing_html_enabled and self._settings.bing_html_access_approved)
 
     def ensure_access(self) -> None:
-        if not self._settings.brave_html_enabled:
-            raise BraveAccessNotApprovedError("BRAVE_HTML_ENABLED is false")
-        if not self._settings.brave_html_access_approved:
-            raise BraveAccessNotApprovedError("BRAVE_HTML_ACCESS_APPROVED has not been confirmed")
+        if not self._settings.bing_html_enabled:
+            raise BingAccessNotApprovedError("BING_HTML_ENABLED is false")
+        if not self._settings.bing_html_access_approved:
+            raise BingAccessNotApprovedError("BING_HTML_ACCESS_APPROVED has not been confirmed")
 
     def search_url(self, phrase: str, *, page: int = 0) -> str:
-        parsed = urlsplit(self._settings.brave_search_base_url)
+        parsed = urlsplit(self._settings.bing_search_base_url)
         query = [
             (key, value)
             for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-            if key.lower() not in {"q", "offset"}
+            if key.lower() not in {"q", "first"}
         ]
         query.append(("q", phrase))
         if page > 0:
-            query.append(("offset", str(page * 10)))
+            query.append(("first", str(page * 10 + 1)))
         return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", urlencode(query), ""))
 
     async def fetch_page(
@@ -322,7 +371,7 @@ class BraveSearchAdapter:
         page: int,
         budget: RequestBudget,
         throttle: DomainThrottle,
-    ) -> BraveSearchPage:
+    ) -> BingSearchPage:
         self.ensure_access()
         url = self.search_url(phrase, page=page)
         if self._request_override is not None:
@@ -346,24 +395,24 @@ class BraveSearchAdapter:
             )
 
         if result.category == RATE_LIMITED or result.status == 429:
-            raise BraveBarrierError("http_429_rate_limited")
+            raise BingBarrierError("http_429_rate_limited")
         html = result.body.decode("utf-8", errors="replace") if result.body else None
-        barrier = detect_brave_barrier(result.status, html)
+        barrier = detect_bing_barrier(result.status, html)
         if barrier:
-            raise BraveBarrierError(barrier)
+            raise BingBarrierError(barrier)
         if result.category != OK or result.status is None:
-            raise BraveRequestError(result.error or result.category)
+            raise BingRequestError(result.error or result.category)
         try:
             results = self._parser.parse(
                 html or "",
                 search_phrase=phrase,
                 result_page_url=result.final_url or url,
             )
-        except BraveParseError:
+        except BingParseError:
             raise
         except Exception as exc:
-            raise BraveParseError("Brave parser failed unexpectedly") from exc
-        return BraveSearchPage(
+            raise BingParseError("Bing parser failed unexpectedly") from exc
+        return BingSearchPage(
             phrase=phrase,
             page_url=result.final_url or url,
             results=results,
@@ -379,14 +428,14 @@ def _stable_result_id(normalized_url: str) -> str:
     return hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()[:24]
 
 
-class BraveDiscoveryService:
-    """Persist unique Brave results into the existing discovery queue."""
+class BingDiscoveryService:
+    """Persist unique Bing results into the existing discovery queue."""
 
     def __init__(
         self,
         settings: Settings,
         repository: Any,
-        adapter: BraveSearchAdapter,
+        adapter: BingSearchAdapter,
         *,
         now: Callable[[], datetime] | None = None,
     ) -> None:
@@ -397,13 +446,13 @@ class BraveDiscoveryService:
         self._lock = asyncio.Lock()
 
     def block_reason(self, state: Mapping[str, Any] | None = None) -> str | None:
-        if not self._settings.brave_html_enabled:
-            return "BRAVE_HTML_ENABLED is false"
-        if not self._settings.brave_html_access_approved:
-            return "Brave HTML access approval has not been confirmed"
-        if state and state.get("brave_paused"):
-            reason = state.get("brave_pause_reason") or "unspecified restriction"
-            return f"Brave adapter persistently paused: {reason}"
+        if not self._settings.bing_html_enabled:
+            return "BING_HTML_ENABLED is false"
+        if not self._settings.bing_html_access_approved:
+            return "Bing HTML access approval has not been confirmed"
+        if state and state.get("bing_paused"):
+            reason = state.get("bing_pause_reason") or "unspecified restriction"
+            return f"Bing adapter persistently paused: {reason}"
         if getattr(self._repository, "configured", True) is False:
             return "Supabase is not configured"
         return None
@@ -431,16 +480,16 @@ class BraveDiscoveryService:
             reason = self.block_reason(state)
             job_id = await self._repository.create_job_run(
                 {
-                    "phrases": list(self._settings.brave_search_phrases),
-                    "interval_hours": self._settings.brave_search_interval_hours,
+                    "phrases": list(self._settings.bing_search_phrases),
+                    "interval_hours": self._settings.bing_search_interval_hours,
                     "url_budget": self._settings.max_urls_per_job,
                     "blocked_reason": reason,
                 },
-                job_type="brave_discovery",
+                job_type="bing_discovery",
             )
             if reason:
                 await self._repository.finish_job_run(job_id, counters, "skipped", reason)
-                log.warning("Brave discovery blocked: %s", reason)
+                log.warning("Bing discovery blocked: %s", reason)
                 return counters
 
             budget = RequestBudget(max_domain_requests=self._settings.max_pages_per_domain)
@@ -451,10 +500,10 @@ class BraveDiscoveryService:
             seen: set[str] = set()
             errors: Counter[str] = Counter()
             try:
-                for phrase in self._settings.brave_search_phrases:
+                for phrase in self._settings.bing_search_phrases:
                     if admitted >= self._settings.max_urls_per_job:
                         break
-                    for page in range(self._settings.brave_search_max_pages_per_phrase):
+                    for page in range(self._settings.bing_search_max_pages_per_phrase):
                         if admitted >= self._settings.max_urls_per_job:
                             break
                         try:
@@ -464,42 +513,42 @@ class BraveDiscoveryService:
                                 budget=budget,
                                 throttle=throttle,
                             )
-                        except BraveBarrierError as exc:
-                            await self._repository.pause_brave(exc.reason)
+                        except BingBarrierError as exc:
+                            await self._repository.pause_bing(exc.reason)
                             await self._repository.finish_job_run(
                                 job_id,
                                 counters,
                                 "failed",
-                                f"brave_access_restriction:{exc.reason}",
+                                f"bing_access_restriction:{exc.reason}",
                             )
                             log.warning(
-                                "Brave access restriction detected; adapter paused: %s",
+                                "Bing access restriction detected; adapter paused: %s",
                                 exc.reason,
                             )
                             return counters
-                        except BraveParseError as exc:
+                        except BingParseError as exc:
                             await self._repository.finish_job_run(
                                 job_id,
                                 counters,
                                 "failed",
-                                f"brave_parse_failed:{type(exc).__name__}",
+                                f"bing_parse_failed:{type(exc).__name__}",
                             )
-                            log.warning("Brave parser failure (%s); no retry attempted", exc)
+                            log.warning("Bing parser failure (%s); no retry attempted", exc)
                             return counters
-                        except BraveAccessNotApprovedError as exc:
+                        except BingAccessNotApprovedError as exc:
                             await self._repository.finish_job_run(
-                                job_id, counters, "failed", f"brave_access_gate:{exc}"
+                                job_id, counters, "failed", f"bing_access_gate:{exc}"
                             )
                             return counters
-                        except brave_safe_exceptions() as exc:
-                            errors[f"brave_request_failed:{type(exc).__name__}"] += 1
+                        except bing_safe_exceptions() as exc:
+                            errors[f"bing_request_failed:{type(exc).__name__}"] += 1
                             await self._repository.finish_job_run(
                                 job_id,
                                 counters,
                                 "failed",
-                                f"brave_request_failed:{type(exc).__name__}",
+                                f"bing_request_failed:{type(exc).__name__}",
                             )
-                            log.warning("Brave request failed (%s)", type(exc).__name__)
+                            log.warning("Bing request failed (%s)", type(exc).__name__)
                             return counters
 
                         if not result_page.results:
@@ -522,7 +571,7 @@ class BraveDiscoveryService:
                                 counters["failed_count"] += 1
                                 errors[f"discovery_insert_failed:{type(exc).__name__}"] += 1
                                 log.warning(
-                                    "Brave discovery insert failed (%s)",
+                                    "Bing discovery insert failed (%s)",
                                     type(exc).__name__,
                                 )
                                 continue
@@ -539,27 +588,27 @@ class BraveDiscoveryService:
                 )
                 await self._repository.finish_job_run(job_id, counters, outcome, error_summary)
                 if outcome == "succeeded":
-                    await self._repository.mark_brave_success()
+                    await self._repository.mark_bing_success()
             except Exception as exc:
                 counters["failed_count"] += 1
                 await self._repository.finish_job_run(
                     job_id,
                     counters,
                     "failed",
-                    f"brave_discovery_failed:{type(exc).__name__}",
+                    f"bing_discovery_failed:{type(exc).__name__}",
                 )
-                log.exception("Brave discovery failed")
+                log.exception("Bing discovery failed")
             return counters
 
-    def _discovery_payload(self, result: BraveResult) -> dict[str, Any]:
+    def _discovery_payload(self, result: BingResult) -> dict[str, Any]:
         discovered_at = self._now().isoformat()
         metadata = result.to_metadata()
         metadata["discovered_at"] = discovered_at
-        metadata["origin_source_type"] = "brave_html"
+        metadata["origin_source_type"] = "bing_html"
         return {
             "url": result.original_url,
             "normalized_url": result.url,
-            "source_type": "brave_html",
+            "source_type": "bing_html",
             "source_platform_id": _stable_result_id(result.url),
             "title": result.title or None,
             "description": result.snippet or None,
@@ -570,6 +619,6 @@ class BraveDiscoveryService:
         }
 
 
-def brave_safe_exceptions() -> tuple[type[BaseException], ...]:
-    """Ordinary Brave transport failures that must not be mistaken for barriers."""
-    return (BraveRequestError, OSError, TimeoutError)
+def bing_safe_exceptions() -> tuple[type[BaseException], ...]:
+    """Ordinary Bing transport failures that must not be mistaken for barriers."""
+    return (BingRequestError, OSError, TimeoutError)
