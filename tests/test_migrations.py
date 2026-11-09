@@ -72,6 +72,75 @@ def test_digest_publication_idempotency_index_exists() -> None:
     assert "where purpose = 'daily_digest'" in sql
 
 
+def test_global_digest_reservation_migration_is_additive_and_atomic() -> None:
+    sql = read_migration("008_global_digest_budget.sql").lower()
+    assert "add column if not exists digest_cycle" in sql
+    assert "add column if not exists digest_slot_reserved" in sql
+    assert "uq_publications_digest_item_global" in sql
+    assert "reserve_daily_digest_publication" in sql
+    assert "for update" in sql
+    assert "asia/kolkata" in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+
+
+def test_digest_claims_retry_fairness_and_rollover_migration_is_fenced() -> None:
+    sql = read_migration("009_digest_claims_retry_fairness.sql").lower()
+    for column in (
+        "delivery_claim_token",
+        "delivery_claim_expires_at",
+        "next_attempt_at",
+        "retry_schedule_count",
+    ):
+        assert f"add column if not exists {column}" in sql
+    assert "claim_daily_digest_publication" in sql
+    assert "renew_daily_digest_claim" in sql
+    assert "advance_daily_digest_attempt" in sql
+    assert "delivery_claim_token = p_claim_token" in sql
+    assert "delivery_claim_expires_at > v_now" in sql
+    assert "attempt_count = greatest(0, p_expected_attempt_count)" in sql
+    assert "rollover_reconciled_digest_publication" in sql
+    assert "attempt_count > 0" in sql
+    assert "grant execute" in sql and "to service_role" in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+
+
+def test_digest_terminal_rollover_and_retry_claim_migration_is_forward_only() -> None:
+    sql = read_migration("010_digest_terminal_rollover_and_retry_claims.sql").lower()
+    assert "add column if not exists digest_terminal boolean not null default false" in sql
+    assert "terminalize_daily_digest_publication" in sql
+    assert "digest_terminal = true" in sql
+    assert "digest_slot_reserved = false" in sql
+    assert "delivery_claim_token = null" in sql
+    assert "advance_daily_digest_attempt_for_cycle" in sql
+    assert "at time zone 'asia/kolkata'" in sql
+    assert "v_local_now::time < time '04:00'" in sql
+    assert "digest_cycle is distinct from p_digest_cycle" in sql
+    assert "tifa.digest_claim_rollover" in sql
+    assert "old.attempt_count = 0" in sql
+    assert "not digest_terminal" in sql
+    assert "revoke all on function public.advance_daily_digest_attempt" in sql
+    assert "grant execute" in sql and "to service_role" in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+
+
+def test_digest_cycle_validation_and_retarget_migration_is_forward_only() -> None:
+    sql = read_migration("011_digest_cycle_validation_and_destination_retarget.sql").lower()
+    assert "before update of channel_id, status" in sql
+    assert "retarget_daily_digest_publication" in sql
+    assert "delivery_claim_token = p_claim_token" in sql
+    assert "delivery_claim_expires_at > v_now" in sql
+    assert "v_now at time zone 'asia/kolkata'" in sql
+    assert "v_local_now::time < time '04:00'" in sql
+    assert "'cycle_stale', true" in sql
+    assert "perform 1 from public.digest_state where id = 1 for update" in sql
+    assert "grant execute" in sql and "to service_role" in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+
+
 def test_runtime_and_digest_singletons_are_seeded() -> None:
     _files, sql = read_migrations()
 
@@ -171,7 +240,7 @@ def test_phase4_migration_extends_existing_runtime_and_job_tables() -> None:
     assert "create table" not in sql
 
 
-def test_phase5_migration_adds_durable_discovery_and_brave_controls() -> None:
+def test_phase5_migration_adds_durable_discovery_controls() -> None:
     files, _sql = read_migrations()
     names = [path.name for path in files]
 
@@ -182,12 +251,36 @@ def test_phase5_migration_adds_durable_discovery_and_brave_controls() -> None:
 
     assert "add column if not exists next_attempt_at" in lowered
     assert "idx_discoveries_queue_claim" in lowered
-    assert "add column if not exists brave_paused" in lowered
-    assert "add column if not exists brave_pause_reason" in lowered
-    assert "add column if not exists brave_paused_at" in lowered
+    assert "alter table public.runtime_state" in lowered
+    assert lowered.count("add column if not exists") == 4
     assert "create table" not in lowered
     assert "drop table" not in lowered
     assert "drop column" not in lowered
+    assert "delete from" not in lowered
+    assert "truncate" not in lowered
+
+
+def test_bing_search_provider_migration_preserves_history() -> None:
+    files, _sql = read_migrations()
+    names = [path.name for path in files]
+
+    assert "012_bing_search_provider.sql" in names
+
+    sql = read_migration("012_bing_search_provider.sql")
+    lowered = sql.lower()
+
+    assert "add column if not exists bing_paused" in lowered
+    assert "add column if not exists bing_pause_reason" in lowered
+    assert "add column if not exists bing_paused_at" in lowered
+    assert "add column if not exists last_bing_success_at" in lowered
+    assert "update public.discoveries" in lowered
+    assert "set source_type = 'web_legacy'" in lowered
+    assert "drop constraint if exists discoveries_source_type_check" in lowered
+    assert "source_type in ('reddit', 'web_legacy', 'bing_html', 'seed', 'manual_save')" in lowered
+    assert "drop constraint if exists job_runs_job_type_check" in lowered
+    assert "'bing_discovery'" in lowered
+    assert lowered.count("drop column if exists") == 4
+    assert "drop table" not in lowered
     assert "delete from" not in lowered
     assert "truncate" not in lowered
 

@@ -41,6 +41,7 @@ class FakeQuery:
         self.filters: list[tuple[str, object]] = []
         self.limit_value: int | None = None
         self.or_expression: str | None = None
+        self.or_expressions: list[str] = []
         self.order_value: tuple[str, bool] | None = None
         self.orders: list[tuple[str, bool]] = []
         self.range_value: tuple[int, int] | None = None
@@ -71,9 +72,12 @@ class FakeQuery:
 
     def or_(self, expression: str) -> FakeQuery:
         self.or_expression = expression
+        self.or_expressions.append(expression)
         return self
 
-    def order(self, column: str, *, desc: bool = False) -> FakeQuery:
+    def order(
+        self, column: str, *, desc: bool = False, nullsfirst: bool | None = None
+    ) -> FakeQuery:
         self.orders.append((column, desc))
         self.order_value = (column, desc)
         return self
@@ -154,9 +158,23 @@ class FakeTable:
 class FakeClient:
     def __init__(self) -> None:
         self.tables: dict[str, FakeTable] = {}
+        self.rpc_calls: list[tuple[str, dict[str, object]]] = []
+        self.rpc_data: object = {"id": "publication-1", "quota_exhausted": False}
 
     def table(self, name: str) -> FakeTable:
         return self.tables.setdefault(name, FakeTable(name))
+
+    def rpc(self, name: str, params: dict[str, object]):
+        self.rpc_calls.append((name, params))
+        return FakeQueryResult(self.rpc_data)
+
+
+class FakeQueryResult:
+    def __init__(self, data: object) -> None:
+        self.data = data
+
+    def execute(self) -> FakeResponse:
+        return FakeResponse(self.data)  # type: ignore[arg-type]
 
 
 async def immediate_thread(function, *args, **kwargs):
@@ -341,6 +359,61 @@ async def test_record_source_upserts_reddit_attribution() -> None:
     assert payload["caption"] == "Original artwork"
 
 
+async def test_sources_for_media_retrieves_every_association_in_stable_order() -> None:
+    client = FakeClient()
+    sources = [{"id": "source-1"}, {"id": "source-2"}]
+    client.table("media_sources").results["select"] = sources
+    repository = make_repository(client)
+
+    result = await repository.sources_for_media("media-1")
+
+    assert result == sources
+    query = client.table("media_sources").queries[0]
+    assert query.filters == [("media_item_id", "media-1")]
+    assert query.orders == [("discovered_at", False), ("id", False)]
+    assert query.range_value == (0, 999)
+
+
+async def test_digest_reservation_uses_atomic_database_function() -> None:
+    client = FakeClient()
+    repository = make_repository(client)
+
+    result = await repository.reserve_digest_publication("media-1", 123, "2026-11-08", limit=50)
+
+    assert result == {"id": "publication-1", "quota_exhausted": False}
+    assert client.rpc_calls == [
+        (
+            "reserve_daily_digest_publication",
+            {
+                "p_media_item_id": "media-1",
+                "p_channel_id": 123,
+                "p_digest_cycle": "2026-11-08",
+                "p_limit": 50,
+            },
+        )
+    ]
+
+
+async def test_digest_destination_retarget_uses_claim_fenced_rpc() -> None:
+    client = FakeClient()
+    client.rpc_data = {"claim_valid": True, "channel_id": 222}
+    repository = make_repository(client)
+
+    result = await repository.retarget_digest_publication("publication-1", "claim-token", 222)
+
+    assert result == {"claim_valid": True, "channel_id": 222}
+    assert client.rpc_calls == [
+        (
+            "retarget_daily_digest_publication",
+            {
+                "p_publication_id": "publication-1",
+                "p_claim_token": "claim-token",
+                "p_channel_id": 222,
+            },
+        )
+    ]
+
+
 async def test_create_publication_starts_pending() -> None:
     client = FakeClient()
     client.table("publications").results["insert"] = [{"id": "publication-1"}]
@@ -408,11 +481,11 @@ async def test_create_job_run_supports_phase5_job_types() -> None:
     client.table("job_runs").results["insert"] = [{"id": "job-1"}]
     repository = make_repository(client)
 
-    job_id = await repository.create_job_run({"phrase": "Tifa"}, job_type="brave_discovery")
+    job_id = await repository.create_job_run({"phrase": "Tifa"}, job_type="bing_discovery")
 
     assert job_id == "job-1"
     _, payload, _ = client.table("job_runs").calls[0]
-    assert payload["job_type"] == "brave_discovery"
+    assert payload["job_type"] == "bing_discovery"
     assert payload["config_snapshot"] == {"phrase": "Tifa"}
     with pytest.raises(ValueError, match="Unsupported job type"):
         await repository.create_job_run({}, job_type="manual_save")
@@ -428,7 +501,7 @@ async def test_mark_interrupted_jobs_covers_worker_and_digest_jobs() -> None:
     queries = [query for query in client.table("job_runs").queries if query.operation == "select"]
     assert [query.filters for query in queries] == [
         [("job_type", "reddit_collection"), ("outcome", "running")],
-        [("job_type", "brave_discovery"), ("outcome", "running")],
+        [("job_type", "bing_discovery"), ("outcome", "running")],
         [("job_type", "crawl"), ("outcome", "running")],
         [("job_type", "daily_digest"), ("outcome", "running")],
     ]
@@ -440,38 +513,38 @@ async def test_mark_interrupted_jobs_covers_worker_and_digest_jobs() -> None:
     )
 
 
-async def test_brave_pause_state_is_persisted_and_clearable() -> None:
+async def test_bing_pause_state_is_persisted_and_clearable() -> None:
     client = FakeClient()
     client.table("runtime_state").results["update"] = [{"id": 1}]
     repository = make_repository(client)
 
-    await repository.pause_brave("http_403_access_denied")
+    await repository.pause_bing("http_403_access_denied")
     pause_payload = client.table("runtime_state").calls[0][1]
-    assert pause_payload["brave_paused"] is True
-    assert pause_payload["brave_pause_reason"] == "http_403_access_denied"
-    assert pause_payload["brave_paused_at"]
+    assert pause_payload["bing_paused"] is True
+    assert pause_payload["bing_pause_reason"] == "http_403_access_denied"
+    assert pause_payload["bing_paused_at"]
 
-    await repository.clear_brave_pause()
+    await repository.clear_bing_pause()
     clear_payload = client.table("runtime_state").calls[1][1]
     assert clear_payload == {
-        "brave_paused": False,
-        "brave_pause_reason": None,
-        "brave_paused_at": None,
+        "bing_paused": False,
+        "bing_pause_reason": None,
+        "bing_paused_at": None,
     }
 
-    await repository.mark_brave_success()
+    await repository.mark_bing_success()
     success_payload = client.table("runtime_state").calls[2][1]
-    assert "last_brave_success_at" in success_payload
+    assert "last_bing_success_at" in success_payload
 
 
-async def test_operational_counts_include_queue_brave_and_pause_state() -> None:
+async def test_operational_counts_include_queue_bing_and_pause_state() -> None:
     client = FakeClient()
     client.table("runtime_state").results["select"] = [
         {
             "collection_enabled": True,
-            "brave_paused": True,
-            "brave_pause_reason": "http_403_access_denied",
-            "last_brave_success_at": "2026-01-01T00:00:00+00:00",
+            "bing_paused": True,
+            "bing_pause_reason": "http_403_access_denied",
+            "last_bing_success_at": "2026-01-01T00:00:00+00:00",
             "last_digest_success_at": None,
         }
     ]
@@ -494,9 +567,9 @@ async def test_operational_counts_include_queue_brave_and_pause_state() -> None:
     assert counts["processing"] == 1
     assert counts["verified"] == 4
     assert counts["dumpster"] == 3
-    assert counts["brave_paused"] is True
-    assert counts["brave_pause_reason"] == "http_403_access_denied"
-    assert counts["last_brave_success_at"] == "2026-01-01T00:00:00+00:00"
+    assert counts["bing_paused"] is True
+    assert counts["bing_pause_reason"] == "http_403_access_denied"
+    assert counts["last_bing_success_at"] == "2026-01-01T00:00:00+00:00"
     count_query = discoveries.queries[0]
     assert count_query.count == "exact"
     assert count_query.filters == [("status", "queued")]
@@ -590,7 +663,7 @@ async def test_record_discovery_edge_deduplicates_and_preserves_root_paths() -> 
         parent_discovery_id=None,
         child_discovery_id="child-1",
         child_normalized_url="https://example.com/child",
-        discovered_from_url="https://search.brave.com/search?q=tifa",
+        discovered_from_url="https://www.bing.com/search?q=tifa",
         depth=0,
     )
 
@@ -639,13 +712,13 @@ async def test_latest_phase5_runs_filter_job_type_and_order_descending() -> None
     client.table("job_runs").results["select"] = [{"id": "run-1"}]
     repository = make_repository(client)
 
-    brave = await repository.latest_brave_runs(2)
+    bing = await repository.latest_bing_runs(2)
     crawl = await repository.latest_crawl_runs(1)
 
-    assert brave == [{"id": "run-1"}]
+    assert bing == [{"id": "run-1"}]
     assert crawl == [{"id": "run-1"}]
     queries = client.table("job_runs").queries
-    assert queries[0].filters == [("job_type", "brave_discovery")]
+    assert queries[0].filters == [("job_type", "bing_discovery")]
     assert queries[0].order_value == ("started_at", True)
     assert queries[0].limit_value == 2
     assert queries[1].filters == [("job_type", "crawl")]
@@ -743,37 +816,75 @@ async def test_ensure_digest_publication_reraises_non_conflict_errors() -> None:
         await repository.ensure_digest_publication("media-1", 222)
 
 
-async def test_record_publication_attempt_uses_conditional_increment() -> None:
+async def test_record_publication_attempt_requires_and_uses_claim_token() -> None:
     client = FakeClient()
-    publications = client.table("publications")
-    publications.results["update"] = [
-        {"id": "publication-1", "status": "pending", "attempt_count": 2}
-    ]
+    client.rpc_data = {
+        "id": "publication-1",
+        "status": "pending",
+        "attempt_count": 2,
+        "attempt_advanced": True,
+    }
     repository = make_repository(client)
 
-    row = await repository.record_publication_attempt("publication-1", expected_attempt_count=1)
+    row = await repository.record_publication_attempt(
+        "publication-1",
+        expected_attempt_count=1,
+        claim_token="claim-token",
+        digest_cycle="2026-11-08",
+    )
 
     assert row["attempt_count"] == 2
-    update_payload = next(
-        payload for operation, payload, _conflict in publications.calls if operation == "update"
-    )
-    assert update_payload == {"status": "pending", "attempt_count": 2, "last_error": None}
-    update_query = publications.queries[0]
-    assert update_query.filters == [("id", "publication-1"), ("attempt_count", 1)]
+    assert client.rpc_calls == [
+        (
+            "advance_daily_digest_attempt_for_cycle",
+            {
+                "p_publication_id": "publication-1",
+                "p_claim_token": "claim-token",
+                "p_expected_attempt_count": 1,
+                "p_digest_cycle": "2026-11-08",
+                "p_attempt_limit": 3,
+                "p_lease_seconds": 900,
+            },
+        )
+    ]
 
 
-async def test_record_publication_attempt_returns_current_row_when_update_loses_race() -> None:
-    current = {"id": "publication-1", "status": "pending", "attempt_count": 2}
+async def test_record_publication_attempt_returns_no_claim_when_update_loses_race() -> None:
     client = FakeClient()
-    publications = client.table("publications")
-    publications.results["update"] = []
-    publications.results["select"] = [current]
+    client.rpc_data = {"attempt_advanced": False}
     repository = make_repository(client)
 
-    row = await repository.record_publication_attempt("publication-1", expected_attempt_count=1)
+    row = await repository.record_publication_attempt(
+        "publication-1",
+        expected_attempt_count=1,
+        claim_token="stale-token",
+        digest_cycle="2026-11-08",
+    )
 
-    assert row == current
-    assert publications.queries[1].filters == [("id", "publication-1")]
+    assert row is None
+    assert client.rpc_calls[0][0] == "advance_daily_digest_attempt_for_cycle"
+
+
+async def test_digest_claim_rpc_preserves_explicit_loser_result() -> None:
+    client = FakeClient()
+    client.rpc_data = {"claim_acquired": False}
+    repository = make_repository(client)
+
+    result = await repository.claim_digest_publication(
+        "publication-1", "claim-token", lease_seconds=600
+    )
+
+    assert result == {"claim_acquired": False}
+    assert client.rpc_calls == [
+        (
+            "claim_daily_digest_publication",
+            {
+                "p_publication_id": "publication-1",
+                "p_claim_token": "claim-token",
+                "p_lease_seconds": 600,
+            },
+        )
+    ]
 
 
 async def test_list_retryable_digest_publications_filters_unresolved_rows() -> None:
@@ -790,8 +901,18 @@ async def test_list_retryable_digest_publications_filters_unresolved_rows() -> N
         ("purpose", "daily_digest"),
         ("in.status", ["pending", "failed"]),
         ("lt.attempt_count", 3),
+        ("digest_terminal", False),
     ]
-    assert query.order_value == ("created_at", False)
+    assert len(query.or_expressions) == 2
+    assert query.or_expressions[0].startswith("next_attempt_at.is.null,next_attempt_at.lte.")
+    assert query.or_expressions[1].startswith(
+        "delivery_claim_token.is.null,delivery_claim_expires_at.is.null,"
+    )
+    assert query.orders == [
+        ("next_attempt_at", False),
+        ("created_at", False),
+        ("id", False),
+    ]
     assert query.limit_value == 25
 
 
@@ -813,17 +934,23 @@ async def test_list_exhausted_ambiguous_publications_reads_every_page() -> None:
     assert len(rows) == 207
     assert [query.range_value for query in publications.queries] == [
         (0, 99),
-        (100, 199),
-        (200, 299),
+        (0, 99),
+        (0, 99),
     ]
     assert all(
         query.orders == [("created_at", False), ("id", False)] for query in publications.queries
     )
-    assert all(
-        query.or_expression == "status.eq.pending,last_error.like.discord_delivery_ambiguous:*,"
+    assert publications.queries[0].or_expressions[0] == (
+        "status.eq.pending,last_error.like.discord_delivery_ambiguous:*,"
         "last_error.like.discord_delivery_failed*"
+    )
+    assert all(
+        len(query.or_expressions) >= 2
+        and query.or_expressions[1].startswith("next_attempt_at.is.null,next_attempt_at.lte.")
         for query in publications.queries
     )
+    assert all(len(query.or_expressions) == 3 for query in publications.queries[1:])
+    assert publications.queries[1].or_expressions[2].startswith("created_at.gt.")
 
 
 async def test_record_reconciliation_diagnostic_preserves_ambiguous_error() -> None:

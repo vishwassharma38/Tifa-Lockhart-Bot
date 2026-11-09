@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import uuid
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -95,6 +96,11 @@ def latest_digest_due_at(
     return due.astimezone(UTC)
 
 
+def digest_cycle_at(now: datetime) -> str:
+    """Return the active digest cycle using the configured IST 04:00 boundary."""
+    return latest_digest_due_at(now).astimezone(ZoneInfo(DIGEST_TIMEZONE)).date().isoformat()
+
+
 @dataclass(frozen=True, slots=True)
 class DigestWindow:
     """Persisted upper and lower boundaries for one digest run."""
@@ -103,6 +109,7 @@ class DigestWindow:
     end: datetime
     cursor: datetime
     resumed: bool
+    cycle: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +152,7 @@ class DigestService:
         self._retry_batch_size = max(1, retry_batch_size)
         self._now = now or (lambda: datetime.now(UTC))
         self._lock = asyncio.Lock()
+        self._quota_exhausted = False
 
     @property
     def attempt_limit(self) -> int:
@@ -188,12 +196,16 @@ class DigestService:
                 job_type="daily_digest",
             )
             window = await self._prepare_window()
+            self._quota_exhausted = False
             processed: set[tuple[str, int]] = set()
             unaccounted: list[str] = []
             await self._process_candidates(window, processed, counters, errors, unaccounted)
-            await self._process_retryable(processed, counters, errors, unaccounted)
+            await self._process_retryable(window.cycle, processed, counters, errors, unaccounted)
             await self._process_exhausted_ambiguous(processed, counters, errors)
-            if unaccounted:
+            if self._quota_exhausted:
+                errors["global_daily_limit_reached"] += 1
+                outcome = "partial"
+            elif unaccounted:
                 errors["unaccounted_items"] += len(unaccounted)
                 outcome = "partial"
                 log.warning(
@@ -281,8 +293,17 @@ class DigestService:
         end = _as_datetime(state.get("last_window_end"))
         completed = _as_datetime(state.get("last_completed_at"))
         cursor = _as_datetime(state.get("cursor_media_created_at"))
+        now = self._now().astimezone(UTC)
+        due = latest_digest_due_at(now)
+        cycle = due.astimezone(ZoneInfo(DIGEST_TIMEZONE)).date().isoformat()
 
         if start is not None and end is not None and (completed is None or completed < end):
+            previous_cycle = str(state.get("digest_cycle") or cycle)
+            if previous_cycle < cycle:
+                # A full prior-cycle window carries its oldest remaining records
+                # into the newly scheduled cycle without resetting on restart.
+                previous_cycle = cycle
+                end = now if now > end else end
             if cursor is None or cursor < start:
                 cursor = start
             if cursor > end:
@@ -293,10 +314,15 @@ class DigestService:
                 _iso(end),
                 _iso(cursor),
             )
-            return DigestWindow(start=start, end=end, cursor=cursor, resumed=True)
+            await self._repository.update_digest_state(
+                {"digest_cycle": previous_cycle, "last_window_end": _iso(end)}
+            )
+            return DigestWindow(
+                start=start, end=end, cursor=cursor, resumed=True, cycle=previous_cycle
+            )
 
         window_start = end if end is not None else INITIAL_DIGEST_WINDOW_START
-        window_end = self._now().astimezone(UTC)
+        window_end = now
         if window_end < window_start:
             window_end = window_start
         window = DigestWindow(
@@ -304,12 +330,14 @@ class DigestService:
             end=window_end,
             cursor=window_start,
             resumed=False,
+            cycle=cycle,
         )
         await self._repository.update_digest_state(
             {
                 "last_window_start": _iso(window.start),
                 "last_window_end": _iso(window.end),
                 "cursor_media_created_at": _iso(window.cursor),
+                "digest_cycle": window.cycle,
             }
         )
         return window
@@ -336,19 +364,25 @@ class DigestService:
             )
             if not rows:
                 return
+            page_cursor = persisted_cursor
             for media in rows:
                 accounted = await self._process_candidate(
                     media,
+                    window,
                     processed,
                     counters,
                     errors,
                     unaccounted,
                 )
                 if not accounted:
+                    if self._quota_exhausted:
+                        break
                     cursor_writable = False
-            last_created = _as_datetime(rows[-1].get("created_at"))
-            if last_created is not None and last_created > persisted_cursor:
-                persisted_cursor = last_created
+                else:
+                    created_at = _as_datetime(media.get("created_at"))
+                    if created_at is not None and created_at > page_cursor:
+                        page_cursor = created_at
+            persisted_cursor = page_cursor
             if cursor_writable:
                 try:
                     await self._repository.update_digest_state(
@@ -362,12 +396,15 @@ class DigestService:
                     errors[f"digest_cursor_update_failed:{type(exc).__name__}"] += 1
                     log.warning("Digest cursor update failed (%s)", type(exc).__name__)
             offset += len(rows)
+            if self._quota_exhausted:
+                return
             if len(rows) < self._page_size:
                 return
 
     async def _process_candidate(
         self,
         media: dict[str, Any],
+        window: DigestWindow,
         processed: set[tuple[str, int]],
         counters: dict[str, int],
         errors: Counter[str],
@@ -384,15 +421,15 @@ class DigestService:
             counters["skipped_count"] += 1
             log.info("Digest skipped ineligible media item=%s", media_id)
             return True
-        channel_id = self._destination_channel(media)
-        if channel_id <= 0:
+        destination_channel_id = self._destination_channel(media)
+        if destination_channel_id <= 0:
             counters["processed_count"] += 1
             counters["failed_count"] += 1
             errors["destination_not_configured"] += 1
             unaccounted.append(media_id)
             log.warning("Digest destination is not configured for media item=%s", media_id)
             return False
-        key = (media_id, channel_id)
+        key = (media_id, destination_channel_id)
         if key in processed:
             counters["processed_count"] += 1
             counters["skipped_count"] += 1
@@ -400,10 +437,27 @@ class DigestService:
         processed.add(key)
         counters["processed_count"] += 1
         try:
-            publication = await self._repository.ensure_digest_publication(
-                media_id,
-                channel_id,
-            )
+            reserve = getattr(self._repository, "reserve_digest_publication", None)
+            cycle = window.cycle
+            if callable(reserve):
+                publication, cycle = await self._reserve_with_cycle_refresh(
+                    media_id, destination_channel_id, window.cycle
+                )
+                if publication.get("cycle_stale"):
+                    errors["digest_cycle_stale_retry_exhausted"] += 1
+                    unaccounted.append(media_id)
+                    return False
+                if publication.get("quota_exhausted"):
+                    self._quota_exhausted = True
+                    return False
+            else:
+                publication = await self._repository.ensure_digest_publication(
+                    media_id, destination_channel_id
+                )
+            try:
+                channel_id = int(publication.get("channel_id") or destination_channel_id)
+            except (TypeError, ValueError):
+                channel_id = destination_channel_id
         except Exception as exc:
             counters["failed_count"] += 1
             errors[f"publication_record_failed:{type(exc).__name__}"] += 1
@@ -418,6 +472,8 @@ class DigestService:
             media,
             publication,
             channel_id=channel_id,
+            cycle=cycle,
+            destination_channel_id=destination_channel_id,
             counters=counters,
             errors=errors,
             unaccounted=unaccounted,
@@ -425,6 +481,7 @@ class DigestService:
 
     async def _process_retryable(
         self,
+        cycle: str,
         processed: set[tuple[str, int]],
         counters: dict[str, int],
         errors: Counter[str],
@@ -434,6 +491,7 @@ class DigestService:
             rows = await self._repository.list_retryable_digest_publications(
                 attempt_limit=self._attempt_limit,
                 limit=self._retry_batch_size,
+                now=_iso(self._now()),
             )
         except Exception as exc:
             errors[f"retry_lookup_failed:{type(exc).__name__}"] += 1
@@ -447,6 +505,28 @@ class DigestService:
                 channel_id = 0
             if not media_id or channel_id <= 0:
                 continue
+            if any(processed_media_id == media_id for processed_media_id, _ in processed):
+                continue
+            reserve = getattr(self._repository, "reserve_digest_publication", None)
+            if callable(reserve):
+                try:
+                    publication, cycle = await self._reserve_with_cycle_refresh(
+                        media_id, channel_id, cycle
+                    )
+                except Exception as exc:
+                    errors[f"retry_reservation_failed:{type(exc).__name__}"] += 1
+                    continue
+                if publication.get("cycle_stale"):
+                    errors["digest_cycle_stale_retry_exhausted"] += 1
+                    unaccounted.append(media_id)
+                    continue
+                if publication.get("quota_exhausted"):
+                    self._quota_exhausted = True
+                    break
+                try:
+                    channel_id = int(publication.get("channel_id") or channel_id)
+                except (TypeError, ValueError):
+                    pass
             key = (media_id, channel_id)
             if key in processed:
                 continue
@@ -467,18 +547,13 @@ class DigestService:
                 counters["skipped_count"] += 1
                 log.info("Digest retry skipped unavailable media item=%s", media_id)
                 continue
-            if self._destination_channel(media) != channel_id:
-                counters["skipped_count"] += 1
-                log.info(
-                    "Digest retry skipped because destination changed item=%s channel=%s",
-                    media_id,
-                    channel_id,
-                )
-                continue
+            destination_channel_id = self._destination_channel(media)
             await self._deliver(
                 media,
                 publication,
                 channel_id=channel_id,
+                cycle=cycle,
+                destination_channel_id=destination_channel_id,
                 counters=counters,
                 errors=errors,
                 unaccounted=unaccounted,
@@ -495,6 +570,7 @@ class DigestService:
             rows = await self._repository.list_exhausted_ambiguous_digest_publications(
                 attempt_limit=self._attempt_limit,
                 page_size=self._retry_batch_size,
+                now=_iso(self._now()),
             )
         except Exception as exc:
             errors[f"reconciliation_queue_lookup_failed:{type(exc).__name__}"] += 1
@@ -514,25 +590,43 @@ class DigestService:
                 continue
             processed.add(key)
             counters["processed_count"] += 1
+            claim_token = str(uuid.uuid4())
+            try:
+                claim = await self._claim(publication, claim_token)
+            except Exception as exc:
+                errors[f"reconciliation_claim_failed:{type(exc).__name__}"] += 1
+                continue
+            if not claim:
+                continue
             reconciliation = await self._reconcile(
                 publication,
                 channel_id=channel_id,
                 errors=errors,
+                claim_token=claim_token,
             )
             if reconciliation == "reconciled":
                 counters["skipped_count"] += 1
                 continue
-            if reconciliation == "unreconciled":
+            if reconciliation.startswith("unreconciled"):
                 counters["failed_count"] += 1
+                await self._finish_reconciliation(
+                    publication,
+                    claim_token,
+                    reconciliation.partition(":")[2] or "delivery_unreconciled",
+                    errors,
+                )
                 continue
 
             # A conclusive miss means this record is no longer ambiguous, but it
             # has exhausted its send budget and must not be retried.
             counters["skipped_count"] += 1
             try:
-                await self._repository.mark_publication_failed(
+                await self._repository.terminalize_digest_publication(
                     str(publication["id"]),
+                    claim_token,
                     "delivery_attempt_limit_reached:no_marker_found",
+                    attempt_limit=self._attempt_limit,
+                    conclusive_no_delivery=True,
                 )
             except Exception as exc:
                 errors[f"exhausted_publication_update_failed:{type(exc).__name__}"] += 1
@@ -548,9 +642,12 @@ class DigestService:
         publication: dict[str, Any],
         *,
         channel_id: int,
+        cycle: str,
+        destination_channel_id: int | None = None,
         counters: dict[str, int],
         errors: Counter[str],
         unaccounted: list[str],
+        cycle_recovery_depth: int = 0,
     ) -> bool:
         publication_id = str(publication.get("id") or "")
         if not publication_id:
@@ -558,11 +655,26 @@ class DigestService:
             errors["publication_id_missing"] += 1
             unaccounted.append(str(media.get("id") or "unknown"))
             return False
-        status = str(publication.get("status") or "pending")
-        attempts = self._attempt_count(publication)
-        if status == "published":
+        if str(publication.get("status") or "pending") == "published" or publication.get(
+            "digest_terminal"
+        ):
             counters["skipped_count"] += 1
             return True
+        claim_token = str(uuid.uuid4())
+        try:
+            claimed = await self._claim(publication, claim_token)
+        except Exception as exc:
+            counters["failed_count"] += 1
+            errors[f"delivery_claim_failed:{type(exc).__name__}"] += 1
+            return True
+        if not claimed:
+            counters["skipped_count"] += 1
+            return True
+        publication = claimed
+        if destination_channel_id is None:
+            destination_channel_id = channel_id
+        attempts = self._attempt_count(publication)
+        status = str(publication.get("status") or "pending")
         last_error = str(publication.get("last_error") or "")
         ambiguous_failure = _is_ambiguous_delivery_error(last_error)
         if attempts > 0 and (status == "pending" or ambiguous_failure):
@@ -570,6 +682,7 @@ class DigestService:
                 publication,
                 channel_id=channel_id,
                 errors=errors,
+                claim_token=claim_token,
             )
             if reconciliation == "reconciled":
                 counters["skipped_count"] += 1
@@ -579,16 +692,69 @@ class DigestService:
                     channel_id,
                 )
                 return True
-            if reconciliation == "unreconciled":
+            if reconciliation.startswith("unreconciled"):
                 counters["failed_count"] += 1
+                await self._finish_reconciliation(
+                    publication,
+                    claim_token,
+                    reconciliation.partition(":")[2] or "delivery_unreconciled",
+                    errors,
+                )
                 log.warning(
                     "Digest held ambiguous publication=%s channel=%s",
                     publication_id,
                     channel_id,
                 )
                 return True
+            # A conclusive miss retires the ambiguous hold. Any resend in a
+            # newer cycle must acquire that cycle's slot before it can proceed.
+            if attempts >= self._attempt_limit:
+                try:
+                    await self._repository.terminalize_digest_publication(
+                        publication_id,
+                        claim_token,
+                        "delivery_attempt_limit_reached:no_marker_found",
+                        attempt_limit=self._attempt_limit,
+                        conclusive_no_delivery=True,
+                    )
+                except Exception as exc:
+                    counters["failed_count"] += 1
+                    errors[f"publication_terminal_update_failed:{type(exc).__name__}"] += 1
+                    return True
+                counters["skipped_count"] += 1
+                return True
+            try:
+                cycle = digest_cycle_at(self._now())
+                rollover = await self._repository.rollover_reconciled_digest_publication(
+                    publication_id, claim_token, cycle, limit=50
+                )
+                if not rollover.get("claim_valid"):
+                    counters["skipped_count"] += 1
+                    return True
+                if rollover.get("quota_exhausted"):
+                    self._quota_exhausted = True
+                    counters["skipped_count"] += 1
+                    return True
+                publication = rollover
+                attempts = self._attempt_count(publication)
+                last_error = "delivery_reconciled_no_marker"
+                ambiguous_failure = False
+            except Exception as exc:
+                counters["failed_count"] += 1
+                errors[f"retry_reservation_failed:{type(exc).__name__}"] += 1
+                return True
 
         if attempts >= self._attempt_limit:
+            try:
+                await self._repository.terminalize_digest_publication(
+                    publication_id,
+                    claim_token,
+                    "delivery_attempt_limit_reached:no_marker_found",
+                    attempt_limit=self._attempt_limit,
+                    conclusive_no_delivery=True,
+                )
+            except Exception as exc:
+                errors[f"publication_terminal_update_failed:{type(exc).__name__}"] += 1
             counters["skipped_count"] += 1
             log.info(
                 "Digest publication exhausted publication=%s attempts=%s",
@@ -596,25 +762,33 @@ class DigestService:
                 attempts,
             )
             return True
-        try:
-            updated = await self._repository.record_publication_attempt(
-                publication_id,
-                expected_attempt_count=attempts,
+        if destination_channel_id <= 0:
+            errors["destination_not_configured_for_retry"] += 1
+            await self._finish_reconciliation(
+                publication, claim_token, "destination_not_configured", errors
             )
-        except Exception as exc:
             counters["failed_count"] += 1
-            errors[f"attempt_record_failed:{type(exc).__name__}"] += 1
-            log.warning(
-                "Digest attempt could not be recorded publication=%s (%s)",
-                publication_id,
-                type(exc).__name__,
-            )
             return True
-        attempt_number = self._attempt_count(updated)
-        if attempt_number > self._attempt_limit:
-            counters["skipped_count"] += 1
-            return True
-
+        if destination_channel_id != channel_id:
+            try:
+                retarget = getattr(self._repository, "retarget_digest_publication", None)
+                if not callable(retarget):
+                    raise RuntimeError("claim-fenced destination update is unavailable")
+                updated_destination = await retarget(
+                    publication_id, claim_token, destination_channel_id
+                )
+                if not updated_destination.get("claim_valid"):
+                    counters["skipped_count"] += 1
+                    return True
+                publication = updated_destination
+                channel_id = int(publication.get("channel_id") or destination_channel_id)
+            except Exception as exc:
+                errors[f"destination_retarget_failed:{type(exc).__name__}"] += 1
+                await self._finish_reconciliation(
+                    publication, claim_token, "destination_retarget_failed", errors
+                )
+                counters["failed_count"] += 1
+                return True
         media_id = str(media.get("id") or "")
         object_key = str(media.get("storage_object_key") or "")
         expected_sha256 = str(media.get("sha256") or "")
@@ -625,7 +799,8 @@ class DigestService:
             )
         except Exception as exc:
             await self._record_failure(
-                publication_id,
+                publication,
+                claim_token,
                 f"storage_download_failed:{type(exc).__name__}",
                 counters,
                 errors,
@@ -633,37 +808,133 @@ class DigestService:
             return True
         if not data or len(data) > MAX_DIGEST_MEDIA_BYTES:
             await self._record_failure(
-                publication_id,
-                "invalid_downloaded_size",
-                counters,
-                errors,
+                publication, claim_token, "invalid_downloaded_size", counters, errors
             )
             return True
         actual_sha256 = hashlib.sha256(data).hexdigest()
         if not hmac.compare_digest(actual_sha256, expected_sha256):
             await self._record_failure(
-                publication_id,
-                "integrity_verification_failed",
-                counters,
-                errors,
+                publication, claim_token, "integrity_verification_failed", counters, errors
             )
             return True
 
-        source: dict[str, Any] | None = None
+        source: list[dict[str, Any]] = []
         try:
-            source = await self._repository.source_for_media(media_id)
+            list_sources = getattr(self._repository, "sources_for_media", None)
+            if callable(list_sources):
+                source = await list_sources(media_id)
+            else:
+                legacy_source = await self._repository.source_for_media(media_id)
+                source = [legacy_source] if legacy_source else []
         except Exception as exc:
+            await self._record_failure(
+                publication,
+                claim_token,
+                f"attribution_lookup_failed:{type(exc).__name__}",
+                counters,
+                errors,
+            )
             log.warning(
                 "Digest source attribution lookup failed item=%s (%s)",
                 media_id,
                 type(exc).__name__,
             )
+            return True
         context = PublicationContext.from_media_record(
             media,
             source,
             publication_marker=publication_marker(publication_id),
         )
         filename = str(media.get("filename") or f"archive.{media.get('extension') or 'bin'}")
+        try:
+            updated = await self._repository.advance_digest_attempt(
+                publication_id,
+                claim_token,
+                cycle,
+                expected_attempt_count=attempts,
+                attempt_limit=self._attempt_limit,
+            )
+        except Exception as exc:
+            counters["failed_count"] += 1
+            errors[f"attempt_record_failed:{type(exc).__name__}"] += 1
+            log.warning(
+                "Digest attempt could not be recorded publication=%s (%s)",
+                publication_id,
+                type(exc).__name__,
+            )
+            return True
+        if not updated.get("attempt_advanced"):
+            if updated.get("cycle_stale"):
+                if cycle_recovery_depth >= 1:
+                    errors["digest_cycle_stale_retry_exhausted"] += 1
+                    await self._finish_reconciliation(
+                        publication, claim_token, "digest_cycle_stale_retry_exhausted", errors
+                    )
+                    unaccounted.append(media_id)
+                    counters["failed_count"] += 1
+                    return False
+                fresh_cycle = digest_cycle_at(self._now())
+                if attempts > 0:
+                    errors["digest_cycle_stale"] += 1
+                    # An attempted publication may still carry reconciliation
+                    # context. Release this claim with backoff first; the next
+                    # due retry will reserve against the then-current cycle.
+                    await self._finish_reconciliation(
+                        publication, claim_token, "digest_cycle_stale", errors
+                    )
+                    try:
+                        refreshed, fresh_cycle = await self._reserve_with_cycle_refresh(
+                            media_id, channel_id, fresh_cycle
+                        )
+                    except Exception as exc:
+                        errors[f"cycle_rollover_reservation_failed:{type(exc).__name__}"] += 1
+                        counters["failed_count"] += 1
+                        return True
+                    if refreshed.get("cycle_stale"):
+                        errors["digest_cycle_stale_retry_exhausted"] += 1
+                        counters["failed_count"] += 1
+                        return True
+                    if refreshed.get("quota_exhausted"):
+                        self._quota_exhausted = True
+                    counters["skipped_count"] += 1
+                    return True
+                try:
+                    refreshed, fresh_cycle = await self._reserve_with_cycle_refresh(
+                        media_id, channel_id, fresh_cycle
+                    )
+                except Exception as exc:
+                    errors[f"cycle_rollover_reservation_failed:{type(exc).__name__}"] += 1
+                    unaccounted.append(media_id)
+                    counters["failed_count"] += 1
+                    return False
+                if refreshed.get("cycle_stale"):
+                    errors["digest_cycle_stale_retry_exhausted"] += 1
+                    await self._finish_reconciliation(
+                        publication, claim_token, "digest_cycle_stale_retry_exhausted", errors
+                    )
+                    unaccounted.append(media_id)
+                    counters["failed_count"] += 1
+                    return False
+                if refreshed.get("quota_exhausted"):
+                    self._quota_exhausted = True
+                    return True
+                if refreshed.get("terminal"):
+                    counters["skipped_count"] += 1
+                    return True
+                return await self._deliver(
+                    media,
+                    refreshed,
+                    channel_id=int(refreshed.get("channel_id") or channel_id),
+                    cycle=fresh_cycle,
+                    destination_channel_id=destination_channel_id,
+                    counters=counters,
+                    errors=errors,
+                    unaccounted=unaccounted,
+                    cycle_recovery_depth=cycle_recovery_depth + 1,
+                )
+            counters["skipped_count"] += 1
+            return True
+        attempt_number = self._attempt_count(updated)
         try:
             message_id = await self._publisher.publish(
                 filename=filename,
@@ -675,7 +946,8 @@ class DigestService:
             definite_rejection = isinstance(exc, DiscordPublicationRejectedError)
             error_kind = "rejected" if definite_rejection else "ambiguous"
             await self._record_failure(
-                publication_id,
+                publication,
+                claim_token,
                 f"discord_delivery_{error_kind}:{type(exc).__name__}",
                 counters,
                 errors,
@@ -691,10 +963,12 @@ class DigestService:
             return True
 
         try:
-            await self._repository.mark_publication_published(
-                publication_id,
-                int(message_id),
-            )
+            if not await self._repository.publish_digest_claimed(
+                publication_id, claim_token, int(message_id)
+            ):
+                errors["publication_claim_lost_after_delivery"] += 1
+                counters["stored_count"] += 1
+                return True
         except Exception as exc:
             counters["stored_count"] += 1
             errors["publication_status_update_failed"] += 1
@@ -716,7 +990,8 @@ class DigestService:
 
     async def _record_failure(
         self,
-        publication_id: str,
+        publication: dict[str, Any],
+        claim_token: str,
         reason: str,
         counters: dict[str, int],
         errors: Counter[str],
@@ -724,14 +999,54 @@ class DigestService:
         counters["failed_count"] += 1
         errors[reason] += 1
         try:
-            await self._repository.mark_publication_failed(publication_id, reason)
+            await self._repository.finish_digest_failure(
+                str(publication["id"]), claim_token, reason
+            )
         except Exception as exc:
             errors[f"publication_failure_update_failed:{type(exc).__name__}"] += 1
             log.warning(
                 "Digest failure could not be recorded publication=%s (%s)",
-                publication_id,
+                publication.get("id"),
                 type(exc).__name__,
             )
+
+    async def _claim(self, publication: dict[str, Any], claim_token: str) -> dict[str, Any] | None:
+        acquire = getattr(self._repository, "claim_digest_publication", None)
+        if not callable(acquire):
+            return None
+        claimed = await acquire(str(publication["id"]), claim_token)
+        if not claimed.get("claim_acquired"):
+            return None
+        return claimed
+
+    async def _reserve_with_cycle_refresh(
+        self, media_item_id: str, channel_id: int, cycle: str
+    ) -> tuple[dict[str, Any], str]:
+        reserve = getattr(self._repository, "reserve_digest_publication", None)
+        if not callable(reserve):
+            raise RuntimeError("atomic digest reservation is unavailable")
+        current_cycle = cycle
+        for attempt in range(2):
+            publication = await reserve(media_item_id, channel_id, current_cycle, limit=50)
+            if not publication.get("cycle_stale"):
+                return publication, current_cycle
+            if attempt == 0:
+                current_cycle = digest_cycle_at(self._now())
+        return {"cycle_stale": True}, current_cycle
+
+    async def _finish_reconciliation(
+        self,
+        publication: dict[str, Any],
+        claim_token: str,
+        reason: str,
+        errors: Counter[str],
+    ) -> None:
+        try:
+            await self._repository.finish_digest_reconciliation(
+                str(publication["id"]), claim_token, reason
+            )
+        except Exception as exc:
+            errors[f"reconciliation_state_write_failed:{type(exc).__name__}"] += 1
 
     async def _reconcile(
         self,
@@ -739,82 +1054,47 @@ class DigestService:
         *,
         channel_id: int,
         errors: Counter[str],
+        claim_token: str,
     ) -> str:
         publication_id = str(publication["id"])
         marker = publication_marker(publication_id)
-        last_error = str(publication.get("last_error") or "")
-        preserve_error = last_error if _is_ambiguous_delivery_error(last_error) else None
         find_marker = getattr(self._publisher, "find_publication_marker", None)
         if not callable(find_marker):
-            await self._record_reconciliation_error(
-                publication_id,
-                "reconciliation_unavailable",
-                errors,
-                preserve_error=preserve_error,
-            )
-            return "unreconciled"
+            errors["reconciliation_unavailable"] += 1
+            return "unreconciled:reconciliation_unavailable"
         try:
             lookup = await find_marker(channel_id=channel_id, marker=marker)
         except Exception as exc:
-            await self._record_reconciliation_error(
-                publication_id,
-                f"reconciliation_failed:{type(exc).__name__}",
-                errors,
-                preserve_error=preserve_error,
-            )
-            return "unreconciled"
+            reason = f"reconciliation_failed:{type(exc).__name__}"
+            errors[reason] += 1
+            return f"unreconciled:{reason}"
 
         message_id = getattr(lookup, "message_id", None)
         conclusive = bool(getattr(lookup, "conclusive", False))
         if message_id is not None:
             try:
-                await self._repository.mark_publication_published(
-                    publication_id,
-                    int(message_id),
+                updated = await self._repository.publish_digest_claimed(
+                    publication_id, claim_token, int(message_id)
                 )
+                if not updated:
+                    return "unreconciled:reconciliation_claim_lost"
             except Exception as exc:
-                await self._record_reconciliation_error(
-                    publication_id,
-                    f"reconciliation_update_failed:{type(exc).__name__}",
-                    errors,
-                    preserve_error=preserve_error,
-                )
-                return "unreconciled"
+                reason = f"reconciliation_update_failed:{type(exc).__name__}"
+                errors[reason] += 1
+                return f"unreconciled:{reason}"
             return "reconciled"
         if not conclusive:
-            await self._record_reconciliation_error(
-                publication_id,
-                "delivery_unreconciled",
-                errors,
-                preserve_error=preserve_error,
-            )
-            return "unreconciled"
+            errors["delivery_unreconciled"] += 1
+            return "unreconciled:delivery_unreconciled"
         return "safe_to_retry"
 
-    async def _record_reconciliation_error(
-        self,
-        publication_id: str,
-        reason: str,
-        errors: Counter[str],
-        *,
-        preserve_error: str | None = None,
-    ) -> None:
-        errors[reason] += 1
-        try:
-            await self._repository.record_publication_reconciliation_error(
-                publication_id,
-                reason,
-                preserve_error=preserve_error,
-            )
-        except Exception as exc:
-            errors[f"reconciliation_error_write_failed:{type(exc).__name__}"] += 1
-            log.warning(
-                "Digest reconciliation state could not be recorded publication=%s (%s)",
-                publication_id,
-                type(exc).__name__,
-            )
-
     def _eligible(self, media: dict[str, Any]) -> bool:
+        if str(media.get("media_type") or "").strip().lower() not in {
+            "image",
+            "animation",
+            "video",
+        }:
+            return False
         if media.get("verification_status") != "verified":
             return False
         if media.get("download_status") != "stored":
@@ -836,19 +1116,15 @@ class DigestService:
         return 1 <= size_bytes <= MAX_DIGEST_MEDIA_BYTES
 
     def _destination_channel(self, media: dict[str, Any]) -> int:
-        category = str(media.get("category") or "").strip().lower()
+        media_type = str(media.get("media_type") or "").strip().lower()
         mappings = getattr(self._settings, "category_channels", None) or {}
-        mapped = mappings.get(category) if isinstance(mappings, dict) else None
+        mapped = mappings.get(media_type) if isinstance(mappings, dict) else None
         if mapped:
             try:
                 return int(mapped)
             except (TypeError, ValueError):
                 pass
-        fallback = getattr(self._settings, "discoveries_channel_id", None) or 0
-        try:
-            return int(fallback)
-        except (TypeError, ValueError):
-            return 0
+        return 0
 
     @staticmethod
     def _attempt_count(publication: dict[str, Any]) -> int:

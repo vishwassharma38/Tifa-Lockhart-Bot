@@ -11,13 +11,14 @@ from urllib.parse import urlparse
 from app.db.client import SupabaseDatabase
 from app.reddit.models import RedditCandidate
 
-_JOB_TYPES = ("reddit_collection", "brave_discovery", "crawl", "daily_digest")
+_JOB_TYPES = ("reddit_collection", "bing_discovery", "crawl", "daily_digest")
 _DIGEST_STATE_FIELDS = frozenset(
     {
         "last_window_start",
         "last_window_end",
         "last_completed_at",
         "cursor_media_created_at",
+        "digest_cycle",
     }
 )
 _DISCOVERY_STATUSES = frozenset(
@@ -201,8 +202,8 @@ class MediaRepository:
             .execute()
         )
 
-    async def latest_brave_runs(self, limit: int = 1) -> list[dict[str, Any]]:
-        return await self.latest_jobs("brave_discovery", limit)
+    async def latest_bing_runs(self, limit: int = 1) -> list[dict[str, Any]]:
+        return await self.latest_jobs("bing_discovery", limit)
 
     async def latest_crawl_runs(self, limit: int = 1) -> list[dict[str, Any]]:
         return await self.latest_jobs("crawl", limit)
@@ -237,9 +238,9 @@ class MediaRepository:
             "failed": count_status("failed"),
             "oversize": count_status("oversize"),
             "last_digest_success_at": state.get("last_digest_success_at"),
-            "last_brave_success_at": state.get("last_brave_success_at"),
-            "brave_paused": bool(state.get("brave_paused")),
-            "brave_pause_reason": state.get("brave_pause_reason"),
+            "last_bing_success_at": state.get("last_bing_success_at"),
+            "bing_paused": bool(state.get("bing_paused")),
+            "bing_pause_reason": state.get("bing_pause_reason"),
         }
 
     async def mark_reddit_success(self) -> None:
@@ -250,40 +251,40 @@ class MediaRepository:
             {"last_reddit_success_at": datetime.now(tz=UTC).isoformat()}
         ).eq("id", 1).execute()
 
-    async def mark_brave_success(self) -> None:
-        await self._to_thread(self._mark_brave_success_sync)
+    async def mark_bing_success(self) -> None:
+        await self._to_thread(self._mark_bing_success_sync)
 
-    def _mark_brave_success_sync(self) -> None:
+    def _mark_bing_success_sync(self) -> None:
         self._client().table("runtime_state").update(
-            {"last_brave_success_at": datetime.now(tz=UTC).isoformat()}
+            {"last_bing_success_at": datetime.now(tz=UTC).isoformat()}
         ).eq("id", 1).execute()
 
-    async def pause_brave(self, reason: str) -> None:
-        await self._to_thread(self._pause_brave_sync, reason)
+    async def pause_bing(self, reason: str) -> None:
+        await self._to_thread(self._pause_bing_sync, reason)
 
-    def _pause_brave_sync(self, reason: str) -> None:
+    def _pause_bing_sync(self, reason: str) -> None:
         self._client().table("runtime_state").update(
             {
-                "brave_paused": True,
-                "brave_pause_reason": reason[:500],
-                "brave_paused_at": datetime.now(tz=UTC).isoformat(),
+                "bing_paused": True,
+                "bing_pause_reason": reason[:500],
+                "bing_paused_at": datetime.now(tz=UTC).isoformat(),
             }
         ).eq("id", 1).execute()
 
-    async def clear_brave_pause(self) -> None:
+    async def clear_bing_pause(self) -> None:
         """Clear the persisted pause after an owner reviews the restriction.
 
         No Discord command calls this. It exists for a deliberate operator
         action and never runs automatically on startup or from ``/start``.
         """
-        await self._to_thread(self._clear_brave_pause_sync)
+        await self._to_thread(self._clear_bing_pause_sync)
 
-    def _clear_brave_pause_sync(self) -> None:
+    def _clear_bing_pause_sync(self) -> None:
         self._client().table("runtime_state").update(
             {
-                "brave_paused": False,
-                "brave_pause_reason": None,
-                "brave_paused_at": None,
+                "bing_paused": False,
+                "bing_pause_reason": None,
+                "bing_paused_at": None,
             }
         ).eq("id", 1).execute()
 
@@ -329,6 +330,30 @@ class MediaRepository:
             .execute()
         )
         return rows[0] if rows else None
+
+    async def sources_for_media(self, media_item_id: str) -> list[dict[str, Any]]:
+        """Return every source association for one canonical media item."""
+        return await self._to_thread(self._sources_for_media_sync, media_item_id)
+
+    def _sources_for_media_sync(self, media_item_id: str) -> list[dict[str, Any]]:
+        size = 1000
+        offset = 0
+        results: list[dict[str, Any]] = []
+        while True:
+            page = self._rows(
+                self._client()
+                .table("media_sources")
+                .select("*")
+                .eq("media_item_id", media_item_id)
+                .order("discovered_at")
+                .order("id")
+                .range(offset, offset + size - 1)
+                .execute()
+            )
+            results.extend(page)
+            if len(page) < size:
+                return results
+            offset += len(page)
 
     async def asset_stats(self, start: str | None = None) -> dict[str, int]:
         return await self._to_thread(self._asset_stats_sync, start)
@@ -881,6 +906,62 @@ class MediaRepository:
             self._ensure_digest_publication_sync, media_item_id, channel_id
         )
 
+    async def reserve_digest_publication(
+        self,
+        media_item_id: str,
+        channel_id: int,
+        digest_cycle: str,
+        *,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Atomically reserve one global digest slot through PostgreSQL."""
+        return await self._to_thread(
+            self._reserve_digest_publication_sync,
+            media_item_id,
+            channel_id,
+            digest_cycle,
+            limit,
+        )
+
+    async def retarget_digest_publication(
+        self, publication_id: str, claim_token: str, channel_id: int
+    ) -> dict[str, Any]:
+        return await self._digest_claim_rpc(
+            "retarget_daily_digest_publication",
+            {
+                "p_publication_id": publication_id,
+                "p_claim_token": claim_token,
+                "p_channel_id": channel_id,
+            },
+        )
+
+    def _reserve_digest_publication_sync(
+        self,
+        media_item_id: str,
+        channel_id: int,
+        digest_cycle: str,
+        limit: int,
+    ) -> dict[str, Any]:
+        response = (
+            self._client()
+            .rpc(
+                "reserve_daily_digest_publication",
+                {
+                    "p_media_item_id": media_item_id,
+                    "p_channel_id": channel_id,
+                    "p_digest_cycle": digest_cycle,
+                    "p_limit": max(0, limit),
+                },
+            )
+            .execute()
+        )
+        data = getattr(response, "data", None)
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, dict):
+            raise RepositoryError("Digest reservation returned an invalid response")
+        return data
+
     def _ensure_digest_publication_sync(
         self, media_item_id: str, channel_id: int
     ) -> dict[str, Any]:
@@ -915,44 +996,161 @@ class MediaRepository:
         publication_id: str,
         *,
         expected_attempt_count: int,
-    ) -> dict[str, Any]:
-        """Advance the real delivery attempt count before any send is attempted."""
-        return await self._to_thread(
-            self._record_publication_attempt_sync,
+        claim_token: str,
+        digest_cycle: str,
+        attempt_limit: int = 3,
+    ) -> dict[str, Any] | None:
+        """Advance attempts only through a live, fenced delivery claim."""
+        result = await self.advance_digest_attempt(
             publication_id,
-            expected_attempt_count,
+            claim_token,
+            digest_cycle,
+            expected_attempt_count=expected_attempt_count,
+            attempt_limit=attempt_limit,
+        )
+        return result if result.get("attempt_advanced") else None
+
+    async def claim_digest_publication(
+        self, publication_id: str, claim_token: str, *, lease_seconds: int = 900
+    ) -> dict[str, Any]:
+        return await self._digest_claim_rpc(
+            "claim_daily_digest_publication",
+            {
+                "p_publication_id": publication_id,
+                "p_claim_token": claim_token,
+                "p_lease_seconds": lease_seconds,
+            },
         )
 
-    def _record_publication_attempt_sync(
-        self, publication_id: str, expected_attempt_count: int
+    async def renew_digest_claim(
+        self, publication_id: str, claim_token: str, *, lease_seconds: int = 900
+    ) -> bool:
+        return bool(
+            await self._digest_claim_rpc(
+                "renew_daily_digest_claim",
+                {
+                    "p_publication_id": publication_id,
+                    "p_claim_token": claim_token,
+                    "p_lease_seconds": lease_seconds,
+                },
+            )
+        )
+
+    async def advance_digest_attempt(
+        self,
+        publication_id: str,
+        claim_token: str,
+        digest_cycle: str,
+        *,
+        expected_attempt_count: int,
+        attempt_limit: int,
+        lease_seconds: int = 900,
     ) -> dict[str, Any]:
-        payload = {
-            "status": "pending",
-            "attempt_count": max(0, expected_attempt_count) + 1,
-            "last_error": None,
-        }
-        response = (
-            self._client()
-            .table("publications")
-            .update(payload)
-            .eq("id", publication_id)
-            .eq("attempt_count", max(0, expected_attempt_count))
-            .execute()
+        return await self._digest_claim_rpc(
+            "advance_daily_digest_attempt_for_cycle",
+            {
+                "p_publication_id": publication_id,
+                "p_claim_token": claim_token,
+                "p_expected_attempt_count": expected_attempt_count,
+                "p_digest_cycle": digest_cycle,
+                "p_attempt_limit": attempt_limit,
+                "p_lease_seconds": lease_seconds,
+            },
         )
-        rows = self._rows(response)
-        if rows:
-            return rows[0]
-        current = self._rows(
-            self._client()
-            .table("publications")
-            .select("*")
-            .eq("id", publication_id)
-            .limit(1)
-            .execute()
+
+    async def terminalize_digest_publication(
+        self,
+        publication_id: str,
+        claim_token: str,
+        error: str,
+        *,
+        attempt_limit: int,
+        conclusive_no_delivery: bool,
+    ) -> bool:
+        return bool(
+            await self._digest_claim_rpc(
+                "terminalize_daily_digest_publication",
+                {
+                    "p_publication_id": publication_id,
+                    "p_claim_token": claim_token,
+                    "p_error": error,
+                    "p_attempt_limit": attempt_limit,
+                    "p_conclusive_no_delivery": conclusive_no_delivery,
+                },
+            )
         )
-        if current:
-            return current[0]
-        raise RepositoryError("Publication attempt could not be recorded")
+
+    async def finish_digest_failure(
+        self, publication_id: str, claim_token: str, error: str
+    ) -> bool:
+        return bool(
+            await self._digest_claim_rpc(
+                "finish_daily_digest_failure",
+                {
+                    "p_publication_id": publication_id,
+                    "p_claim_token": claim_token,
+                    "p_error": error,
+                },
+            )
+        )
+
+    async def finish_digest_reconciliation(
+        self, publication_id: str, claim_token: str, error: str
+    ) -> bool:
+        return bool(
+            await self._digest_claim_rpc(
+                "finish_daily_digest_reconciliation",
+                {
+                    "p_publication_id": publication_id,
+                    "p_claim_token": claim_token,
+                    "p_error": error,
+                },
+            )
+        )
+
+    async def publish_digest_claimed(
+        self, publication_id: str, claim_token: str, message_id: int
+    ) -> bool:
+        return bool(
+            await self._digest_claim_rpc(
+                "publish_daily_digest_publication",
+                {
+                    "p_publication_id": publication_id,
+                    "p_claim_token": claim_token,
+                    "p_message_id": message_id,
+                },
+            )
+        )
+
+    async def rollover_reconciled_digest_publication(
+        self,
+        publication_id: str,
+        claim_token: str,
+        digest_cycle: str,
+        *,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        return await self._digest_claim_rpc(
+            "rollover_reconciled_digest_publication",
+            {
+                "p_publication_id": publication_id,
+                "p_claim_token": claim_token,
+                "p_digest_cycle": digest_cycle,
+                "p_limit": limit,
+            },
+        )
+
+    async def _digest_claim_rpc(self, function: str, params: dict[str, Any]) -> Any:
+        return await self._to_thread(self._digest_claim_rpc_sync, function, params)
+
+    def _digest_claim_rpc_sync(self, function: str, params: dict[str, Any]) -> Any:
+        response = self._client().rpc(function, params).execute()
+        data = getattr(response, "data", None)
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if data is None:
+            raise RepositoryError(f"{function} returned an empty response")
+        return data
 
     async def mark_publication_published(
         self,
@@ -989,6 +1187,8 @@ class MediaRepository:
 
     def _mark_publication_failed_sync(self, publication_id: str, error: str) -> dict[str, Any]:
         payload = {"status": "failed", "last_error": error[:500]}
+        if not error.startswith(("discord_delivery_ambiguous:", "discord_delivery_failed")):
+            payload["digest_slot_reserved"] = False
         response = (
             self._client().table("publications").update(payload).eq("id", publication_id).execute()
         )
@@ -1030,16 +1230,18 @@ class MediaRepository:
         *,
         attempt_limit: int,
         limit: int = 100,
+        now: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return retryable rows and exhausted rows that still need reconciliation."""
         return await self._to_thread(
             self._list_retryable_digest_publications_sync,
             attempt_limit,
             limit,
+            now or datetime.now(tz=UTC).isoformat(),
         )
 
     def _list_retryable_digest_publications_sync(
-        self, attempt_limit: int, limit: int
+        self, attempt_limit: int, limit: int, now: str
     ) -> list[dict[str, Any]]:
         return self._rows(
             self._client()
@@ -1048,7 +1250,15 @@ class MediaRepository:
             .eq("purpose", "daily_digest")
             .in_("status", ["pending", "failed"])
             .lt("attempt_count", max(1, attempt_limit))
+            .eq("digest_terminal", False)
+            .or_(f"next_attempt_at.is.null,next_attempt_at.lte.{now}")
+            .or_(
+                "delivery_claim_token.is.null,delivery_claim_expires_at.is.null,"
+                f"delivery_claim_expires_at.lte.{now}"
+            )
+            .order("next_attempt_at", nullsfirst=True)
             .order("created_at")
+            .order("id")
             .limit(max(1, limit))
             .execute()
         )
@@ -1058,28 +1268,32 @@ class MediaRepository:
         *,
         attempt_limit: int,
         page_size: int = 100,
+        now: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return every exhausted ambiguous row, reading the backlog in stable pages."""
         return await self._to_thread(
             self._list_exhausted_ambiguous_digest_publications_sync,
             attempt_limit,
             page_size,
+            now or datetime.now(tz=UTC).isoformat(),
         )
 
     def _list_exhausted_ambiguous_digest_publications_sync(
-        self, attempt_limit: int, page_size: int
+        self, attempt_limit: int, page_size: int, now: str
     ) -> list[dict[str, Any]]:
         size = max(1, page_size)
-        offset = 0
         results: list[dict[str, Any]] = []
+        cursor_created_at: str | None = None
+        cursor_id: str | None = None
         while True:
-            page = self._rows(
+            query = (
                 self._client()
                 .table("publications")
                 .select("*")
                 .eq("purpose", "daily_digest")
                 .in_("status", ["pending", "failed"])
                 .gte("attempt_count", max(1, attempt_limit))
+                .eq("digest_terminal", False)
                 .or_(
                     ",".join(
                         (
@@ -1089,15 +1303,21 @@ class MediaRepository:
                         )
                     )
                 )
+                .or_(f"next_attempt_at.is.null,next_attempt_at.lte.{now}")
                 .order("created_at")
                 .order("id")
-                .range(offset, offset + size - 1)
-                .execute()
             )
+            if cursor_created_at is not None and cursor_id is not None:
+                query = query.or_(
+                    f"created_at.gt.{cursor_created_at},"
+                    f"and(created_at.eq.{cursor_created_at},id.gt.{cursor_id})"
+                )
+            page = self._rows(query.range(0, size - 1).execute())
             results.extend(page)
             if len(page) < size:
                 return results
-            offset += len(page)
+            cursor_created_at = str(page[-1].get("created_at") or "")
+            cursor_id = str(page[-1].get("id") or "")
 
     async def get_media_item(self, media_item_id: str) -> dict[str, Any] | None:
         return await self._to_thread(self._get_media_item_sync, media_item_id)

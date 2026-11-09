@@ -21,8 +21,86 @@ def test_defaults_do_not_require_credentials() -> None:
     assert settings.supabase_configured is False
     assert settings.b2_configured is False
     assert settings.reddit_access_approved is False
-    assert settings.brave_html_enabled is False
+    assert settings.reddit_seed_discovery_enabled is True
+    assert settings.reddit_search_phrases == (
+        "Tifa Lockhart",
+        "Tifa Lockhart fanart",
+        "Tifa cosplay",
+        "Tifa Lockhart cosplay",
+        "Tifa Lockhart NSFW",
+    )
+    assert settings.bing_search_phrases == settings.reddit_search_phrases
+    assert settings.bing_html_enabled is False
+    assert settings.bing_html_access_approved is False
+    assert settings.bing_search_base_url == "https://www.bing.com/search"
+    assert settings.bing_search_interval_hours == 8
+    assert settings.bing_search_max_pages_per_phrase == 2
     assert settings.perceptual_hash_enabled is False
+
+
+def test_bing_settings_are_independently_configurable() -> None:
+    settings = Settings.from_env(
+        env={
+            "DISCORD_TOKEN": "token",
+            "REDDIT_SEARCH_PHRASES": "Reddit phrase",
+            "BING_HTML_ENABLED": "true",
+            "BING_HTML_ACCESS_APPROVED": "true",
+            "BING_SEARCH_BASE_URL": "https://www.bing.com/search?setlang=en",
+            "BING_SEARCH_INTERVAL_HOURS": "12",
+            "BING_SEARCH_PHRASES": "Bing phrase one|Bing phrase two",
+            "BING_SEARCH_MAX_PAGES_PER_PHRASE": "4",
+        },
+        load_env_file=False,
+    )
+
+    settings.validate_runtime()
+
+    assert settings.reddit_search_phrases == ("Reddit phrase",)
+    assert settings.bing_html_enabled is True
+    assert settings.bing_html_access_approved is True
+    assert settings.bing_search_base_url == "https://www.bing.com/search?setlang=en"
+    assert settings.bing_search_interval_hours == 12
+    assert settings.bing_search_phrases == ("Bing phrase one", "Bing phrase two")
+    assert settings.bing_search_max_pages_per_phrase == 4
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        (
+            {"BING_SEARCH_BASE_URL": "http://www.bing.com/search"},
+            "BING_SEARCH_BASE_URL",
+        ),
+        (
+            {"BING_SEARCH_BASE_URL": "https://user:password@www.bing.com/search"},
+            "credentials",
+        ),
+        (
+            {"BING_SEARCH_BASE_URL": "https://www.bing.com/search#fragment"},
+            "fragment",
+        ),
+        ({"BING_SEARCH_INTERVAL_HOURS": "0"}, "BING_SEARCH_INTERVAL_HOURS"),
+        ({"BING_SEARCH_INTERVAL_HOURS": "169"}, "BING_SEARCH_INTERVAL_HOURS"),
+        (
+            {"BING_SEARCH_MAX_PAGES_PER_PHRASE": "0"},
+            "BING_SEARCH_MAX_PAGES_PER_PHRASE",
+        ),
+        (
+            {"BING_SEARCH_MAX_PAGES_PER_PHRASE": "11"},
+            "BING_SEARCH_MAX_PAGES_PER_PHRASE",
+        ),
+        ({"BING_SEARCH_PHRASES": ""}, "at least one phrase"),
+        ({"BING_SEARCH_PHRASES": "x" * 201}, "200 characters or fewer"),
+    ],
+)
+def test_invalid_bing_configuration_is_rejected(env: dict[str, str], message: str) -> None:
+    settings = Settings.from_env(
+        env={"DISCORD_TOKEN": "token", **env},
+        load_env_file=False,
+    )
+
+    with pytest.raises(ConfigurationError, match=message):
+        settings.validate_runtime()
 
 
 def test_parses_phase_one_settings() -> None:
@@ -45,8 +123,12 @@ def test_parses_phase_one_settings() -> None:
             "B2_BUCKET_NAME": "private-bucket",
             "B2_KEY_ID": "key-id",
             "B2_APPLICATION_KEY": "application-key",
+            "DISCORD_CATEGORY_CHANNELS_JSON": (
+                '{"image": 1, "animation": 2, "video": 3, "dumpster": 4}'
+            ),
             "REDDIT_ACCESS_APPROVED": "true",
-            "BRAVE_HTML_ENABLED": "false",
+            "REDDIT_SEED_DISCOVERY_ENABLED": "false",
+            "BING_HTML_ENABLED": "false",
             "PERCEPTUAL_HASH_ENABLED": "true",
         },
         load_env_file=False,
@@ -64,7 +146,8 @@ def test_parses_phase_one_settings() -> None:
     assert settings.supabase_configured is True
     assert settings.b2_configured is True
     assert settings.reddit_access_approved is True
-    assert settings.brave_html_enabled is False
+    assert settings.reddit_seed_discovery_enabled is False
+    assert settings.bing_html_enabled is False
     assert settings.perceptual_hash_enabled is True
 
 
@@ -92,9 +175,9 @@ def test_boolean_parsing(raw: str, expected: bool) -> None:
 
 
 def test_invalid_boolean_is_rejected() -> None:
-    with pytest.raises(ConfigurationError, match="BRAVE_HTML_ENABLED"):
+    with pytest.raises(ConfigurationError, match="BING_HTML_ENABLED"):
         Settings.from_env(
-            env={"BRAVE_HTML_ENABLED": "sometimes"},
+            env={"BING_HTML_ENABLED": "sometimes"},
             load_env_file=False,
         )
 
@@ -374,10 +457,33 @@ def test_complete_service_configuration_passes() -> None:
             "B2_BUCKET_NAME": "bucket",
             "B2_KEY_ID": "key-id",
             "B2_APPLICATION_KEY": "application-key",
+            "DISCORD_CATEGORY_CHANNELS_JSON": (
+                '{"image": 1, "animation": 2, "video": 3, "dumpster": 4}'
+            ),
         },
         load_env_file=False,
     )
     settings.validate_service_configuration()
+
+
+def test_digest_requires_four_distinct_channels() -> None:
+    settings = Settings.from_env(
+        env={
+            "SUPABASE_URL": "https://example.supabase.co",
+            "SUPABASE_SERVICE_ROLE_KEY": "service-key",
+            "B2_ENDPOINT_URL": "https://s3.us-west-004.backblazeb2.com",
+            "B2_REGION": "us-west-004",
+            "B2_BUCKET_NAME": "bucket",
+            "B2_KEY_ID": "key-id",
+            "B2_APPLICATION_KEY": "application-key",
+            "DISCORD_CATEGORY_CHANNELS_JSON": (
+                '{"image": 1, "animation": 1, "video": 3, "dumpster": 4}'
+            ),
+        },
+        load_env_file=False,
+    )
+    with pytest.raises(ConfigurationError, match="four distinct channel IDs"):
+        settings.validate_service_configuration()
 
 
 def test_secret_values_and_safe_summary(make_settings) -> None:
@@ -450,7 +556,7 @@ def test_category_channel_mapping_is_parsed() -> None:
     [
         ('{"fanart": ', "valid JSON"),
         ('["fanart"]', "JSON object"),
-        ('{"portrait": 123}', "unsupported category"),
+        ('{"portrait": 123}', "unsupported media type"),
         ('{"fanart": "123"}', "integer channel IDs"),
         ('{"fanart": 12.5}', "integer channel IDs"),
         ('{"fanart": true}', "integer channel IDs"),

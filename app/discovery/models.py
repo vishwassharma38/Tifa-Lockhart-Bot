@@ -35,7 +35,7 @@ class WebCandidate:
     media_metadata: dict[str, Any] = field(default_factory=dict)
     extraction_reason: str | None = None
     discovery_id: str | None = None
-    source_type: str = "brave_html"
+    source_type: str = "web_legacy"
     source_platform: str = "web"
     created_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     normalized_url: str | None = None

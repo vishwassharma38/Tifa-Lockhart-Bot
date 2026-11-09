@@ -13,6 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from app.bot.publisher import PublicationContext, build_publication_message
 from app.config import Settings
 from app.health.status import StatusReport
 from app.jobs.digest import DEFAULT_DIGEST_ATTEMPT_LIMIT, digest_window_incomplete
@@ -183,28 +184,24 @@ class PhaseFourCommands(commands.Cog):
             if hashlib.sha256(data).hexdigest() != row["sha256"]:
                 await interaction.followup.send("The archived file failed integrity verification.")
                 return
-            source = await repo.source_for_media(row["id"])
+            list_sources = getattr(repo, "sources_for_media", None)
+            if callable(list_sources):
+                sources = await list_sources(row["id"])
+            else:
+                source = await repo.source_for_media(row["id"])
+                sources = [source] if source else []
             channel_id = interaction.channel_id or self.bot.settings.saves_channel_id or 0
             publication = await repo.create_publication(str(row["id"]), channel_id, "random")
             publication_id = str(publication["id"])
             filename = row.get("filename") or f"archive.{row.get('extension', 'bin')}"
             file = discord.File(io.BytesIO(data), filename=filename)
-            details = [
-                (source or {}).get("title")
-                or (source or {}).get("caption")
-                or row.get("title")
-                or row.get("caption")
-                or "Archived Tifa media"
-            ]
-            if source:
-                if source.get("creator_name"):
-                    creator = f"Creator: {source['creator_name']}"
-                    if source.get("creator_profile_url"):
-                        creator += f" ({source['creator_profile_url']})"
-                    details.append(creator)
-                if source.get("source_url"):
-                    details.append(f"Source: {source['source_url']}")
-            message = await interaction.followup.send("\n".join(details), file=file, wait=True)
+            context = PublicationContext.from_media_record(row, sources)
+            message = await interaction.followup.send(
+                build_publication_message(context),
+                file=file,
+                suppress_embeds=True,
+                wait=True,
+            )
             await repo.update_publication(publication_id, status="published", message_id=message.id)
         except Exception as exc:
             log.warning("Random command failed (%s)", type(exc).__name__)
@@ -288,23 +285,23 @@ class PhaseFourCommands(commands.Cog):
                 value=f"Persisted: {'enabled' if state.get('collection_enabled') else 'paused'}; effective: {'enabled' if effective else 'blocked/paused'}; Reddit feature: {'enabled' if self.bot.settings.reddit_enabled else 'disabled'}; approval: {'confirmed' if self.bot.settings.reddit_access_approved else 'not confirmed'}; reason: {blocked or 'none'}",
                 inline=False,
             )
-            brave_service = getattr(self.bot, "brave_service", None)
-            brave_block = (
-                brave_service.block_reason(state)
-                if brave_service is not None
-                else "Brave service unavailable"
+            bing_service = getattr(self.bot, "bing_service", None)
+            bing_block = (
+                bing_service.block_reason(state)
+                if bing_service is not None
+                else "Bing service unavailable"
             )
-            if not self.bot.settings.brave_html_enabled:
-                brave_state = "disabled by feature flag"
-            elif not self.bot.settings.brave_html_access_approved:
-                brave_state = "enabled but access not approved"
-            elif state.get("brave_paused"):
-                brave_state = "persistently paused"
+            if not self.bot.settings.bing_html_enabled:
+                bing_state = "disabled by feature flag"
+            elif not self.bot.settings.bing_html_access_approved:
+                bing_state = "enabled but access not approved"
+            elif state.get("bing_paused"):
+                bing_state = "persistently paused"
             else:
-                brave_state = "enabled and approved, waiting for schedule"
-            brave_runs = await self.bot.repository.latest_brave_runs(1)
+                bing_state = "enabled and approved, waiting for schedule"
+            bing_runs = await self.bot.repository.latest_bing_runs(1)
             crawl_runs = await self.bot.repository.latest_crawl_runs(1)
-            brave_latest = brave_runs[0] if brave_runs else None
+            bing_latest = bing_runs[0] if bing_runs else None
             crawl_latest = crawl_runs[0] if crawl_runs else None
             digest_runs = await self.bot.repository.latest_digest_runs(1)
             digest_counts = await self.bot.repository.digest_publication_counts(
@@ -332,12 +329,12 @@ class PhaseFourCommands(commands.Cog):
                 return f"{row.get('outcome')}: {row.get('error_summary') or 'no errors'}"
 
             embed.add_field(
-                name="Brave discovery",
+                name="Bing discovery",
                 value=(
-                    f"Feature: {'enabled' if self.bot.settings.brave_html_enabled else 'disabled'}; "
-                    f"access: {'approved' if self.bot.settings.brave_html_access_approved else 'not approved'}; "
-                    f"state: {brave_state}; pause reason: "
-                    f"{state.get('brave_pause_reason') or 'none'}; block: {brave_block or 'none'}"
+                    f"Feature: {'enabled' if self.bot.settings.bing_html_enabled else 'disabled'}; "
+                    f"access: {'approved' if self.bot.settings.bing_html_access_approved else 'not approved'}; "
+                    f"state: {bing_state}; pause reason: "
+                    f"{state.get('bing_pause_reason') or 'none'}; block: {bing_block or 'none'}"
                 ),
                 inline=False,
             )
@@ -347,8 +344,8 @@ class PhaseFourCommands(commands.Cog):
                 inline=False,
             )
             embed.add_field(
-                name="Latest Brave run",
-                value=run_summary(brave_latest),
+                name="Latest Bing run",
+                value=run_summary(bing_latest),
                 inline=False,
             )
             embed.add_field(
@@ -367,8 +364,8 @@ class PhaseFourCommands(commands.Cog):
                 inline=False,
             )
             embed.add_field(
-                name="Last successful Brave discovery",
-                value=str(state.get("last_brave_success_at") or "Never"),
+                name="Last successful Bing discovery",
+                value=str(state.get("last_bing_success_at") or "Never"),
                 inline=False,
             )
             embed.add_field(
@@ -386,7 +383,7 @@ class PhaseFourCommands(commands.Cog):
             )
             errors = [
                 str(row.get("error_summary"))
-                for row in (crawl_latest, brave_latest, latest)
+                for row in (crawl_latest, bing_latest, latest)
                 if row and row.get("error_summary")
             ]
             embed.add_field(

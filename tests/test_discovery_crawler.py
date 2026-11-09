@@ -623,7 +623,7 @@ def row(
         "depth": depth,
         "status": status,
         "retry_count": 0,
-        "source_type": "brave_html",
+        "source_type": "bing_html",
         "metadata_json": metadata or {},
     }
 
@@ -671,7 +671,7 @@ async def test_crawler_verifies_acquires_and_admits_bounded_children(make_settin
     candidate, publish = pipeline.calls[0]
     assert publish is False
     assert candidate.discovery_id == "discovery-1"
-    assert candidate.source_type == "brave_html"
+    assert candidate.source_type == "bing_html"
     assert [asset.url for asset in candidate.media_assets] == ["https://example.com/full.jpg"]
     verified_update = repository.updates[0][1]
     assert verified_update["status"] == "verified"
@@ -685,6 +685,30 @@ async def test_crawler_verifies_acquires_and_admits_bounded_children(make_settin
     assert first_child["metadata_json"]["search_phrase"] == "Tifa Lockhart"
     assert all(edge["parent_discovery_id"] == "discovery-1" for edge in repository.edges)
     assert repository.finished[-1][2] == "succeeded"
+
+
+async def test_reddit_seed_root_is_crawled_and_children_keep_reddit_provenance(
+    make_settings,
+) -> None:
+    page = extracted_page(media=("/full.jpg",), links=("https://other.example/page",))
+    root = row(metadata={"reddit_submission_id": "reddit-post"})
+    root["source_type"] = "reddit"
+    repository = FakeRepository(rows=[root])
+    pipeline = FakePipeline()
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        pipeline,
+        FakeInspector(ok_inspection(page)),
+    )
+
+    await crawler_.run_once(scheduled=True)
+
+    candidate, publish = pipeline.calls[0]
+    assert publish is False
+    assert candidate.source_type == "reddit"
+    assert repository.upserts[0]["source_type"] == "reddit"
+    assert repository.upserts[0]["metadata_json"]["origin_source_type"] == "reddit"
 
 
 async def test_crawler_stages_verified_pages_without_original_media(make_settings) -> None:

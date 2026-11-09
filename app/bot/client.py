@@ -14,7 +14,7 @@ from discord.ext import commands
 from app.bot.commands import PhaseFourCommands
 from app.bot.publisher import DiscordPublisher
 from app.config import Settings
-from app.discovery.brave import BraveDiscoveryService, BraveSearchAdapter
+from app.discovery.bing import BingDiscoveryService, BingSearchAdapter
 from app.discovery.crawler import DiscoveryCrawler, WebSaveService
 from app.discovery.http import SafeHttpClient
 from app.jobs.digest import DigestService
@@ -68,7 +68,7 @@ class TifaBot(commands.Bot):
         self.storage = storage
         self.collector: RedditCollector | None = None
         self.pipeline: Phase2Pipeline | None = None
-        self.brave_service: BraveDiscoveryService | None = None
+        self.bing_service: BingDiscoveryService | None = None
         self.crawler: DiscoveryCrawler | None = None
         self.web_save_service: WebSaveService | None = None
         self.safe_http_client: SafeHttpClient | None = None
@@ -113,10 +113,10 @@ class TifaBot(commands.Bot):
                     connect_timeout=self.settings.crawl_connect_timeout_seconds,
                     read_timeout=self.settings.crawl_read_timeout_seconds,
                 )
-                self.brave_service = BraveDiscoveryService(
+                self.bing_service = BingDiscoveryService(
                     self.settings,
                     self.repository,
-                    BraveSearchAdapter(self.settings, client=self.safe_http_client),
+                    BingSearchAdapter(self.settings, client=self.safe_http_client),
                 )
                 self.crawler = DiscoveryCrawler(
                     self.settings,
@@ -152,10 +152,10 @@ class TifaBot(commands.Bot):
                     misfire_grace_time=900,
                 )
                 self.scheduler.add_job(
-                    self._scheduled_brave_discovery,
+                    self._scheduled_bing_discovery,
                     "interval",
-                    hours=self.settings.brave_search_interval_hours,
-                    id="brave_discovery",
+                    hours=self.settings.bing_search_interval_hours,
+                    id="bing_discovery",
                     replace_existing=True,
                     coalesce=True,
                     max_instances=1,
@@ -184,9 +184,9 @@ class TifaBot(commands.Bot):
                 )
                 self.scheduler.start()
                 log.info(
-                    "Scheduler initialized; persisted collection=%s Brave interval=%s hours",
+                    "Scheduler initialized; persisted collection=%s Bing interval=%s hours",
                     bool(state.get("collection_enabled")),
-                    self.settings.brave_search_interval_hours,
+                    self.settings.bing_search_interval_hours,
                 )
             except Exception as exc:
                 log.warning("Scheduler unavailable (%s)", type(exc).__name__)
@@ -231,19 +231,19 @@ class TifaBot(commands.Bot):
                     self._active_background_tasks.discard(current)
                 self._active_collection_task = None
 
-    async def _scheduled_brave_discovery(self) -> None:
+    async def _scheduled_bing_discovery(self) -> None:
         current = asyncio.current_task()
         if current is not None:
             self._active_background_tasks.add(current)
         try:
-            if self.brave_service is not None:
-                await self.brave_service.run(scheduled=True)
+            if self.bing_service is not None:
+                await self.bing_service.run(scheduled=True)
             if self.crawler is not None:
                 await self.crawler.run_once(scheduled=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning("Scheduled Brave discovery failed (%s)", type(exc).__name__)
+            log.warning("Scheduled Bing discovery failed (%s)", type(exc).__name__)
         finally:
             if current is not None:
                 self._active_background_tasks.discard(current)
