@@ -89,6 +89,14 @@ class TifaBot(commands.Bot):
                         log.info("Recovered %s interrupted discovery record(s)", recovered)
                 except Exception as exc:
                     log.warning("Discovery recovery unavailable (%s)", type(exc).__name__)
+                backfill = getattr(self.repository, "backfill_frontier_domains", None)
+                if callable(backfill):
+                    try:
+                        updated = await backfill()
+                        if updated:
+                            log.info("Registered %s legacy frontier domain identity(ies)", updated)
+                    except Exception as exc:
+                        log.warning("Legacy frontier backfill unavailable (%s)", type(exc).__name__)
                 connector = RedditConnector(self.settings)
                 fetcher = MediaFetcher()
                 pipeline = Phase2Pipeline(

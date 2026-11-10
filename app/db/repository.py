@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import httpx
 
 from app.db.client import SupabaseDatabase
+from app.discovery.domains import domain_identity, identity_from_row
 from app.reddit.models import RedditCandidate
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,10 @@ _DISCOVERY_UPDATE_FIELDS = frozenset(
         "creator_name",
         "creator_profile_url",
         "domain",
+        "hostname",
+        "registrable_domain",
+        "crawl_priority",
+        "claimed_at",
     }
 )
 
@@ -246,20 +251,69 @@ class MediaRepository:
         return await self._run(self._recover_processing_discoveries_sync, retry=True)
 
     def _recover_processing_discoveries_sync(self) -> int:
-        client = self._client()
-        rows = self._rows(
-            client.table("discoveries").select("id").eq("status", "processing").execute()
+        result = (
+            self._client().rpc("recover_expired_crawl_claims", {"p_lease_seconds": 900}).execute()
         )
-        now = datetime.now(tz=UTC).isoformat()
-        for row in rows:
-            client.table("discoveries").update(
-                {
-                    "status": "queued",
-                    "last_error": "interrupted_by_restart",
-                    "next_attempt_at": now,
-                }
-            ).eq("id", row["id"]).execute()
-        return len(rows)
+        data = getattr(result, "data", None)
+        if isinstance(data, int):
+            return data
+        if isinstance(data, dict):
+            return int(data.get("recovered_count") or 0)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return int(data[0].get("recovered_count") or 0)
+        return 0
+
+    async def backfill_frontier_domains(self, *, batch_size: int = 500) -> int:
+        """Backfill PSL identities for legacy queued and processing discoveries."""
+        return await self._run(self._backfill_frontier_domains_sync, batch_size, retry=True)
+
+    def _backfill_frontier_domains_sync(self, batch_size: int) -> int:
+        client = self._client()
+        size = max(1, min(1000, batch_size))
+        updated = 0
+        while True:
+            rows = self._rows(
+                client.table("discoveries")
+                .select("id,normalized_url,domain,discovered_at,status,fetched_at")
+                .is_("registrable_domain", "null")
+                .range(0, size - 1)
+                .execute()
+            )
+            if not rows:
+                break
+            identities = []
+            for row in rows:
+                raw_url = row.get("normalized_url") or row.get("url")
+                try:
+                    if not isinstance(raw_url, str):
+                        raise ValueError("discovery URL missing")
+                    identity = domain_identity(raw_url)
+                except ValueError:
+                    identity = identity_from_row(row)
+                if identity.hostname == "unknown":
+                    continue
+                identities.append(
+                    {
+                        "id": row.get("id"),
+                        "hostname": identity.hostname,
+                        "registrable_domain": identity.registrable_domain,
+                    }
+                )
+            if not identities:
+                break
+            result = client.rpc(
+                "backfill_crawl_domain_identities", {"p_items": identities}
+            ).execute()
+            data = getattr(result, "data", None)
+            if isinstance(data, int):
+                updated += data
+            elif isinstance(data, dict):
+                updated += int(data.get("updated_count") or len(identities))
+            else:
+                updated += len(identities)
+            if len(rows) < size:
+                break
+        return updated
 
     async def latest_jobs(self, job_type: str, limit: int = 1) -> list[dict[str, Any]]:
         return await self._run(self._latest_jobs_sync, job_type, limit, retry=True)
@@ -315,6 +369,113 @@ class MediaRepository:
             "bing_paused": bool(state.get("bing_paused")),
             "bing_pause_reason": state.get("bing_pause_reason"),
         }
+
+    async def crawl_frontier_summary(self) -> dict[str, int]:
+        return await self._run(self._crawl_frontier_summary_sync, retry=True)
+
+    def _crawl_frontier_summary_sync(self) -> dict[str, int]:
+        response = self._client().rpc("crawl_frontier_summary", {}).execute()
+        data = getattr(response, "data", None)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            data = data[0]
+        if not isinstance(data, dict):
+            return {}
+        return {key: int(value or 0) for key, value in data.items()}
+
+    async def get_robots_policy(self, origin: str) -> dict[str, Any] | None:
+        return await self._run(self._get_robots_policy_sync, origin, retry=True)
+
+    def _get_robots_policy_sync(self, origin: str) -> dict[str, Any] | None:
+        rows = self._rows(
+            self._client()
+            .table("crawl_origin_state")
+            .select("robots_body,robots_status,robots_category,robots_expires_at")
+            .eq("origin", origin)
+            .limit(1)
+            .execute()
+        )
+        return rows[0] if rows else None
+
+    async def store_robots_policy(
+        self, origin: str, hostname: str, registrable_domain: str, policy: dict[str, Any]
+    ) -> None:
+        await self._run(
+            self._store_robots_policy_sync,
+            origin,
+            hostname,
+            registrable_domain,
+            dict(policy),
+            retry=True,
+        )
+
+    def _store_robots_policy_sync(
+        self, origin: str, hostname: str, registrable_domain: str, policy: dict[str, Any]
+    ) -> None:
+        client = self._client()
+        # Redirect targets can introduce an origin before its registrable domain
+        # has a frontier row. The origin policy table references that row, so
+        # register the minimum identity idempotently before persisting robots.
+        client.table("crawl_domain_state").upsert(
+            {
+                "registrable_domain": registrable_domain,
+                "hostnames": [hostname],
+            },
+            on_conflict="registrable_domain",
+            ignore_duplicates=True,
+        ).execute()
+        payload = {
+            "origin": origin,
+            "hostname": hostname,
+            "registrable_domain": registrable_domain,
+            **policy,
+        }
+        client.table("crawl_origin_state").upsert(payload, on_conflict="origin").execute()
+
+    async def pause_crawl_domain(self, registrable_domain: str, *, until: str, reason: str) -> None:
+        await self._run(
+            self._pause_crawl_domain_sync, registrable_domain, until, reason, retry=True
+        )
+
+    def _pause_crawl_domain_sync(self, registrable_domain: str, until: str, reason: str) -> None:
+        self._client().rpc(
+            "pause_crawl_domain",
+            {
+                "p_registrable_domain": registrable_domain,
+                "p_next_eligible_at": until,
+                "p_reason": reason[:120],
+            },
+        ).execute()
+
+    async def sitemap_scan_is_due(self, registrable_domain: str, *, max_age_days: int = 30) -> bool:
+        return await self._run(
+            self._sitemap_scan_is_due_sync, registrable_domain, max_age_days, retry=True
+        )
+
+    def _sitemap_scan_is_due_sync(self, registrable_domain: str, max_age_days: int) -> bool:
+        rows = self._rows(
+            self._client()
+            .table("crawl_domain_state")
+            .select("sitemap_checked_at")
+            .eq("registrable_domain", registrable_domain)
+            .limit(1)
+            .execute()
+        )
+        value = rows[0].get("sitemap_checked_at") if rows else None
+        if not value:
+            return True
+        try:
+            checked = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        return (datetime.now(tz=UTC) - checked).total_seconds() >= max_age_days * 86400
+
+    async def mark_sitemap_scan(self, registrable_domain: str) -> None:
+        await self._run(self._mark_sitemap_scan_sync, registrable_domain, retry=True)
+
+    def _mark_sitemap_scan_sync(self, registrable_domain: str) -> None:
+        self._client().table("crawl_domain_state").update(
+            {"sitemap_checked_at": datetime.now(tz=UTC).isoformat()}
+        ).eq("registrable_domain", registrable_domain).execute()
 
     async def mark_reddit_success(self) -> None:
         await self._run(self._mark_reddit_success_sync, retry=True)
@@ -490,6 +651,7 @@ class MediaRepository:
         return await self._run(self._upsert_discovery_record_sync, dict(payload), retry=True)
 
     def _upsert_discovery_record_sync(self, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        payload = self._with_domain_identity(dict(payload))
         normalized_url = str(payload["normalized_url"])
         existing = self._get_discovery_by_url_sync(normalized_url)
         if existing is not None:
@@ -540,44 +702,66 @@ class MediaRepository:
         *,
         limit: int,
         max_depth: int,
+        per_domain_limit: int = 2,
+        new_domain_share: float = 0.8,
     ) -> list[dict[str, Any]]:
         """Atomically claim up to ``limit`` due queued discoveries."""
         # Repeating the whole select-and-claim could exceed the requested batch
         # after a partially committed attempt, so leave this operation unretried.
-        return await self._run(self._claim_discoveries_sync, limit, max_depth, retry=False)
+        return await self._run(
+            self._claim_discoveries_sync,
+            limit,
+            max_depth,
+            per_domain_limit,
+            new_domain_share,
+            retry=False,
+        )
 
-    def _claim_discoveries_sync(self, limit: int, max_depth: int) -> list[dict[str, Any]]:
+    def _claim_discoveries_sync(
+        self, limit: int, max_depth: int, per_domain_limit: int, new_domain_share: float
+    ) -> list[dict[str, Any]]:
         if limit < 1:
             return []
-        now = datetime.now(tz=UTC).isoformat()
-        rows = self._rows(
+        result = (
             self._client()
-            .table("discoveries")
-            .select("*")
-            .eq("status", "queued")
-            .lte("depth", max_depth)
-            .or_(f"next_attempt_at.is.null,next_attempt_at.lte.{now}")
-            .order("discovered_at")
-            .limit(limit)
+            .rpc(
+                "claim_crawl_discoveries",
+                {
+                    "p_limit": limit,
+                    "p_max_depth": max_depth,
+                    "p_per_domain_limit": max(1, min(10, per_domain_limit)),
+                    "p_new_domain_share": max(0.5, min(0.95, float(new_domain_share))),
+                },
+            )
             .execute()
         )
-        claimed: list[dict[str, Any]] = []
-        for row in rows:
-            discovery_id = row.get("id")
-            if discovery_id is None:
-                continue
-            response = (
-                self._client()
-                .table("discoveries")
-                .update({"status": "processing", "next_attempt_at": None})
-                .eq("id", discovery_id)
-                .eq("status", "queued")
-                .execute()
+        return self._rows(result)
+
+    @staticmethod
+    def _with_domain_identity(payload: dict[str, Any]) -> dict[str, Any]:
+        value = payload.get("normalized_url") or payload.get("url")
+        if not isinstance(value, str):
+            return payload
+        try:
+            identity = domain_identity(value)
+        except ValueError:
+            return payload
+        metadata = payload.get("metadata_json")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        try:
+            priority = int(
+                metadata.get("crawl_priority")
+                or metadata.get("admission_score")
+                or payload.get("crawl_priority")
+                or 0
             )
-            updated = self._rows(response)
-            if updated:
-                claimed.append({**row, **updated[0]})
-        return claimed
+        except (TypeError, ValueError):
+            priority = 0
+        payload["hostname"] = identity.hostname
+        payload["registrable_domain"] = identity.registrable_domain
+        payload["domain"] = payload.get("domain") or identity.hostname
+        payload["crawl_priority"] = max(0, min(100, priority))
+        return payload
 
     async def update_discovery(self, discovery_id: str, fields: dict[str, Any]) -> dict[str, Any]:
         return await self._run(self._update_discovery_sync, discovery_id, dict(fields), retry=True)
@@ -586,6 +770,8 @@ class MediaRepository:
         payload = {key: value for key, value in fields.items() if key in _DISCOVERY_UPDATE_FIELDS}
         if "status" in payload and payload["status"] not in _DISCOVERY_STATUSES:
             raise RepositoryError("Unsupported discovery status")
+        if payload.get("status") != "processing" and "status" in payload:
+            payload["claimed_at"] = None
         if not payload:
             return {"id": discovery_id}
         response = (
@@ -623,6 +809,13 @@ class MediaRepository:
         child_normalized_url: str,
         discovered_from_url: str,
         depth: int,
+        original_url: str | None = None,
+        link_text: str | None = None,
+        source_domain: str | None = None,
+        destination_domain: str | None = None,
+        admission_score: int | None = None,
+        admission_reason: str | None = None,
+        discovery_mechanism: str | None = None,
     ) -> dict[str, Any]:
         return await self._run(
             self._record_discovery_edge_sync,
@@ -631,6 +824,13 @@ class MediaRepository:
             child_normalized_url,
             discovered_from_url,
             depth,
+            original_url,
+            link_text,
+            source_domain,
+            destination_domain,
+            admission_score,
+            admission_reason,
+            discovery_mechanism,
             retry=True,
         )
 
@@ -654,6 +854,13 @@ class MediaRepository:
         child_normalized_url: str,
         discovered_from_url: str,
         depth: int,
+        original_url: str | None,
+        link_text: str | None,
+        source_domain: str | None,
+        destination_domain: str | None,
+        admission_score: int | None,
+        admission_reason: str | None,
+        discovery_mechanism: str | None,
     ) -> dict[str, Any]:
         existing = self._rows(self._edge_query(parent_discovery_id, child_normalized_url).execute())
         if existing:
@@ -664,6 +871,15 @@ class MediaRepository:
             "child_normalized_url": child_normalized_url,
             "discovered_from_url": discovered_from_url,
             "depth": depth,
+            "original_url": original_url,
+            "link_text": (link_text or "")[:300] or None,
+            "source_domain": source_domain,
+            "destination_domain": destination_domain,
+            "admission_score": (
+                max(0, min(100, int(admission_score))) if admission_score is not None else None
+            ),
+            "admission_reason": (admission_reason or "")[:500] or None,
+            "discovery_mechanism": discovery_mechanism,
         }
         try:
             response = self._client().table("discovery_edges").insert(payload).execute()
@@ -713,6 +929,7 @@ class MediaRepository:
             "verified_at": now,
             "metadata_json": metadata,
         }
+        payload = self._with_domain_identity(payload)
         response = (
             self._client()
             .table("discoveries")

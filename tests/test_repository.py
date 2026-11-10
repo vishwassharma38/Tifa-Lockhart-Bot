@@ -147,6 +147,7 @@ class FakeTable:
         payload: dict[str, object],
         *,
         on_conflict: str | None = None,
+        ignore_duplicates: bool = False,
     ) -> FakeQuery:
         self.calls.append(("upsert", payload, on_conflict))
         query = FakeQuery(self, "upsert")
@@ -820,27 +821,97 @@ async def test_generic_discovery_upsert_inserts_new_normalized_url() -> None:
     assert insert[1]["normalized_url"] == "https://example.com/b"
 
 
-async def test_claim_discoveries_filters_due_rows_and_uses_conditional_update() -> None:
+async def test_claim_discoveries_uses_atomic_fair_frontier_rpc() -> None:
     client = FakeClient()
-    discoveries = client.table("discoveries")
-    discoveries.results["select"] = [{"id": "discovery-1", "status": "queued", "depth": 2}]
-    discoveries.results["update"] = [{"id": "discovery-1", "status": "processing", "depth": 2}]
+    client.rpc_data = [{"id": "discovery-1", "status": "processing", "depth": 2}]
     repository = make_repository(client)
 
-    rows = await repository.claim_discoveries(limit=5, max_depth=6)
+    rows = await repository.claim_discoveries(limit=25, max_depth=6, per_domain_limit=2)
 
     assert rows[0]["status"] == "processing"
-    select_query = discoveries.queries[0]
-    assert ("status", "queued") in select_query.filters
-    assert ("lte.depth", 6) in select_query.filters
-    assert select_query.or_expression is not None
-    assert "next_attempt_at.is.null" in select_query.or_expression
-    assert select_query.order_value == ("discovered_at", False)
-    assert select_query.limit_value == 5
-    update_query = discoveries.queries[1]
-    assert update_query.operation == "update"
-    assert ("id", "discovery-1") in update_query.filters
-    assert ("status", "queued") in update_query.filters
+    assert client.rpc_calls == [
+        (
+            "claim_crawl_discoveries",
+            {
+                "p_limit": 25,
+                "p_max_depth": 6,
+                "p_per_domain_limit": 2,
+                "p_new_domain_share": 0.8,
+            },
+        )
+    ]
+
+
+async def test_crawl_frontier_summary_and_robots_policy_persistence() -> None:
+    client = FakeClient()
+    client.rpc_data = {
+        "domains_discovered": "20",
+        "domains_unexplored": 8,
+        "domains_explored": 12,
+        "domains_cooling_down": 2,
+        "queued_domains": 7,
+        "domains_visited_recently": 6,
+    }
+    client.table("crawl_origin_state").results["select"] = [
+        {
+            "robots_body": "User-agent: *\\nDisallow: /private",
+            "robots_status": 200,
+            "robots_category": "ok",
+            "robots_expires_at": "2026-11-11T00:00:00+00:00",
+        }
+    ]
+    repository = make_repository(client)
+
+    summary = await repository.crawl_frontier_summary()
+    policy = await repository.get_robots_policy("https://example.com")
+    await repository.store_robots_policy(
+        "https://example.com",
+        "example.com",
+        "example.com",
+        {"robots_status": 200, "robots_category": "ok", "robots_body": ""},
+    )
+
+    assert summary["domains_discovered"] == 20
+    assert summary["domains_unexplored"] == 8
+    assert policy["robots_status"] == 200
+    assert client.rpc_calls[-1][0] == "crawl_frontier_summary"
+    assert client.table("crawl_origin_state").queries[0].filters == [
+        ("origin", "https://example.com")
+    ]
+    domain_upsert = next(
+        call for call in client.table("crawl_domain_state").calls if call[0] == "upsert"
+    )
+    assert domain_upsert[1] == {
+        "registrable_domain": "example.com",
+        "hostnames": ["example.com"],
+    }
+    upsert = next(call for call in client.table("crawl_origin_state").calls if call[0] == "upsert")
+    assert upsert[1]["registrable_domain"] == "example.com"
+
+
+async def test_frontier_backfill_uses_stored_host_when_legacy_url_is_invalid() -> None:
+    client = FakeClient()
+    discoveries = client.table("discoveries")
+    discoveries.queued_results["select"] = [
+        [
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "normalized_url": "http://localhost/private",
+                "domain": "gallery.example.org",
+            }
+        ],
+        [],
+    ]
+    client.rpc_data = 1
+    repository = make_repository(client)
+
+    updated = await repository.backfill_frontier_domains()
+
+    assert updated == 1
+    assert client.rpc_calls[0][0] == "backfill_crawl_domain_identities"
+    item = client.rpc_calls[0][1]["p_items"][0]
+    assert item["hostname"] == "gallery.example.org"
+    assert item["registrable_domain"] == "example.org"
 
 
 async def test_update_discovery_filters_fields_and_rejects_unknown_status() -> None:
@@ -861,6 +932,7 @@ async def test_update_discovery_filters_fields_and_rejects_unknown_status() -> N
     _, payload, _ = client.table("discoveries").calls[0]
     assert payload == {
         "status": "verified",
+        "claimed_at": None,
         "http_status": 200,
         "metadata_json": {"title": "Tifa"},
     }
@@ -904,22 +976,13 @@ async def test_record_discovery_edge_deduplicates_and_preserves_root_paths() -> 
 
 async def test_recover_processing_discoveries_requeues_interrupted_rows() -> None:
     client = FakeClient()
-    discoveries = client.table("discoveries")
-    discoveries.results["select"] = [{"id": "discovery-1"}, {"id": "discovery-2"}]
-    discoveries.results["update"] = [{"id": "discovery-1"}]
+    client.rpc_data = 2
     repository = make_repository(client)
 
     recovered = await repository.recover_processing_discoveries()
 
     assert recovered == 2
-    assert discoveries.queries[0].filters == [("status", "processing")]
-    updates = [call for call in discoveries.calls if call[0] == "update"]
-    assert len(updates) == 2
-    assert all(payload["status"] == "queued" for _operation, payload, _conflict in updates)
-    assert all(
-        payload["last_error"] == "interrupted_by_restart"
-        for _operation, payload, _conflict in updates
-    )
+    assert client.rpc_calls == [("recover_expired_crawl_claims", {"p_lease_seconds": 900})]
 
 
 async def test_latest_phase5_runs_filter_job_type_and_order_descending() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -24,8 +25,10 @@ from app.discovery.http import (
     DomainThrottle,
     FetchResult,
     RequestBudget,
+    SafeHttpClient,
 )
 from app.discovery.robots import RobotsCache
+from app.discovery.url_safety import validate_url_literal
 from app.pipeline.phase2 import Phase2Result, Phase2Status
 
 
@@ -200,6 +203,68 @@ async def test_inspector_returns_extracted_metadata_for_html(make_settings) -> N
     assert client.calls[1][1]["allowed_content_types"] is not None
 
 
+async def test_inspector_checks_robots_for_cross_domain_redirect_destination(make_settings) -> None:
+    class Content:
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+
+        async def iter_chunked(self, _size: int):
+            if self.body:
+                yield self.body
+
+    class Response:
+        def __init__(self, status: int, headers: dict[str, str], body: bytes = b"") -> None:
+            self.status = status
+            self.headers = headers
+            self.content = Content(body)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc_info: object) -> bool:
+            return False
+
+    class Session:
+        def __init__(self) -> None:
+            self.responses = [
+                Response(404, {}),
+                Response(302, {"Location": "https://target.example/private/page"}),
+                Response(
+                    200,
+                    {"Content-Type": "text/plain"},
+                    b"User-agent: *\nDisallow: /private",
+                ),
+            ]
+            self.calls: list[str] = []
+
+        def get(self, url: str, **_kwargs: object):
+            self.calls.append(url)
+            return self.responses.pop(0)
+
+    async def validate_public(url: str):
+        return SimpleNamespace(url=validate_url_literal(url), addresses=("8.8.8.8",))
+
+    session = Session()
+    settings = make_settings()
+    client = SafeHttpClient(session=session, validator=validate_public)
+    inspector = PageInspector(settings, client, sleep=no_sleep)
+
+    inspection = await inspector.inspect(
+        "https://source.example/start",
+        budget=RequestBudget(max_domain_requests=20),
+        throttle=make_throttle(),
+        robots=RobotsCache(user_agent="TifaLockhartBot/1.0"),
+    )
+
+    assert inspection.category == "robots_disallowed"
+    assert inspection.reason == "robots_disallowed"
+    assert session.calls == [
+        "https://source.example/robots.txt",
+        "https://source.example/start",
+        "https://target.example/robots.txt",
+    ]
+
+
 async def test_inspector_obeys_robots_disallow_without_fetching_the_page(make_settings) -> None:
     settings = make_settings()
     client = FakeHttpClient(
@@ -361,6 +426,7 @@ async def test_inspector_does_not_retry_permanent_http_errors(make_settings) -> 
 
     assert inspection.category == "failed"
     assert inspection.attempts == 1
+    assert inspection.retryable is False
     assert len([call for call in client.calls if not call[0].endswith("robots.txt")]) == 1
 
 
@@ -534,7 +600,14 @@ class FakeRepository:
     ) -> None:
         self.finished.append((job_id, dict(counters), outcome, error))
 
-    async def claim_discoveries(self, *, limit: int, max_depth: int):
+    async def claim_discoveries(
+        self,
+        *,
+        limit: int,
+        max_depth: int,
+        per_domain_limit: int = 2,
+        new_domain_share: float = 0.8,
+    ):
         self.claims.append((limit, max_depth))
         return self.rows
 
@@ -685,6 +758,8 @@ async def test_crawler_verifies_acquires_and_admits_bounded_children(make_settin
     assert first_child["metadata_json"]["search_phrase"] == "Tifa Lockhart"
     assert all(edge["parent_discovery_id"] == "discovery-1" for edge in repository.edges)
     assert repository.finished[-1][2] == "succeeded"
+    assert repository.finished[-1][1]["stats_json"]["visited_domains"] == ["example.com"]
+    assert repository.finished[-1][1]["stats_json"]["new_domains"] == ["other.example"]
 
 
 async def test_reddit_seed_root_is_crawled_and_children_keep_reddit_provenance(
@@ -919,6 +994,179 @@ async def test_crawler_records_retry_attempts_for_exhausted_failures(make_settin
     update = repository.updates[0][1]
     assert update["status"] == "failed"
     assert update["retry_count"] == 3
+
+
+async def test_crawler_does_not_requeue_permanent_http_failures(make_settings) -> None:
+    inspection = PageInspection(
+        "https://example.com/page",
+        None,
+        404,
+        "failed",
+        "http_404",
+        attempts=1,
+        retryable=False,
+    )
+    repository = FakeRepository(rows=[row()])
+    crawler_ = crawler(make_settings, repository, FakePipeline(), FakeInspector([inspection]))
+
+    await crawler_.run_once(scheduled=True)
+
+    update = repository.updates[0][1]
+    assert update["status"] == "failed"
+    assert update["next_attempt_at"] is None
+    assert update["retry_count"] == 1
+
+
+async def test_crawler_recursively_follows_a_b_c_d_across_domains(make_settings) -> None:
+    urls = [
+        "https://creator-a.com/start",
+        "https://creator-b.com/gallery",
+        "https://creator-c.com/portfolio",
+        "https://creator-d.com/art",
+    ]
+    html_by_url = {
+        urls[index]: (
+            "<html><head><title>Tifa Lockhart fan art</title></head><body>"
+            "<p>Artist portfolio featuring Tifa Lockhart.</p>"
+            + (
+                f'<a href="{urls[index + 1]}">Tifa Lockhart fan art portfolio</a>'
+                if index < len(urls) - 1
+                else ""
+            )
+            + "</body></html>"
+        )
+        for index in range(len(urls))
+    }
+
+    class RecursiveRepository(FakeRepository):
+        async def claim_discoveries(self, *, limit: int, max_depth: int, **_kwargs: Any):
+            claimed, self.rows = self.rows[:limit], self.rows[limit:]
+            return claimed
+
+        async def upsert_discovery_record(self, payload: dict[str, Any]):
+            child, created = await super().upsert_discovery_record(payload)
+            if created:
+                self.rows.append(child)
+            return child, created
+
+    class MappingInspector:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def inspect(self, url: str, **_kwargs: Any) -> PageInspection:
+            self.calls.append(url)
+            page = extract_page(html_by_url[url], url)
+            return ok_inspection(page, url)
+
+    repository = RecursiveRepository(
+        rows=[row(url=urls[0], metadata={"search_phrase": "Tifa Lockhart"})]
+    )
+    inspector = MappingInspector()
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        inspector,
+        CRAWL_BATCH_SIZE="25",
+        MAX_CRAWL_DEPTH="6",
+    )
+
+    for _ in urls:
+        await crawler_.run_once(scheduled=True)
+
+    assert inspector.calls == urls
+    assert len(repository.edges) == 3
+    assert [edge["discovered_from_url"] for edge in repository.edges] == urls[:3]
+    assert [edge["child_normalized_url"] for edge in repository.edges] == urls[1:]
+    assert [edge["depth"] for edge in repository.edges] == [1, 2, 3]
+
+
+async def test_weak_page_admits_relevant_external_link_but_not_generic_navigation(
+    make_settings,
+) -> None:
+    url = "https://travel-blog.example/journal"
+    page = extract_page(
+        "<html><head><title>Weekend travel journal</title></head><body>"
+        '<nav><a href="https://social.example/about">About</a></nav>'
+        '<main><a href="https://artist-portfolio.example/portfolio">Artist portfolio</a></main>'
+        "</body></html>",
+        url,
+    )
+    repository = FakeRepository(rows=[row(url=url)])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page, url)),
+    )
+
+    counters = await crawler_.run_once(scheduled=True)
+
+    assert [item["normalized_url"] for item in repository.upserts] == [
+        "https://artist-portfolio.example/portfolio"
+    ]
+    assert counters["skipped_url_count"] >= 1
+
+
+async def test_search_result_evidence_alone_does_not_expand_generic_links(make_settings) -> None:
+    url = "https://travel-blog.example/journal"
+    page = extract_page(
+        "<html><head><title>Weekend travel journal</title></head><body>"
+        '<a href="/next">More posts</a></body></html>',
+        url,
+    )
+    repository = FakeRepository(
+        rows=[
+            row(
+                url=url,
+                metadata={
+                    "search_result_title": "Tifa Lockhart Fan Art",
+                    "search_result_snippet": "Artwork of Tifa Lockhart",
+                    "search_phrase": "Tifa Lockhart",
+                },
+            )
+        ]
+    )
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page, url)),
+    )
+
+    await crawler_.run_once(scheduled=True)
+
+    assert repository.upserts == []
+
+
+async def test_crawler_admits_sitemap_locations_through_the_normal_frontier(make_settings) -> None:
+    page_url = "https://example.com/home"
+    sitemap_url = "https://example.com/sitemap.xml"
+    sitemap_page = "https://example.com/tifa-artist-gallery"
+    html = b"<html><head><title>Tifa Lockhart</title></head><body>Gallery.</body></html>"
+    sitemap = (
+        b'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        b"<url><loc>" + sitemap_page.encode() + b"</loc></url></urlset>"
+    )
+    client = FakeHttpClient(
+        {
+            page_url: make_result(page_url, body=html),
+            sitemap_url: make_result(sitemap_url, body=sitemap),
+        }
+    )
+    repository = FakeRepository(rows=[row(url=page_url)])
+    settings = make_settings()
+    crawler_ = DiscoveryCrawler(
+        settings,
+        repository,
+        FakePipeline(),
+        client=client,
+        inspector=make_inspector(settings, client),
+    )
+
+    await crawler_.run_once(scheduled=True)
+
+    assert [item["normalized_url"] for item in repository.upserts] == [sitemap_page]
 
 
 async def test_crawler_stages_extraction_failures_in_the_dumpster(make_settings) -> None:

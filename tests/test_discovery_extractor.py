@@ -4,6 +4,7 @@ import pytest
 
 from app.discovery.extractor import (
     clean_text,
+    extract_http_link_header,
     extract_page,
     is_direct_media_url,
 )
@@ -163,6 +164,57 @@ def test_extract_page_ignores_unsafe_canonical_links() -> None:
     page = extract_page(html, "https://example.com/page")
 
     assert page.canonical_url is None
+
+
+def test_extract_page_resolves_base_area_and_meaningful_link_relations() -> None:
+    html = """
+    <html><head>
+      <base href="https://artist.example/gallery/">
+      <link rel="next" href="page-2">
+      <link rel="canonical" href="https://unrelated.example/canonical">
+    </head><body>
+      <area href="artwork" alt="Tifa artwork">
+      <a href="portfolio">Artist portfolio</a>
+    </body></html>
+    """
+
+    page = extract_page(html, "https://artist.example/old/page")
+    links = {link.url: link for link in page.links}
+
+    assert "https://artist.example/gallery/page-2" in links
+    assert links["https://artist.example/gallery/page-2"].kind == "next"
+    assert "https://artist.example/gallery/artwork" in links
+    assert links["https://artist.example/gallery/artwork"].kind == "area"
+    assert "https://artist.example/gallery/portfolio" in links
+    assert "https://unrelated.example/canonical" not in links
+
+
+def test_extract_page_drops_action_and_infinite_navigation_routes() -> None:
+    page = extract_page(
+        """<html><body>
+        <a href="/login">Login</a>
+        <a href="/search?q=tifa">Search</a>
+        <a href="/a/b/a/b/a/b/a/b/a">Repeating path</a>
+        <a href="/gallery/tifa">Tifa gallery</a>
+        </body></html>""",
+        "https://example.com/",
+    )
+
+    assert [link.url for link in page.links] == ["https://example.com/gallery/tifa"]
+
+
+def test_http_link_header_parses_useful_relations_and_skips_canonical() -> None:
+    links = extract_http_link_header(
+        '<https://example.com/page-2>; rel="next", '
+        '<https://example.com/artist>; rel="author"; title="Artist portfolio", '
+        '<https://canonical.example/page>; rel="canonical"',
+        "https://example.com/gallery/page-1",
+    )
+
+    assert [(link.url, link.kind) for link in links] == [
+        ("https://example.com/page-2", "next"),
+        ("https://example.com/artist", "author"),
+    ]
 
 
 def test_extract_page_without_metadata_still_returns_text() -> None:

@@ -15,6 +15,8 @@ REQUIRED_TABLES = {
     "job_runs",
     "runtime_state",
     "digest_state",
+    "crawl_domain_state",
+    "crawl_origin_state",
 }
 
 
@@ -258,6 +260,45 @@ def test_phase5_migration_adds_durable_discovery_controls() -> None:
     assert "drop column" not in lowered
     assert "delete from" not in lowered
     assert "truncate" not in lowered
+
+
+def test_domain_frontier_migration_is_additive_fair_and_atomic() -> None:
+    sql = read_migration("013_domain_aware_crawl_frontier.sql").lower()
+
+    for column in (
+        "hostname",
+        "registrable_domain",
+        "crawl_priority",
+        "claimed_at",
+    ):
+        assert f"add column if not exists {column}" in sql
+    assert "claim_crawl_discoveries" in sql
+    assert "p_new_domain_share numeric default 0.8" in sql
+    assert "row_number() over" in sql
+    assert "partition by coalesce(nullif(d.registrable_domain" in sql
+    assert "cold_domain_rank" in sql
+    assert "domain_round <= greatest(1, least(p_per_domain_limit, 10))" in sql
+    assert "for update of d skip locked" in sql
+    assert re.search(
+        r"limit greatest\(0, least\(p_limit, 300\)\)\s+for update of d skip locked", sql
+    )
+    assert "set status = 'processing'" in sql
+    assert "last_claimed_at = pg_catalog.now()" in sql
+    assert "recover_expired_crawl_claims" in sql
+    assert "backfill_crawl_domain_identities" in sql
+    assert "crawl_origin_state" in sql
+    assert "robots_expires_at" in sql
+    assert "next_eligible_at" in sql
+    assert "create index if not exists idx_discoveries_frontier_round" in sql
+    assert "create index if not exists idx_discoveries_frontier_due" in sql
+    assert "alter table public.crawl_domain_state enable row level security" in sql
+    assert "alter table public.crawl_origin_state enable row level security" in sql
+    assert "grant execute on function public.claim_crawl_discoveries" in sql
+    assert "source_type_check" not in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+    assert "truncate" not in sql
+    assert "on delete cascade" not in sql
 
 
 def test_bing_search_provider_migration_preserves_history() -> None:

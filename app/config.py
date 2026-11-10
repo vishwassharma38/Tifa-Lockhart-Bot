@@ -188,6 +188,8 @@ class Settings:
     crawl_read_timeout_seconds: float = 20.0
     crawl_max_attempts: int = 3
     crawl_batch_size: int = 25
+    crawl_domain_batch_limit: int = 2
+    crawl_new_domain_share: float = 0.8
 
     @classmethod
     def from_env(
@@ -267,6 +269,8 @@ class Settings:
             crawl_read_timeout_seconds=_parse_float(env, "CRAWL_READ_TIMEOUT_SECONDS", 20.0),
             crawl_max_attempts=_parse_int(env, "CRAWL_MAX_ATTEMPTS", 3),
             crawl_batch_size=_parse_int(env, "CRAWL_BATCH_SIZE", 25),
+            crawl_domain_batch_limit=_parse_int(env, "CRAWL_DOMAIN_BATCH_LIMIT", 2),
+            crawl_new_domain_share=_parse_float(env, "CRAWL_NEW_DOMAIN_SHARE", 0.8),
             perceptual_hash_enabled=_parse_bool(env, "PERCEPTUAL_HASH_ENABLED"),
         )
 
@@ -377,6 +381,10 @@ class Settings:
             errors.append("CRAWL_MAX_ATTEMPTS must be between 1 and 3")
         if not 1 <= self.crawl_batch_size <= self.max_urls_per_job:
             errors.append("CRAWL_BATCH_SIZE must be positive and no greater than MAX_URLS_PER_JOB")
+        if not 1 <= self.crawl_domain_batch_limit <= 10:
+            errors.append("CRAWL_DOMAIN_BATCH_LIMIT must be between 1 and 10")
+        if not 0.5 <= self.crawl_new_domain_share <= 0.95:
+            errors.append("CRAWL_NEW_DOMAIN_SHARE must be between 0.5 and 0.95")
 
         for name, value in (
             ("DISCORD_GUILD_ID", self.discord_guild_id),
