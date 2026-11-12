@@ -874,7 +874,7 @@ async def test_crawl_frontier_summary_and_robots_policy_persistence() -> None:
     assert summary["domains_discovered"] == 20
     assert summary["domains_unexplored"] == 8
     assert policy["robots_status"] == 200
-    assert client.rpc_calls[-1][0] == "crawl_frontier_summary"
+    assert client.rpc_calls[-1] == ("crawl_frontier_summary", {"p_max_depth": 6})
     assert client.table("crawl_origin_state").queries[0].filters == [
         ("origin", "https://example.com")
     ]

@@ -301,6 +301,18 @@ def test_domain_frontier_migration_is_additive_fair_and_atomic() -> None:
     assert "on delete cascade" not in sql
 
 
+def test_frontier_status_migration_counts_actual_claim_eligibility() -> None:
+    sql = read_migration("014_accurate_frontier_status.sql").lower()
+
+    assert "drop function if exists public.crawl_frontier_summary()" in sql
+    assert "p_max_depth integer default 6" in sql
+    assert "d.depth <= greatest(0, least(p_max_depth, 6))" in sql
+    assert "d.next_attempt_at <= pg_catalog.now()" in sql
+    assert "ds.next_eligible_at <= pg_catalog.now()" in sql
+    assert "d.next_attempt_at > pg_catalog.now()" in sql
+    assert "ds.next_eligible_at > pg_catalog.now()" in sql
+
+
 def test_bing_search_provider_migration_preserves_history() -> None:
     files, _sql = read_migrations()
     names = [path.name for path in files]

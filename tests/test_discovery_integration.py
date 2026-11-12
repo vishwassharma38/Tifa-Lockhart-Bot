@@ -223,7 +223,7 @@ class StatusRepository:
             }
         ]
 
-    async def crawl_frontier_summary(self):
+    async def crawl_frontier_summary(self, *, max_depth=6):
         return {
             "domains_discovered": 20,
             "domains_unexplored": 8,

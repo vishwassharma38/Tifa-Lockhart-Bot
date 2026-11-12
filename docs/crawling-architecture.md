@@ -91,7 +91,8 @@ frontier totals; each crawler run records visited domains, the distinct
 external domains that received newly created queue rows, internal and external
 admissions, skipped URLs, and whether the URL budget was exhausted.
 
-Apply migration 013 before deploying code that calls its RPCs. A local
-PostgreSQL server is not part of this repository's test setup, so migration
-tests inspect the forward-only schema and claim contract; production RPC
-execution and query-plan performance should be observed after deployment.
+Apply migrations 013 and 014 before deploying code that calls their RPCs. A
+local PostgreSQL server is not part of this repository's test setup. The
+loopback-only integration test exercises the claim RPC when a local Supabase
+stack is available; without it, production RPC execution and query-plan
+performance remain unverified.

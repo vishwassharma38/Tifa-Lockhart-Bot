@@ -278,7 +278,11 @@ class PhaseFourCommands(commands.Cog):
             runs = await self.bot.repository.latest_reddit_runs(1)
             counts = await self.bot.repository.operational_counts()
             frontier_service = getattr(self.bot.repository, "crawl_frontier_summary", None)
-            frontier = await frontier_service() if callable(frontier_service) else {}
+            frontier = (
+                await frontier_service(max_depth=self.bot.settings.max_crawl_depth)
+                if callable(frontier_service)
+                else {}
+            )
             latest = runs[0] if runs else None
             effective = bool(state.get("collection_enabled")) and blocked is None
             embed.set_field_at(

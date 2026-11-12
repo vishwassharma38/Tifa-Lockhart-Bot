@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from types import SimpleNamespace
@@ -236,6 +237,21 @@ async def test_domain_throttle_serializes_start_times() -> None:
     assert sleeps == [2.0]
 
 
+async def test_concurrent_requests_reserve_distinct_domain_start_slots() -> None:
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await asyncio.sleep(0)
+        clock[0] += seconds
+
+    throttle_ = DomainThrottle(2.0, sleep=sleep, clock=lambda: clock[0])
+    await asyncio.gather(*(throttle_.wait("example.com") for _ in range(3)))
+
+    assert sorted(sleeps) == [2.0, 4.0]
+
+
 async def test_domain_throttle_uses_the_larger_crawl_delay() -> None:
     clock = [0.0]
     sleeps: list[float] = []
@@ -273,6 +289,74 @@ async def test_domain_throttle_shares_delay_across_subdomains() -> None:
     )
 
     assert sleeps == [2.0]
+
+
+async def test_domain_throttle_adapts_to_failures_retry_after_and_recovers() -> None:
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    throttle_ = DomainThrottle(1.0, sleep=sleep, clock=lambda: clock[0])
+    throttle_.observe(
+        "a.example.com",
+        latency_seconds=0.2,
+        status=429,
+        category=RATE_LIMITED,
+        retry_after_seconds=5.0,
+        registrable_domain="example.com",
+        origin="https://a.example.com",
+    )
+
+    await throttle_.wait("a.example.com", registrable_domain="example.com")
+    await throttle_.wait("a.example.com", registrable_domain="example.com")
+    assert sleeps[:2] == [5.0, 2.0]
+
+    throttle_.observe(
+        "a.example.com",
+        latency_seconds=0.1,
+        status=200,
+        category=OK,
+        registrable_domain="example.com",
+        origin="https://a.example.com",
+    )
+    previous_delay = throttle_._adaptive_delay["example.com"]
+    throttle_.observe(
+        "a.example.com",
+        latency_seconds=0.1,
+        status=200,
+        category=OK,
+        registrable_domain="example.com",
+        origin="https://a.example.com",
+    )
+    throttle_.observe(
+        "other.example",
+        latency_seconds=0.1,
+        status=200,
+        category=OK,
+        registrable_domain="other.example",
+        origin="https://other.example",
+    )
+
+    assert throttle_._adaptive_delay["example.com"] < previous_delay
+    assert throttle_._adaptive_delay["other.example"] == 1.0
+
+
+def test_domain_throttle_increases_after_repeated_slow_successes() -> None:
+    throttle_ = DomainThrottle(1.0, clock=lambda: 10.0)
+
+    for _ in range(2):
+        throttle_.observe(
+            "slow.example",
+            latency_seconds=3.0,
+            status=200,
+            category=OK,
+            registrable_domain="slow.example",
+        )
+
+    assert throttle_._adaptive_delay["slow.example"] == 1.25
 
 
 async def test_fetch_returns_a_successful_bounded_response() -> None:

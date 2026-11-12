@@ -370,11 +370,15 @@ class MediaRepository:
             "bing_pause_reason": state.get("bing_pause_reason"),
         }
 
-    async def crawl_frontier_summary(self) -> dict[str, int]:
-        return await self._run(self._crawl_frontier_summary_sync, retry=True)
+    async def crawl_frontier_summary(self, *, max_depth: int = 6) -> dict[str, int]:
+        return await self._run(self._crawl_frontier_summary_sync, max_depth, retry=True)
 
-    def _crawl_frontier_summary_sync(self) -> dict[str, int]:
-        response = self._client().rpc("crawl_frontier_summary", {}).execute()
+    def _crawl_frontier_summary_sync(self, max_depth: int) -> dict[str, int]:
+        response = (
+            self._client()
+            .rpc("crawl_frontier_summary", {"p_max_depth": max(0, min(6, int(max_depth)))})
+            .execute()
+        )
         data = getattr(response, "data", None)
         if isinstance(data, list) and data and isinstance(data[0], dict):
             data = data[0]

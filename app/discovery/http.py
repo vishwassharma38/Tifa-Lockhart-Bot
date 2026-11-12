@@ -260,6 +260,10 @@ class DomainThrottle:
         self._clock = clock
         self._locks: dict[str, asyncio.Lock] = {}
         self._next_start: dict[str, float] = {}
+        self._adaptive_delay: dict[str, float] = {}
+        self._failure_streak: dict[str, int] = {}
+        self._slow_streak: dict[str, int] = {}
+        self._blocked_until: dict[str, float] = {}
 
     async def wait(
         self,
@@ -272,15 +276,71 @@ class DomainThrottle:
         # The site bucket prevents subdomains from bypassing fairness and
         # politeness. Host and origin buckets preserve finer-grained limits.
         keys = [key.lower() for key in (registrable_domain, host, origin) if key]
-        effective_delay = max(self._delay, delay_seconds or 0.0)
         for normalized in dict.fromkeys(keys):
             lock = self._locks.setdefault(normalized, asyncio.Lock())
             async with lock:
                 now = self._clock()
-                target = max(now, self._next_start.get(normalized, now))
-                if target > now:
-                    await self._sleep(target - now)
-                self._next_start[normalized] = max(self._clock(), target) + effective_delay
+                target = max(
+                    now,
+                    self._next_start.get(normalized, now),
+                    self._blocked_until.get(normalized, now),
+                )
+                effective_delay = max(
+                    self._delay,
+                    delay_seconds or 0.0,
+                    self._adaptive_delay.get(normalized, self._delay),
+                )
+                wait_seconds = target - now
+                self._next_start[normalized] = target + effective_delay
+            if wait_seconds > 0:
+                await self._sleep(wait_seconds)
+
+    def observe(
+        self,
+        host: str,
+        *,
+        latency_seconds: float,
+        status: int | None,
+        category: str,
+        retry_after_seconds: float | None = None,
+        registrable_domain: str | None = None,
+        origin: str | None = None,
+    ) -> None:
+        """Update shared per-site and per-origin delay from one HTTP outcome."""
+        keys = [key.lower() for key in (registrable_domain, host, origin) if key]
+        latency = max(0.0, latency_seconds)
+        for normalized in dict.fromkeys(keys):
+            delay = self._adaptive_delay.get(normalized, self._delay)
+            failures = self._failure_streak.get(normalized, 0)
+            slow = self._slow_streak.get(normalized, 0)
+            if retry_after_seconds is not None and retry_after_seconds > 0:
+                self._blocked_until[normalized] = max(
+                    self._blocked_until.get(normalized, 0.0),
+                    self._clock() + min(retry_after_seconds, 300_000_000.0),
+                )
+            if status == 429:
+                failures += 1
+                delay = max(self._delay * 2, delay * 2)
+            elif status == 503:
+                failures += 1
+                delay = max(self._delay * 1.5, delay * 1.8)
+            elif category in {TIMEOUT, NETWORK_ERROR} or (status is not None and status >= 500):
+                failures += 1
+                delay = max(self._delay * 1.25, delay * 1.5)
+            elif status is not None and 200 <= status < 400:
+                failures = 0
+                slow = slow + 1 if latency >= max(2.0, self._delay * 3) else 0
+                if slow >= 2:
+                    delay = max(delay, self._delay) * 1.25
+                else:
+                    delay = max(self._delay, delay * 0.85)
+            if failures:
+                delay = min(60.0, max(self._delay, delay))
+            else:
+                delay = min(60.0, max(self._delay, delay))
+            self._adaptive_delay[normalized] = delay
+            self._failure_streak[normalized] = failures
+            self._slow_streak[normalized] = slow
 
 
 class SafeHttpClient:
@@ -309,6 +369,7 @@ class SafeHttpClient:
         self._read_timeout = read_timeout
         self._validator = validator
         self._user_agent = user_agent
+        self._clock = clock
         self._semaphore = asyncio.Semaphore(max_concurrent_requests)
         self._closed = False
 
@@ -434,6 +495,7 @@ class SafeHttpClient:
                 raise
 
             redirect_target: str | None = None
+            request_started = self._clock()
             try:
                 async with self._semaphore:
                     request = self._get_session().get(
@@ -450,6 +512,26 @@ class SafeHttpClient:
                         status = int(getattr(response, "status", 0) or 0)
                         headers = getattr(response, "headers", None) or {}
                         content_type = _content_type(headers)
+                        retry_after_seconds = parse_retry_after(headers)
+                        observer = getattr(throttle, "observe", None)
+                        if callable(observer):
+                            observer(
+                                host,
+                                latency_seconds=max(0.0, self._clock() - request_started),
+                                status=status,
+                                category=(
+                                    RATE_LIMITED
+                                    if status == 429
+                                    else SERVER_ERROR
+                                    if status >= 500
+                                    else HTTP_ERROR
+                                    if not 200 <= status < 400
+                                    else OK
+                                ),
+                                retry_after_seconds=retry_after_seconds,
+                                registrable_domain=identity.registrable_domain,
+                                origin=identity.origin,
+                            )
 
                         if is_redirect_status(status):
                             location = redirect_location(headers)
@@ -513,7 +595,7 @@ class SafeHttpClient:
                                 category=category,
                                 content_type=content_type,
                                 error=f"http_{status}",
-                                retry_after_seconds=parse_retry_after(headers),
+                                retry_after_seconds=retry_after_seconds,
                                 redirects=redirects,
                             )
 
@@ -595,6 +677,16 @@ class SafeHttpClient:
                                 },
                             )
             except TimeoutError as exc:
+                observer = getattr(throttle, "observe", None)
+                if callable(observer):
+                    observer(
+                        host,
+                        latency_seconds=max(0.0, self._clock() - request_started),
+                        status=None,
+                        category=TIMEOUT,
+                        registrable_domain=identity.registrable_domain,
+                        origin=identity.origin,
+                    )
                 return FetchResult(
                     requested_url=url,
                     final_url=normalized.normalized,
@@ -604,6 +696,16 @@ class SafeHttpClient:
                     redirects=redirects,
                 )
             except (aiohttp.ClientError, OSError) as exc:
+                observer = getattr(throttle, "observe", None)
+                if callable(observer):
+                    observer(
+                        host,
+                        latency_seconds=max(0.0, self._clock() - request_started),
+                        status=None,
+                        category=NETWORK_ERROR,
+                        registrable_domain=identity.registrable_domain,
+                        origin=identity.origin,
+                    )
                 return FetchResult(
                     requested_url=url,
                     final_url=normalized.normalized,

@@ -686,7 +686,10 @@ class DiscoveryCrawler:
                 host,
                 inspection.reason or inspection.category,
             )
-            return {"skipped": 1}
+            return {
+                "skipped": 1,
+                "resource_budget_limited": inspection.category == DOMAIN_BUDGET,
+            }
 
         metadata = _metadata(row)
         metadata["inspection_latency_ms"] = inspection_latency_ms
@@ -1228,6 +1231,12 @@ class DiscoveryCrawler:
             if trap:
                 skipped += 1
                 continue
+            # Sitemap membership is discovery evidence in its own right. Keep
+            # its priority modest while allowing ordinary pages through the
+            # same safety, depth, per-page and job-budget gates as HTML links.
+            if link.kind == "sitemap":
+                score = max(score, 4)
+                reasons += ("sitemap_discovery_evidence",)
             destination_signal = score
             if external:
                 score += 2

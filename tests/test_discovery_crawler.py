@@ -1142,11 +1142,17 @@ async def test_search_result_evidence_alone_does_not_expand_generic_links(make_s
 async def test_crawler_admits_sitemap_locations_through_the_normal_frontier(make_settings) -> None:
     page_url = "https://example.com/home"
     sitemap_url = "https://example.com/sitemap.xml"
-    sitemap_page = "https://example.com/tifa-artist-gallery"
-    html = b"<html><head><title>Tifa Lockhart</title></head><body>Gallery.</body></html>"
+    sitemap_pages = (
+        "https://example.com/about",
+        "https://example.com/creators",
+        "https://example.com/gallery/123",
+        "https://example.com/tifa-artist-gallery",
+    )
+    html = b"<html><head><title>Example</title></head><body>Welcome.</body></html>"
     sitemap = (
         b'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
-        b"<url><loc>" + sitemap_page.encode() + b"</loc></url></urlset>"
+        + b"".join(b"<url><loc>" + url.encode() + b"</loc></url>" for url in sitemap_pages)
+        + b"</urlset>"
     )
     client = FakeHttpClient(
         {
@@ -1166,7 +1172,10 @@ async def test_crawler_admits_sitemap_locations_through_the_normal_frontier(make
 
     await crawler_.run_once(scheduled=True)
 
-    assert [item["normalized_url"] for item in repository.upserts] == [sitemap_page]
+    assert sorted(item["normalized_url"] for item in repository.upserts) == sorted(sitemap_pages)
+    assert all(
+        item["metadata_json"]["discovered_via"] == "crawl_link" for item in repository.upserts
+    )
 
 
 async def test_crawler_stages_extraction_failures_in_the_dumpster(make_settings) -> None:
@@ -1188,6 +1197,23 @@ async def test_crawler_stages_extraction_failures_in_the_dumpster(make_settings)
     assert update["metadata_json"]["review_reason"] == "extraction_failed:ValueError"
     assert counters["processed_count"] == 1
     assert counters["skipped_count"] == 1
+
+
+async def test_domain_request_budget_exhaustion_is_reported_in_job_result(make_settings) -> None:
+    url = "https://example.com/page"
+    inspection = PageInspection(
+        url,
+        url,
+        None,
+        DOMAIN_BUDGET,
+        reason="domain_request_budget_exhausted",
+    )
+    repository = FakeRepository(rows=[row(url=url)])
+    crawler_ = crawler(make_settings, repository, FakePipeline(), FakeInspector([inspection]))
+
+    counters = await crawler_.run_once(scheduled=True)
+
+    assert counters["resource_budget_limited"] is True
 
 
 async def test_crawler_requeues_rows_interrupted_by_shutdown(make_settings) -> None:

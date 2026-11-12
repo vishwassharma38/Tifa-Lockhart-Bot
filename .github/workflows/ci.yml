@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, tifa-bot-beta]
   pull_request:
     branches: [main]
 
