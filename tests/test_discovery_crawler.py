@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+from contextvars import ContextVar
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
@@ -582,6 +584,30 @@ class FakeRepository:
         self.edge_batches: list[list[dict[str, Any]]] = []
         self.requeues: list[tuple[str, str | None, str | None]] = []
         self.claims: list[tuple[int, int]] = []
+        self._metrics: Counter[str] = Counter()
+        self._scoped_metrics: ContextVar[Counter[str] | None] = ContextVar(
+            f"fake_repository_metrics_{id(self)}", default=None
+        )
+
+    def _bump_metrics(self, **increments: int) -> None:
+        scoped = self._scoped_metrics.get()
+        for name, value in increments.items():
+            self._metrics[name] += value
+            if scoped is not None:
+                scoped[name] += value
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        return dict(self._metrics)
+
+    def begin_metrics_scope(self):
+        return self._scoped_metrics.set(Counter())
+
+    def end_metrics_scope(self, token) -> None:
+        self._scoped_metrics.reset(token)
+
+    def scoped_metrics_snapshot(self) -> dict[str, int]:
+        scoped = self._scoped_metrics.get()
+        return dict(scoped) if scoped is not None else {}
 
     async def get_runtime_state(self) -> dict[str, Any]:
         return self.state
@@ -611,6 +637,7 @@ class FakeRepository:
         new_domain_share: float = 0.8,
     ):
         self.claims.append((limit, max_depth))
+        self._bump_metrics(claim_calls=1)
         return self.rows
 
     async def update_discovery(self, discovery_id: str, fields: dict[str, Any]):
@@ -1297,6 +1324,9 @@ async def test_crawler_requeues_remaining_rows_if_collection_is_paused_mid_job(
         ("two", "collection_paused", None),
     ]
     assert counters["skipped_count"] == 2
+    assert repository.finished[-1][1]["stats_json"]["repository_metrics"] == {
+        "claim_calls": 1
+    }
 
 
 async def test_crawler_aggregates_acquisition_results(make_settings) -> None:
@@ -1422,7 +1452,7 @@ async def test_crawler_batches_duplicate_children_once_and_keeps_every_edge(make
     assert [edge["child_normalized_url"] for edge in repository.edges] == list(links)
 
 
-async def test_crawler_falls_back_to_single_writes_when_batches_fail(make_settings) -> None:
+async def test_crawler_fails_job_when_required_edge_batch_fails(make_settings) -> None:
     links = external_batch_links(2)
     page = extracted_page(media=("/full.jpg",), links=links)
 
@@ -1434,6 +1464,9 @@ async def test_crawler_falls_back_to_single_writes_when_batches_fail(make_settin
         async def record_discovery_edges(self, edges):
             self.edge_batches.append([dict(edge) for edge in edges])
             raise RuntimeError("edge batch unavailable")
+
+        async def record_discovery_edge(self, **kwargs):
+            pytest.fail("failed batch edges must not be retried through the same RPC")
 
     repository = BatchFailingRepository(rows=[row()])
     crawler_ = crawler(
@@ -1448,9 +1481,70 @@ async def test_crawler_falls_back_to_single_writes_when_batches_fail(make_settin
 
     assert [len(batch) for batch in repository.upsert_batches] == [2]
     assert [len(batch) for batch in repository.edge_batches] == [2]
-    assert counters["discovered_count"] == 2
+    assert counters["discovered_count"] == 0
+    assert counters["failed_count"] == 1
     assert [payload["normalized_url"] for payload in repository.upserts] == list(links)
-    assert [edge["child_normalized_url"] for edge in repository.edges] == list(links)
+    assert repository.edges == []
+    assert repository.requeues == [
+        ("discovery-1", "discovery_edge_persistence_failed", None)
+    ]
+    assert repository.finished[-1][2] == "failed"
+    assert repository.finished[-1][1]["stats_json"]["discovery_edges"] == {
+        "persisted_count": 0,
+        "failed_count": 2,
+    }
+    assert repository.finished[-1][1]["stats_json"]["error_breakdown"] == {
+        "discovery_edge_persistence_failed": 2
+    }
+    assert repository.finished[-1][1]["stats_json"]["repository_metrics"] == {
+        "claim_calls": 1
+    }
+
+
+async def test_crawler_accounts_for_confirmed_edges_before_partial_batch_failure(make_settings) -> None:
+    links = external_batch_links(2)
+    page = extracted_page(media=("/full.jpg",), links=links)
+
+    class PartiallyFailingRepository(FakeRepository):
+        async def record_discovery_edges(self, edges):
+            self.edge_batches.append([dict(edge) for edge in edges])
+            error = RuntimeError("later edge chunk unavailable")
+            error.confirmed_count = 1  # type: ignore[attr-defined]
+            error.failed_count = 1  # type: ignore[attr-defined]
+            raise error
+
+    repository = PartiallyFailingRepository(rows=[row()])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page)),
+        MAX_URLS_PER_JOB="100",
+    )
+
+    await crawler_.run_once(scheduled=True)
+
+    assert repository.finished[-1][2] == "failed"
+    assert repository.finished[-1][1]["stats_json"]["discovery_edges"] == {
+        "persisted_count": 1,
+        "failed_count": 1,
+    }
+
+
+async def test_crawler_repository_metrics_are_job_scoped_and_cumulative_counters_remain(
+    make_settings,
+) -> None:
+    repository = FakeRepository(rows=[])
+    repository._bump_metrics(unrelated_operations=2)
+    crawler_ = crawler(make_settings, repository, FakePipeline(), FakeInspector([]))
+
+    first = await crawler_.run_once(scheduled=False)
+    repository._bump_metrics(unrelated_operations=3)
+    second = await crawler_.run_once(scheduled=False)
+
+    assert first["stats_json"]["repository_metrics"] == {"claim_calls": 1}
+    assert second["stats_json"]["repository_metrics"] == {"claim_calls": 1}
+    assert repository.metrics_snapshot() == {"claim_calls": 2, "unrelated_operations": 5}
 
 
 async def test_crawler_preserves_admissions_before_a_wave_boundary_pause(make_settings) -> None:

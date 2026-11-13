@@ -9,6 +9,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar, Token
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -79,6 +80,22 @@ class RepositoryError(RuntimeError):
     """Raised when a repository operation cannot be completed."""
 
 
+class DiscoveryEdgePersistenceError(RepositoryError):
+    """An edge batch failed after the given number of relationships were confirmed."""
+
+    def __init__(
+        self, confirmed_count: int, failed_count: int, cause: Exception | None = None
+    ) -> None:
+        self.confirmed_count = confirmed_count
+        self.failed_count = failed_count
+        cause_detail = f" ({type(cause).__name__}: {cause})" if cause is not None else ""
+        super().__init__(
+            "record_discovery_edges failed after confirming "
+            f"{confirmed_count} relationship(s); {failed_count} remain unconfirmed"
+            f"{cause_detail}"
+        )
+
+
 def _operation_name(function: Callable[..., Any]) -> str:
     name = getattr(function, "__name__", "database_operation")
     return name.removeprefix("_").removesuffix("_sync")
@@ -129,17 +146,37 @@ class MediaRepository:
         self._runtime_state_generation = 0
         self._metrics: Counter[str] = Counter()
         self._metrics_lock = threading.Lock()
+        self._scoped_metrics: ContextVar[Counter[str] | None] = ContextVar(
+            f"repository_metrics_{id(self)}", default=None
+        )
 
     def _bump_metrics(self, **increments: int) -> None:
         with self._metrics_lock:
             for name, value in increments.items():
                 if value:
                     self._metrics[name] += value
+                    scoped_metrics = self._scoped_metrics.get()
+                    if scoped_metrics is not None:
+                        scoped_metrics[name] += value
 
     def metrics_snapshot(self) -> dict[str, int]:
         """Return a copy of lightweight database-operation counters."""
         with self._metrics_lock:
             return dict(self._metrics)
+
+    def begin_metrics_scope(self) -> Token[Counter[str] | None]:
+        """Attribute repository operations in this async context to one job."""
+        return self._scoped_metrics.set(Counter())
+
+    def end_metrics_scope(self, token: Token[Counter[str] | None]) -> None:
+        """Restore the prior metric scope after a job finishes."""
+        self._scoped_metrics.reset(token)
+
+    def scoped_metrics_snapshot(self) -> dict[str, int]:
+        """Return counters attributed to the current job scope."""
+        with self._metrics_lock:
+            metrics = self._scoped_metrics.get()
+            return dict(metrics) if metrics is not None else {}
 
     async def _run(self, function: Callable[..., Any], *args: Any, retry: bool = False) -> Any:
         """Dispatch one database operation under the shared concurrency limit.
@@ -1007,11 +1044,20 @@ class MediaRepository:
         """
         if not edges:
             return []
-        return await self._run(
-            self._record_discovery_edges_sync,
-            [dict(edge) for edge in edges],
-            retry=True,
-        )
+        progress: dict[str, Any] = {"confirmed_keys": set()}
+        try:
+            return await self._run(
+                self._record_discovery_edges_sync,
+                [dict(edge) for edge in edges],
+                progress,
+                retry=True,
+            )
+        except Exception as exc:
+            if "failed_count" not in progress:
+                raise
+            raise DiscoveryEdgePersistenceError(
+                progress.get("confirmed_count", 0), progress["failed_count"], exc
+            ) from exc
 
     @staticmethod
     def _edge_key(edge: dict[str, Any]) -> tuple[str | None, str]:
@@ -1057,23 +1103,44 @@ class MediaRepository:
             "discovery_mechanism": edge.get("discovery_mechanism") or None,
         }
 
-    def _record_discovery_edges_sync(self, edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _record_discovery_edges_sync(
+        self, edges: list[dict[str, Any]], progress: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        confirmed_keys: set[tuple[str | None, str]] = set()
+        if progress is not None:
+            confirmed_keys = progress.setdefault("confirmed_keys", set())
+            progress.setdefault("confirmed_count", 0)
+            progress.setdefault("failed_count", len(edges))
         prepared = [self._prepare_discovery_edge(edge) for edge in edges]
         unique: dict[tuple[str | None, str], dict[str, Any]] = {}
         for edge in prepared:
             unique.setdefault(self._edge_key(edge), edge)
+        if progress is not None:
+            progress["unique_count"] = len(unique)
+            progress["confirmed_count"] = len(confirmed_keys)
+            progress["failed_count"] = len(unique) - len(confirmed_keys)
 
         resolved: dict[tuple[str | None, str], dict[str, Any]] = {}
         created = 0
         items = list(unique.items())
         for offset in range(0, len(items), self._discovery_edge_batch_size):
             chunk = items[offset : offset + self._discovery_edge_batch_size]
-            chunk_rows, chunk_created = self._record_discovery_edges_chunk_sync(
-                [edge for _key, edge in chunk]
-            )
+            try:
+                chunk_rows, chunk_created = self._record_discovery_edges_chunk_sync(
+                    [edge for _key, edge in chunk]
+                )
+            except Exception:
+                if progress is not None:
+                    progress["confirmed_count"] = len(confirmed_keys)
+                    progress["failed_count"] = len(unique) - len(confirmed_keys)
+                raise
             for (key, _edge), row in zip(chunk, chunk_rows, strict=True):
                 resolved[key] = row
             created += chunk_created
+            if progress is not None:
+                confirmed_keys.update(key for key, _edge in chunk)
+                progress["confirmed_count"] = len(confirmed_keys)
+                progress["failed_count"] = len(unique) - len(confirmed_keys)
 
         results = [dict(resolved[self._edge_key(edge)]) for edge in prepared]
         self._bump_metrics(
@@ -1084,6 +1151,10 @@ class MediaRepository:
             edge_batch_created=created,
             edge_batch_existing=len(edges) - created,
         )
+        if progress is not None:
+            confirmed_keys.update(unique)
+            progress["confirmed_count"] = len(confirmed_keys)
+            progress["failed_count"] = 0
         return results
 
     def _record_discovery_edges_chunk_sync(

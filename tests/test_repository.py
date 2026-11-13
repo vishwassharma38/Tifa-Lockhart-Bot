@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from app.db.client import SupabaseDatabase
-from app.db.repository import MediaRepository, RepositoryError
+from app.db.repository import DiscoveryEdgePersistenceError, MediaRepository, RepositoryError
 from app.discovery.models import WebCandidate
 from app.reddit.models import RedditCandidate
 
@@ -186,6 +186,8 @@ class FakeQueryResult:
         self.data = data
 
     def execute(self) -> FakeResponse:
+        if isinstance(self.data, Exception):
+            raise self.data
         return FakeResponse(self.data)  # type: ignore[arg-type]
 
 
@@ -1400,6 +1402,107 @@ async def test_record_discovery_edges_rejects_incomplete_rpc_responses() -> None
                 }
             ]
         )
+
+
+async def test_record_discovery_edges_reports_confirmed_partial_chunks() -> None:
+    first = {
+        "id": "edge-1",
+        "parent_discovery_id": "parent-1",
+        "child_normalized_url": "https://example.com/one",
+    }
+    client = FakeClient()
+    client.rpc_queue = [
+        {"inserted_count": 1, "edges": [first]},
+        ValueError("RPC unavailable"),
+    ]
+    repository = make_repository(client)
+    repository._discovery_edge_batch_size = 1
+
+    with pytest.raises(DiscoveryEdgePersistenceError) as error:
+        await repository.record_discovery_edges(
+            [
+                {
+                    "parent_discovery_id": "parent-1",
+                    "child_normalized_url": "https://example.com/one",
+                    "discovered_from_url": "https://example.com/parent",
+                    "depth": 1,
+                },
+                {
+                    "parent_discovery_id": "parent-1",
+                    "child_normalized_url": "https://example.com/two",
+                    "discovered_from_url": "https://example.com/parent",
+                    "depth": 1,
+                },
+            ]
+        )
+
+    assert error.value.confirmed_count == 1
+    assert error.value.failed_count == 1
+    assert isinstance(error.value.__cause__, ValueError)
+    assert len(client.rpc_calls) == 2
+
+
+async def test_record_discovery_edges_keeps_confirmed_chunks_across_retries() -> None:
+    first = {
+        "id": "edge-1",
+        "parent_discovery_id": "parent-1",
+        "child_normalized_url": "https://example.com/one",
+    }
+    client = FakeClient()
+    client.rpc_queue = [
+        {"inserted_count": 1, "edges": [first]},
+        httpx.ReadError("later chunk response lost"),
+        httpx.ReadError("retry failed before first chunk response"),
+        httpx.ReadError("final retry failed before first chunk response"),
+    ]
+    repository = make_retrying_repository(client, immediate_thread, discovery_edge_batch_size=1)
+
+    with pytest.raises(DiscoveryEdgePersistenceError) as error:
+        await repository.record_discovery_edges(
+            [
+                {
+                    "parent_discovery_id": "parent-1",
+                    "child_normalized_url": "https://example.com/one",
+                    "discovered_from_url": "https://example.com/parent",
+                    "depth": 1,
+                },
+                {
+                    "parent_discovery_id": "parent-1",
+                    "child_normalized_url": "https://example.com/two",
+                    "discovered_from_url": "https://example.com/parent",
+                    "depth": 1,
+                },
+            ]
+        )
+
+    assert error.value.confirmed_count == 1
+    assert error.value.failed_count == 1
+    assert len(client.rpc_calls) == 4
+
+
+async def test_repository_metric_scopes_are_per_task_and_cumulative_metrics_remain_global() -> None:
+    repository = make_repository(FakeClient())
+
+    async def scoped_operation(name: str) -> dict[str, int]:
+        token = repository.begin_metrics_scope()
+        try:
+            await asyncio.to_thread(repository._bump_metrics, total_calls=1, **{name: 1})
+            await asyncio.sleep(0)
+            return repository.scoped_metrics_snapshot()
+        finally:
+            repository.end_metrics_scope(token)
+
+    first, second = await asyncio.gather(
+        scoped_operation("first_job"), scoped_operation("second_job")
+    )
+
+    assert first == {"total_calls": 1, "first_job": 1}
+    assert second == {"total_calls": 1, "second_job": 1}
+    assert repository.metrics_snapshot() == {
+        "total_calls": 2,
+        "first_job": 1,
+        "second_job": 1,
+    }
 
 
 async def test_record_discovery_edges_retry_is_idempotent_after_a_lost_response() -> None:

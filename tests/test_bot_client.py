@@ -230,6 +230,29 @@ async def test_scheduled_bing_discovery_runs_search_then_crawl(make_settings) ->
     assert crawler.run_calls == [True]
 
 
+async def test_scheduled_crawl_failure_does_not_take_the_bot_offline(make_settings) -> None:
+    class FailingCrawler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run_once(self, *, scheduled: bool = True) -> None:
+            self.calls += 1
+            raise RuntimeError("crawl persistence failed")
+
+    bot = build_bot(make_settings, sync_commands=False)
+    crawler = FailingCrawler()
+    bot.crawler = crawler
+    try:
+        await bot._scheduled_crawl_processing()
+        assert not bot.is_closed()
+        await bot._scheduled_crawl_processing()
+        assert not bot.is_closed()
+    finally:
+        await bot.close()
+
+    assert crawler.calls == 2
+
+
 async def test_scheduled_digest_runs_while_collection_is_paused(make_settings) -> None:
     repository = FakeBotRepository({"collection_enabled": False})
     bot = build_bot(

@@ -98,6 +98,19 @@ class PageInspection:
         return self.category == OK and self.extracted is not None
 
 
+class DiscoveryEdgeWriteError(RuntimeError):
+    """A required discovery relationship could not be confirmed as persisted."""
+
+    def __init__(self, parent_discovery_id: str, persisted_count: int, failed_count: int) -> None:
+        self.parent_discovery_id = parent_discovery_id
+        self.persisted_count = persisted_count
+        self.failed_count = failed_count
+        super().__init__(
+            f"Discovery edge persistence incomplete for parent={parent_discovery_id}: "
+            f"{persisted_count} confirmed, {failed_count} unconfirmed"
+        )
+
+
 def _metadata(row: dict[str, Any]) -> dict[str, Any]:
     value = row.get("metadata_json")
     return dict(value) if isinstance(value, dict) else {}
@@ -532,6 +545,48 @@ class DiscoveryCrawler:
             sitemap_scan_domains: set[str] = set()
             errors: Counter[str] = Counter()
             paused_for_collection = False
+            metrics_snapshot = getattr(self._repository, "metrics_snapshot", None)
+            metrics_baseline: dict[str, int] = {}
+            if callable(metrics_snapshot):
+                try:
+                    metrics_baseline = metrics_snapshot()
+                except Exception as exc:
+                    log.debug("Repository metrics baseline unavailable (%s)", type(exc).__name__)
+            begin_metrics_scope = getattr(self._repository, "begin_metrics_scope", None)
+            end_metrics_scope = getattr(self._repository, "end_metrics_scope", None)
+            scoped_metrics_snapshot = getattr(self._repository, "scoped_metrics_snapshot", None)
+            metrics_scope_token = (
+                begin_metrics_scope()
+                if callable(begin_metrics_scope)
+                and callable(end_metrics_scope)
+                and callable(scoped_metrics_snapshot)
+                else None
+            )
+            edge_write_stats = {"persisted_count": 0, "failed_count": 0}
+
+            def job_stats_json() -> dict[str, Any]:
+                stats: dict[str, Any] = {
+                    "error_breakdown": dict(sorted(errors.items())),
+                    "visited_domains": sorted(visited_domains)[:50],
+                    "new_domains": sorted(linked_external_domains)[:50],
+                    "sitemap_scanned_domains": len(sitemap_scan_domains),
+                    "discovery_edges": dict(edge_write_stats),
+                }
+                try:
+                    if metrics_scope_token is not None:
+                        stats["repository_metrics"] = scoped_metrics_snapshot()
+                    elif callable(metrics_snapshot):
+                        current_metrics = metrics_snapshot()
+                        metric_names = set(metrics_baseline) | set(current_metrics)
+                        stats["repository_metrics"] = {
+                            name: max(0, current_metrics.get(name, 0) - metrics_baseline.get(name, 0))
+                            for name in sorted(metric_names)
+                            if current_metrics.get(name, 0) > metrics_baseline.get(name, 0)
+                        }
+                except Exception as exc:
+                    log.debug("Repository metrics snapshot unavailable (%s)", type(exc).__name__)
+                return stats
+
             try:
                 claimed = await self._repository.claim_discoveries(
                     limit=self._settings.crawl_batch_size,
@@ -556,6 +611,7 @@ class DiscoveryCrawler:
                             admission=admission,
                             seen_edges=seen_edges,
                             sitemap_scan_domains=sitemap_scan_domains,
+                            edge_write_stats=edge_write_stats,
                             scheduled=scheduled,
                         )
                     except asyncio.CancelledError:
@@ -563,13 +619,28 @@ class DiscoveryCrawler:
                         raise
                     except Exception as exc:
                         counters["failed_count"] += 1
-                        errors[f"discovery_processing_failed:{type(exc).__name__}"] += 1
-                        log.warning(
-                            "Discovery processing failed discovery_id=%s (%s)",
-                            row.get("id"),
-                            type(exc).__name__,
-                        )
-                        await self._safe_fail(row, f"processing_failed:{type(exc).__name__}")
+                        if isinstance(exc, DiscoveryEdgeWriteError):
+                            errors["discovery_edge_persistence_failed"] += exc.failed_count
+                            log.error(
+                                "Required discovery edges were not confirmed discovery_id=%s "
+                                "parent_id=%s persisted=%s failed=%s cause=%s",
+                                row.get("id"),
+                                exc.parent_discovery_id,
+                                exc.persisted_count,
+                                exc.failed_count,
+                                str(exc.__cause__)[:300] if exc.__cause__ else "unknown",
+                            )
+                            await self._safe_requeue(row, "discovery_edge_persistence_failed")
+                        else:
+                            errors[f"discovery_processing_failed:{type(exc).__name__}"] += 1
+                            log.warning(
+                                "Discovery processing failed discovery_id=%s (%s)",
+                                row.get("id"),
+                                type(exc).__name__,
+                            )
+                            await self._safe_fail(
+                                row, f"processing_failed:{type(exc).__name__}"
+                            )
                         continue
                     counters["discovered_count"] += outcome.get("discovered", 0)
                     counters["examined_count"] += outcome.get("examined", 0)
@@ -614,31 +685,21 @@ class DiscoveryCrawler:
                     ]
                     or None
                 )
-                counters["stats_json"] = {
-                    "error_breakdown": dict(sorted(errors.items())),
-                    "visited_domains": sorted(visited_domains)[:50],
-                    "new_domains": sorted(linked_external_domains)[:50],
-                    "sitemap_scanned_domains": len(sitemap_scan_domains),
-                }
-                metrics_snapshot = getattr(self._repository, "metrics_snapshot", None)
-                if callable(metrics_snapshot):
-                    try:
-                        counters["stats_json"]["repository_metrics"] = metrics_snapshot()
-                    except Exception as exc:
-                        log.debug(
-                            "Repository metrics snapshot unavailable (%s)",
-                            type(exc).__name__,
-                        )
+                counters["stats_json"] = job_stats_json()
                 await self._repository.finish_job_run(job_id, counters, outcome, error_summary)
             except Exception as exc:
                 counters["failed_count"] += 1
+                counters["stats_json"] = job_stats_json()
                 await self._repository.finish_job_run(
                     job_id,
                     counters,
                     "failed",
-                    f"crawl_job_failed:{type(exc).__name__}",
+                    f"crawl_job_failed:{type(exc).__name__}:{str(exc)[:300]}",
                 )
                 log.exception("Crawl job failed")
+            finally:
+                if metrics_scope_token is not None:
+                    end_metrics_scope(metrics_scope_token)
             return counters
 
     async def _automation_enabled(self) -> bool:
@@ -655,6 +716,7 @@ class DiscoveryCrawler:
         admission: _UrlAdmission,
         seen_edges: set[tuple[str, str]],
         sitemap_scan_domains: set[str],
+        edge_write_stats: dict[str, int],
         scheduled: bool,
     ) -> dict[str, Any]:
         discovery_id = str(row.get("id") or "")
@@ -975,6 +1037,7 @@ class DiscoveryCrawler:
             depth=depth,
             admission=admission,
             seen_edges=seen_edges,
+            edge_write_stats=edge_write_stats,
             scheduled=scheduled,
         )
         outcome["discovered"] = expansion["admitted"]
@@ -1204,6 +1267,7 @@ class DiscoveryCrawler:
         depth: int,
         admission: _UrlAdmission,
         seen_edges: set[tuple[str, str]],
+        edge_write_stats: dict[str, int],
         scheduled: bool,
     ) -> dict[str, Any]:
         if depth >= self._settings.max_crawl_depth:
@@ -1345,21 +1409,63 @@ class DiscoveryCrawler:
             if not edges:
                 return
             batch_edges = getattr(self._repository, "record_discovery_edges", None)
-            if callable(batch_edges):
-                try:
-                    await batch_edges(edges)
-                    return
-                except Exception as exc:
-                    log.warning(
-                        "Discovery edge batch failed (%s); retrying %s item(s) individually",
-                        type(exc).__name__,
-                        len(edges),
+            unique_edge_count = len(
+                {
+                    (
+                        str(edge.get("parent_discovery_id") or "") or None,
+                        str(edge["child_normalized_url"]),
                     )
-            for edge in edges:
-                try:
-                    await self._repository.record_discovery_edge(**edge)
-                except Exception as exc:
-                    log.warning("Discovery edge insert failed (%s)", type(exc).__name__)
+                    for edge in edges
+                }
+            )
+            if not callable(batch_edges):
+                edge_write_stats["failed_count"] += unique_edge_count
+                cause = RuntimeError("repository does not provide batch discovery-edge persistence")
+                log.error(
+                    "Required discovery edge batch writer is unavailable parent_id=%s edges=%s",
+                    parent_id,
+                    unique_edge_count,
+                )
+                raise DiscoveryEdgeWriteError(parent_id, 0, unique_edge_count) from cause
+            try:
+                rows = await batch_edges(edges)
+                if not isinstance(rows, list) or len(rows) != len(edges):
+                    raise RuntimeError(
+                        "discovery edge batch returned an incomplete relationship result"
+                    )
+            except Exception as exc:
+                persisted_count = max(
+                    0,
+                    min(unique_edge_count, int(getattr(exc, "confirmed_count", 0) or 0)),
+                )
+                failed_count = max(
+                    0,
+                    min(
+                        unique_edge_count - persisted_count,
+                        int(
+                            getattr(
+                                exc,
+                                "failed_count",
+                                unique_edge_count - persisted_count,
+                            )
+                            or 0
+                        ),
+                    ),
+                )
+                failed_count += unique_edge_count - persisted_count - failed_count
+                edge_write_stats["persisted_count"] += persisted_count
+                edge_write_stats["failed_count"] += failed_count
+                log.exception(
+                    "Discovery edge batch failed; no individual fallback will be attempted "
+                    "parent_id=%s persisted=%s unconfirmed=%s",
+                    parent_id,
+                    persisted_count,
+                    failed_count,
+                )
+                raise DiscoveryEdgeWriteError(
+                    parent_id, persisted_count, failed_count
+                ) from exc
+            edge_write_stats["persisted_count"] += unique_edge_count
 
         async def flush_pending() -> None:
             nonlocal budget_limited, skipped
