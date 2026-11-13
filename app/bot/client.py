@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -25,6 +26,7 @@ from app.reddit.connector import RedditConnector
 from app.status import StatusService
 
 log = logging.getLogger(__name__)
+CRAWL_COOLDOWN = timedelta(minutes=5)
 
 
 async def sync_application_commands(tree: Any, guild_id: int | None) -> int:
@@ -77,6 +79,30 @@ class TifaBot(commands.Bot):
         self._active_collection_task: asyncio.Task[Any] | None = None
         self._active_background_tasks: set[asyncio.Task[Any]] = set()
         self._digest_catch_up_started = False
+        self._crawler_active = False
+        self._crawler_cooldown_until: datetime | None = None
+        self._shutting_down = False
+
+    def _crawl_now(self) -> datetime:
+        return datetime.now(tz=UTC)
+
+    def _schedule_crawl_at(self, run_at: datetime) -> None:
+        self._crawler_cooldown_until = run_at
+        if self.scheduler is None or self._shutting_down:
+            return
+        try:
+            self.scheduler.add_job(
+                self._scheduled_crawl_processing,
+                "date",
+                run_date=run_at,
+                id="crawl_processing",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=None,
+            )
+        except Exception as exc:
+            log.warning("Could not schedule the next crawl (%s)", type(exc).__name__)
 
     async def setup_hook(self) -> None:
         await self.add_cog(PhaseFourCommands(self))
@@ -149,6 +175,8 @@ class TifaBot(commands.Bot):
                 )
                 state = await self.repository.get_runtime_state()
                 self.scheduler = AsyncIOScheduler(timezone=ZoneInfo("Asia/Kolkata"))
+                first_crawl_at = self._crawl_now() + CRAWL_COOLDOWN
+                self._schedule_crawl_at(first_crawl_at)
                 self.scheduler.add_job(
                     self._scheduled_collection,
                     "cron",
@@ -168,16 +196,6 @@ class TifaBot(commands.Bot):
                     coalesce=True,
                     max_instances=1,
                     misfire_grace_time=900,
-                )
-                self.scheduler.add_job(
-                    self._scheduled_crawl_processing,
-                    "interval",
-                    minutes=5,
-                    id="crawl_processing",
-                    replace_existing=True,
-                    coalesce=True,
-                    max_instances=1,
-                    misfire_grace_time=300,
                 )
                 self.scheduler.add_job(
                     self._scheduled_digest,
@@ -246,8 +264,7 @@ class TifaBot(commands.Bot):
         try:
             if self.bing_service is not None:
                 await self.bing_service.run(scheduled=True)
-            if self.crawler is not None:
-                await self.crawler.run_once(scheduled=True)
+            await self._run_crawler_once()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -261,15 +278,30 @@ class TifaBot(commands.Bot):
         if current is not None:
             self._active_background_tasks.add(current)
         try:
-            if self.crawler is not None:
-                await self.crawler.run_once(scheduled=True)
+            await self._run_crawler_once()
+        finally:
+            if current is not None:
+                self._active_background_tasks.discard(current)
+
+    async def _run_crawler_once(self) -> None:
+        crawler = self.crawler
+        if crawler is None or self._shutting_down or self._crawler_active:
+            return
+        now = self._crawl_now()
+        if self._crawler_cooldown_until is not None and now < self._crawler_cooldown_until:
+            return
+
+        self._crawler_active = True
+        try:
+            await crawler.run_once(scheduled=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.warning("Scheduled crawl processing failed (%s)", type(exc).__name__)
         finally:
-            if current is not None:
-                self._active_background_tasks.discard(current)
+            self._crawler_active = False
+            if not self._shutting_down:
+                self._schedule_crawl_at(self._crawl_now() + CRAWL_COOLDOWN)
 
     async def _scheduled_digest(self) -> None:
         current = asyncio.current_task()
@@ -312,7 +344,8 @@ class TifaBot(commands.Bot):
 
     async def close(self) -> None:
         log.info("Closing Discord client")
-        if self.scheduler is not None:
+        self._shutting_down = True
+        if self.scheduler is not None and self.scheduler.running:
             self.scheduler.shutdown(wait=False)
         current = asyncio.current_task()
         active = [
@@ -321,12 +354,13 @@ class TifaBot(commands.Bot):
             if task is not current and not task.done()
         ]
         for task in active:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                log.warning("Active scheduled job stopped with an error (%s)", type(exc).__name__)
+            task.cancel()
+        results = await asyncio.gather(*active, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                log.warning(
+                    "Active scheduled job stopped with an error (%s)", type(result).__name__
+                )
         client = self.safe_http_client
         self.safe_http_client = None
         if client is not None:

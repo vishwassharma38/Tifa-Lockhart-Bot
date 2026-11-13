@@ -247,6 +247,13 @@ async def test_scheduled_crawl_failure_does_not_take_the_bot_offline(make_settin
         assert not bot.is_closed()
         await bot._scheduled_crawl_processing()
         assert not bot.is_closed()
+        assert crawler.calls == 1
+
+        cooldown_until = bot._crawler_cooldown_until
+        assert cooldown_until is not None
+        bot._crawl_now = lambda: cooldown_until
+        await bot._scheduled_crawl_processing()
+        assert not bot.is_closed()
     finally:
         await bot.close()
 

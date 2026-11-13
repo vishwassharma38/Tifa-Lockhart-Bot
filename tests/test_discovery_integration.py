@@ -380,7 +380,10 @@ async def test_scheduler_registers_phase_five_jobs_with_required_intervals(
             "daily_digest",
         }
         assert jobs["bing_discovery"].trigger.interval.total_seconds() == 8 * 3600
-        assert jobs["crawl_processing"].trigger.interval.total_seconds() == 300
+        assert jobs["crawl_processing"].trigger.run_date == bot._crawler_cooldown_until
+        assert jobs["crawl_processing"].coalesce is True
+        assert jobs["crawl_processing"].max_instances == 1
+        assert jobs["crawl_processing"].misfire_grace_time is None
         assert "hour='4'" in str(jobs["daily_digest"].trigger)
         assert "minute='0'" in str(jobs["daily_digest"].trigger)
         assert jobs["daily_digest"].coalesce is True
