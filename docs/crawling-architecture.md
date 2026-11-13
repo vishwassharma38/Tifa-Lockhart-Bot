@@ -57,6 +57,34 @@ registrable domain per scan, caps each compressed and expanded document at
 sitemap's host. Sitemap candidates still pass URL safety, robots, scoring,
 deduplication, and ordinary queue admission.
 
+## Batched queue writes
+
+Each page's ranked links are admitted in ten-link waves. Within a wave the
+crawler prepares all eligible discovery payloads first, deduplicates normalized
+URLs while retaining the first occurrence's provenance, and writes bounded
+chunks of `DISCOVERY_BATCH_SIZE` rows with one atomic upsert per chunk
+(`on_conflict=normalized_url`, duplicate rows ignored). Only URLs that already
+existed need a follow-up lookup, and that lookup is one bounded
+`normalized_url in (...)` query per chunk. Results are mapped back to the input
+order so created and duplicate children keep their original queue semantics.
+
+Edges for the same wave are deduplicated by parent and normalized child URL and
+sent in `DISCOVERY_EDGE_BATCH_SIZE` chunks through `record_discovery_edges`.
+The RPC uses `on conflict do nothing`, covers both the parent-child and
+root-child partial unique indexes, and returns the existing row when a
+relationship already exists, so callers still receive a child ID and keep the
+original provenance. Empty waves issue no database request. If a batch call
+fails, the crawler retries each item through the existing single-record path;
+a failed URL does not prevent later links on the page from being considered.
+
+The per-page caps remain ten internal and forty external links, and the
+job-wide `MAX_URLS_PER_JOB` budget is still checked before a child consumes an
+admission slot. Collection state is read from a short-lived in-process cache
+(`RUNTIME_STATE_CACHE_TTL_SECONDS`, default three seconds) and is still checked
+at every ten ranked links and at job start. A successful `/start` or `/stop`
+invalidates and refreshes the local snapshot; external changes become visible
+within the TTL, and the persisted row remains authoritative after restart.
+
 ## Robots, redirects, and retries
 
 Robots decisions are keyed by scheme, host, and port. Path matching follows
@@ -91,7 +119,9 @@ frontier totals; each crawler run records visited domains, the distinct
 external domains that received newly created queue rows, internal and external
 admissions, skipped URLs, and whether the URL budget was exhausted.
 
-Apply migrations 013 and 014 before deploying code that calls their RPCs. A
+Apply migrations 013, 014, and 015 before deploying code that calls their RPCs.
+Migration 015 creates `record_discovery_edges(jsonb)`, revokes default execute
+permissions, and grants execution plus table access only to `service_role`. A
 local PostgreSQL server is not part of this repository's test setup. The
 loopback-only integration test exercises the claim RPC when a local Supabase
 stack is available; without it, production RPC execution and query-plan

@@ -426,6 +426,14 @@ class _UrlAdmission:
         return True
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingChild:
+    payload: dict[str, Any]
+    edge: dict[str, Any]
+    external: bool
+    domain_site: str
+
+
 class DiscoveryCrawler:
     """Process queued discoveries in bounded batches through the shared pipeline."""
 
@@ -612,6 +620,15 @@ class DiscoveryCrawler:
                     "new_domains": sorted(linked_external_domains)[:50],
                     "sitemap_scanned_domains": len(sitemap_scan_domains),
                 }
+                metrics_snapshot = getattr(self._repository, "metrics_snapshot", None)
+                if callable(metrics_snapshot):
+                    try:
+                        counters["stats_json"]["repository_metrics"] = metrics_snapshot()
+                    except Exception as exc:
+                        log.debug(
+                            "Repository metrics snapshot unavailable (%s)",
+                            type(exc).__name__,
+                        )
                 await self._repository.finish_job_run(job_id, counters, outcome, error_summary)
             except Exception as exc:
                 counters["failed_count"] += 1
@@ -1271,6 +1288,117 @@ class DiscoveryCrawler:
         external_limit = 40
         next_page_admitted = False
         budget_limited = False
+        pending: list[_PendingChild] = []
+
+        async def write_children(children: list[_PendingChild]) -> None:
+            nonlocal admitted, external_admitted, internal_admitted
+            nonlocal duplicates, skipped, new_domains
+            payloads = [child.payload for child in children]
+            batch_upsert = getattr(self._repository, "upsert_discovery_records", None)
+            results: list[tuple[dict[str, Any], bool] | None]
+            if callable(batch_upsert):
+                try:
+                    results = list(await batch_upsert(payloads))
+                except Exception as exc:
+                    log.warning(
+                        "Child discovery batch failed (%s); retrying %s item(s) individually",
+                        type(exc).__name__,
+                        len(payloads),
+                    )
+                    results = await self._upsert_children_individually(payloads)
+            else:
+                results = await self._upsert_children_individually(payloads)
+            if len(results) != len(children):
+                log.warning(
+                    "Child discovery batch returned %s result(s) for %s item(s)",
+                    len(results),
+                    len(children),
+                )
+                results = (results + [None] * len(children))[: len(children)]
+
+            edges: list[dict[str, Any]] = []
+            for child, result in zip(children, results, strict=True):
+                if result is None:
+                    skipped += 1
+                    continue
+                child_row, created = result
+                if created:
+                    if not admission.admit():
+                        skipped += 1
+                        continue
+                    admitted += 1
+                    if child.external:
+                        external_admitted += 1
+                        if child.domain_site not in admitted_domain_sites:
+                            new_domains += 1
+                            admitted_domain_sites.add(child.domain_site)
+                            new_domain_sites.append(child.domain_site)
+                    else:
+                        internal_admitted += 1
+                else:
+                    duplicates += 1
+                child_id = child_row.get("id")
+                edge = dict(child.edge)
+                edge["child_discovery_id"] = str(child_id) if child_id else None
+                edges.append(edge)
+
+            if not edges:
+                return
+            batch_edges = getattr(self._repository, "record_discovery_edges", None)
+            if callable(batch_edges):
+                try:
+                    await batch_edges(edges)
+                    return
+                except Exception as exc:
+                    log.warning(
+                        "Discovery edge batch failed (%s); retrying %s item(s) individually",
+                        type(exc).__name__,
+                        len(edges),
+                    )
+            for edge in edges:
+                try:
+                    await self._repository.record_discovery_edge(**edge)
+                except Exception as exc:
+                    log.warning("Discovery edge insert failed (%s)", type(exc).__name__)
+
+        async def flush_pending() -> None:
+            nonlocal budget_limited, skipped
+            while pending:
+                if admission.remaining <= 0:
+                    budget_limited = True
+                    return
+                external_available = max(0, external_limit - external_admitted)
+                internal_available = max(0, internal_limit - internal_admitted)
+                budget_available = admission.remaining
+                selected: list[_PendingChild] = []
+                deferred: list[_PendingChild] = []
+                external_reserved = internal_reserved = 0
+                for child in pending:
+                    if len(selected) >= budget_available:
+                        deferred.append(child)
+                        continue
+                    if child.external:
+                        if external_reserved >= external_available:
+                            deferred.append(child)
+                            continue
+                        external_reserved += 1
+                    else:
+                        if internal_reserved >= internal_available:
+                            deferred.append(child)
+                            continue
+                        internal_reserved += 1
+                    selected.append(child)
+
+                pending[:] = deferred
+                if not selected:
+                    # Only children whose per-page type cap is already full
+                    # remain, so they cannot be admitted on this page.
+                    skipped += len(pending)
+                    pending.clear()
+                    return
+
+                await write_children(selected)
+
         for index, (score, reasons, external, link, destination_identity) in enumerate(
             ranked_links
         ):
@@ -1303,6 +1431,7 @@ class DiscoveryCrawler:
                 continue
             seen_edges.add(edge_key)
             if scheduled and index % 10 == 0 and not await self._automation_enabled():
+                await flush_pending()
                 skipped += len(ranked_links) - index
                 break
             child_metadata: dict[str, Any] = {
@@ -1342,45 +1471,39 @@ class DiscoveryCrawler:
                 "status": "queued",
                 "metadata_json": child_metadata,
             }
-            try:
-                child_row, created = await self._repository.upsert_discovery_record(payload)
-            except Exception as exc:
-                log.warning("Child discovery insert failed (%s)", type(exc).__name__)
-                skipped += 1
-                continue
-            if created and not admission.admit():
-                skipped += 1
-                break
-            if created:
-                admitted += 1
-                if external:
-                    external_admitted += 1
-                    if destination_identity.registrable_domain not in admitted_domain_sites:
-                        new_domains += 1
-                        admitted_domain_sites.add(destination_identity.registrable_domain)
-                        new_domain_sites.append(destination_identity.registrable_domain)
-                else:
-                    internal_admitted += 1
-            else:
-                duplicates += 1
-            child_id = child_row.get("id")
-            try:
-                await self._repository.record_discovery_edge(
-                    parent_discovery_id=parent_id,
-                    child_discovery_id=str(child_id) if child_id else None,
-                    child_normalized_url=normalized,
-                    discovered_from_url=parent_url,
-                    depth=child_depth,
-                    original_url=link.original_url or link.url,
-                    link_text=link.text,
-                    source_domain=source_identity.registrable_domain,
-                    destination_domain=destination_identity.registrable_domain,
-                    admission_score=max(0, min(100, score * 10)),
-                    admission_reason=";".join(reasons),
-                    discovery_mechanism="sitemap" if link.kind == "sitemap" else "html_link",
+            pending.append(
+                _PendingChild(
+                    payload=payload,
+                    edge={
+                        "parent_discovery_id": parent_id,
+                        "child_discovery_id": None,
+                        "child_normalized_url": normalized,
+                        "discovered_from_url": parent_url,
+                        "depth": child_depth,
+                        "original_url": link.original_url or link.url,
+                        "link_text": link.text,
+                        "source_domain": source_identity.registrable_domain,
+                        "destination_domain": destination_identity.registrable_domain,
+                        "admission_score": max(0, min(100, score * 10)),
+                        "admission_reason": ";".join(reasons),
+                        "discovery_mechanism": (
+                            "sitemap" if link.kind == "sitemap" else "html_link"
+                        ),
+                    },
+                    external=external,
+                    domain_site=destination_identity.registrable_domain,
                 )
-            except Exception as exc:
-                log.warning("Discovery edge insert failed (%s)", type(exc).__name__)
+            )
+            # Flush each ten-link wave so a pause observed at the next
+            # automation boundary still preserves everything admitted before it.
+            if (index + 1) % 10 == 0 or index + 1 == len(ranked_links):
+                await flush_pending()
+
+        await flush_pending()
+        if pending:
+            budget_limited = True
+            skipped += len(pending)
+            pending.clear()
         return {
             "admitted": admitted,
             "external": external_admitted,
@@ -1391,6 +1514,18 @@ class DiscoveryCrawler:
             "skipped": skipped,
             "budget_limited": budget_limited,
         }
+
+    async def _upsert_children_individually(
+        self, payloads: list[dict[str, Any]]
+    ) -> list[tuple[dict[str, Any], bool] | None]:
+        results: list[tuple[dict[str, Any], bool] | None] = []
+        for payload in payloads:
+            try:
+                results.append(await self._repository.upsert_discovery_record(payload))
+            except Exception as exc:
+                log.warning("Child discovery insert failed (%s)", type(exc).__name__)
+                results.append(None)
+        return results
 
     async def _requeue_from_pause(
         self,

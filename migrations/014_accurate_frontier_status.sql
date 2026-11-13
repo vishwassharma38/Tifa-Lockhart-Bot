@@ -66,7 +66,7 @@ as $$
         ),
         'oldest_queued_seconds', (
             select coalesce(
-                pg_catalog.extract(epoch from pg_catalog.now() - min(discovered_at)), 0
+                extract(epoch from (pg_catalog.now() - min(discovered_at))), 0
             )::bigint
             from public.discoveries where status = 'queued'
         )

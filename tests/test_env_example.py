@@ -44,6 +44,9 @@ REQUIRED_KEYS = {
     "CRAWL_BATCH_SIZE",
     "CRAWL_DOMAIN_BATCH_LIMIT",
     "CRAWL_NEW_DOMAIN_SHARE",
+    "DISCOVERY_BATCH_SIZE",
+    "DISCOVERY_EDGE_BATCH_SIZE",
+    "RUNTIME_STATE_CACHE_TTL_SECONDS",
     "MAX_MEDIA_BYTES",
 }
 
@@ -97,6 +100,9 @@ def test_template_contains_only_placeholders_and_safe_defaults() -> None:
     assert values["MAX_PAGES_PER_DOMAIN"] == "20"
     assert values["CRAWL_DOMAIN_BATCH_LIMIT"] == "2"
     assert values["CRAWL_NEW_DOMAIN_SHARE"] == "0.8"
+    assert values["DISCOVERY_BATCH_SIZE"] == "25"
+    assert values["DISCOVERY_EDGE_BATCH_SIZE"] == "50"
+    assert values["RUNTIME_STATE_CACHE_TTL_SECONDS"] == "3"
     assert values["MAX_CONCURRENT_REQUESTS"] == "5"
     assert values["PER_DOMAIN_DELAY_SECONDS"] == "2"
     assert values["MAX_REDIRECTS"] == "5"

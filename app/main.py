@@ -43,7 +43,12 @@ class Application:
             lambda: TifaBot(
                 settings,
                 self._status_service,
-                repository=MediaRepository(self._database),
+                repository=MediaRepository(
+                    self._database,
+                    discovery_batch_size=self.settings.discovery_batch_size,
+                    discovery_edge_batch_size=self.settings.discovery_edge_batch_size,
+                    runtime_state_cache_ttl_seconds=self.settings.runtime_state_cache_ttl_seconds,
+                ),
                 storage=self._storage,
             )
         )

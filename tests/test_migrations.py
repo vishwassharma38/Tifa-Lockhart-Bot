@@ -313,6 +313,42 @@ def test_frontier_status_migration_counts_actual_claim_eligibility() -> None:
     assert "ds.next_eligible_at > pg_catalog.now()" in sql
 
 
+def test_batch_edge_rpc_migration_is_atomic_and_service_role_only() -> None:
+    sql = read_migration("015_batch_record_discovery_edges.sql")
+    lowered = sql.lower()
+
+    assert "create or replace function public.record_discovery_edges(p_edges jsonb)" in lowered
+    assert "returns jsonb" in lowered
+    assert "language plpgsql" in lowered
+    assert "security invoker" in lowered
+    assert "set search_path = ''" in lowered
+    assert "on conflict do nothing" in lowered
+    assert "returning * into v_row" in lowered
+    assert "uq_discovery_edges_parent_child" in lowered
+    assert "uq_discovery_edges_root_child" in lowered
+    assert "pg_catalog.jsonb_array_elements" in lowered
+    assert "pg_catalog.jsonb_typeof(p_edges) <> 'array'" in lowered
+    assert "v_input_count > 200" in lowered
+    assert "'inserted_count'" in lowered
+    assert "'edges'" in lowered
+    assert "nullif(v_edge ->> 'child_normalized_url', '')" in lowered
+    assert "nullif(v_edge ->> 'discovered_from_url', '')" in lowered
+    assert "e.child_normalized_url = v_child_normalized_url" in lowered
+    assert "e.parent_discovery_id is null" in lowered
+    assert "e.parent_discovery_id = v_parent_discovery_id" in lowered
+    assert "revoke all on function public.record_discovery_edges(jsonb)" in lowered
+    assert "from public, anon, authenticated" in lowered
+    assert "grant execute on function public.record_discovery_edges(jsonb) to service_role" in (
+        lowered
+    )
+    assert "grant select, insert on table public.discovery_edges to service_role" in lowered
+    assert "create index" not in lowered
+    assert "security definer" not in lowered
+    assert "drop table" not in lowered
+    assert "delete from" not in lowered
+    assert "truncate" not in lowered
+
+
 def test_bing_search_provider_migration_preserves_history() -> None:
     files, _sql = read_migrations()
     names = [path.name for path in files]
