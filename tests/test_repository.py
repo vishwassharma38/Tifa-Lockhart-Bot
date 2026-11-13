@@ -50,6 +50,11 @@ class FakeQuery:
         self.order_value: tuple[str, bool] | None = None
         self.orders: list[tuple[str, bool]] = []
         self.range_value: tuple[int, int] | None = None
+        self.returning_columns: tuple[str, ...] | None = None
+
+    def select(self, *columns: str) -> FakeQuery:
+        self.returning_columns = columns
+        return self
 
     def eq(self, column: str, value: object) -> FakeQuery:
         self.filters.append((column, value))
@@ -1235,6 +1240,80 @@ async def test_update_discovery_filters_fields_and_rejects_unknown_status() -> N
     }
     with pytest.raises(RepositoryError, match="Unsupported discovery status"):
         await repository.update_discovery("discovery-1", {"status": "unknown"})
+
+
+async def test_requeue_discovery_confirms_processing_claim_transition() -> None:
+    client = FakeClient()
+    discoveries = client.table("discoveries")
+    discoveries.results["update"] = [
+        {
+            "id": "discovery-1",
+            "status": "queued",
+            "claimed_at": None,
+            "last_error": "edge_write_failed",
+            "next_attempt_at": None,
+        }
+    ]
+    repository = make_repository(client)
+
+    result = await repository.requeue_discovery(
+        "discovery-1",
+        reason="edge_write_failed",
+        expected_claimed_at="2026-11-13T10:00:00+00:00",
+    )
+
+    assert result["status"] == "queued"
+    query = next(query for query in discoveries.queries if query.operation == "update")
+    assert ("status", "processing") in query.filters
+    assert ("claimed_at", "2026-11-13T10:00:00+00:00") in query.filters
+    assert query.returning_columns == ("id,status,claimed_at,last_error,next_attempt_at",)
+
+
+async def test_requeue_discovery_reports_unconfirmed_update() -> None:
+    client = FakeClient()
+    discoveries = client.table("discoveries")
+    discoveries.queued_results["update"] = [[]]
+    discoveries.results["select"] = [
+        {
+            "id": "discovery-1",
+            "status": "processing",
+            "claimed_at": "2026-11-13T10:00:00+00:00",
+            "last_error": None,
+        }
+    ]
+    repository = make_repository(client)
+
+    with pytest.raises(RepositoryError, match="Requeue was not confirmed"):
+        await repository.requeue_discovery(
+            "discovery-1",
+            reason="edge_write_failed",
+            expected_claimed_at="2026-11-13T10:00:00+00:00",
+        )
+
+
+async def test_requeue_discovery_confirms_ambiguous_commit_on_retry() -> None:
+    client = FakeClient()
+    discoveries = client.table("discoveries")
+    queued = {
+        "id": "discovery-1",
+        "status": "queued",
+        "claimed_at": None,
+        "last_error": "edge_write_failed",
+        "next_attempt_at": None,
+    }
+    discoveries.queued_results["update"] = [[queued], []]
+    discoveries.queued_results["select"] = [[queued]]
+    thread = ExecuteThenFailThread()
+    repository = make_retrying_repository(client, thread)
+
+    result = await repository.requeue_discovery(
+        "discovery-1",
+        reason="edge_write_failed",
+        expected_claimed_at="2026-11-13T10:00:00+00:00",
+    )
+
+    assert result == queued
+    assert thread.calls == 2
 
 
 async def test_record_discovery_edge_uses_rpc_without_read_before_write() -> None:

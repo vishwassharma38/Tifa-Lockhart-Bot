@@ -990,15 +990,66 @@ class MediaRepository:
         *,
         reason: str | None = None,
         next_attempt_at: str | None = None,
+        expected_claimed_at: str | None = None,
     ) -> dict[str, Any]:
-        return await self.update_discovery(
+        return await self._run(
+            self._requeue_discovery_sync,
             discovery_id,
-            {
-                "status": "queued",
-                "last_error": reason,
-                "next_attempt_at": next_attempt_at,
-            },
+            reason,
+            next_attempt_at,
+            expected_claimed_at,
+            retry=True,
         )
+
+    def _requeue_discovery_sync(
+        self,
+        discovery_id: str,
+        reason: str | None,
+        next_attempt_at: str | None,
+        expected_claimed_at: str | None,
+    ) -> dict[str, Any]:
+        client = self._client()
+        update = (
+            client.table("discoveries")
+            .update(
+                {
+                    "status": "queued",
+                    "claimed_at": None,
+                    "last_error": reason,
+                    "next_attempt_at": next_attempt_at,
+                }
+            )
+            .eq("id", discovery_id)
+            .eq("status", "processing")
+        )
+        if expected_claimed_at is not None:
+            update = update.eq("claimed_at", expected_claimed_at)
+        rows = self._rows(
+            update.select("id,status,claimed_at,last_error,next_attempt_at").execute()
+        )
+        if rows:
+            if rows[0].get("status") == "queued":
+                return rows[0]
+            raise RepositoryError(f"Requeue was not confirmed for discovery {discovery_id}")
+
+        # A transient response loss can occur after the update committed. Confirm
+        # that exact retry outcome without disturbing a newer processing claim.
+        current_rows = self._rows(
+            client.table("discoveries")
+            .select("id,status,claimed_at,last_error,next_attempt_at")
+            .eq("id", discovery_id)
+            .limit(1)
+            .execute()
+        )
+        if current_rows:
+            current = current_rows[0]
+            if (
+                current.get("status") == "queued"
+                and current.get("claimed_at") is None
+                and current.get("last_error") == reason
+            ):
+                return current
+        raise RepositoryError(f"Requeue was not confirmed for discovery {discovery_id}")
 
     async def record_discovery_edge(
         self,

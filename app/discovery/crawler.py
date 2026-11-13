@@ -588,6 +588,17 @@ class DiscoveryCrawler:
                 return stats
 
             try:
+                recover_processing = getattr(
+                    self._repository, "recover_processing_discoveries", None
+                )
+                if callable(recover_processing):
+                    try:
+                        recovered = await recover_processing()
+                        if recovered:
+                            log.info("Recovered %s expired crawl claim(s)", recovered)
+                    except Exception:
+                        errors["processing_claim_recovery_failed"] += 1
+                        log.exception("Expired crawl claim recovery failed")
                 claimed = await self._repository.claim_discoveries(
                     limit=self._settings.crawl_batch_size,
                     max_depth=self._settings.max_crawl_depth,
@@ -599,7 +610,9 @@ class DiscoveryCrawler:
                         if not await self._automation_enabled():
                             paused_for_collection = True
                     if paused_for_collection:
-                        await self._safe_requeue(row, "collection_paused")
+                        if not await self._safe_requeue(row, "collection_paused"):
+                            counters["failed_count"] += 1
+                            errors["discovery_requeue_failed"] += 1
                         counters["skipped_count"] += 1
                         continue
                     try:
@@ -630,7 +643,10 @@ class DiscoveryCrawler:
                                 exc.failed_count,
                                 str(exc.__cause__)[:300] if exc.__cause__ else "unknown",
                             )
-                            await self._safe_requeue(row, "discovery_edge_persistence_failed")
+                            if not await self._safe_requeue(
+                                row, "discovery_edge_persistence_failed"
+                            ):
+                                errors["discovery_requeue_failed"] += 1
                         else:
                             errors[f"discovery_processing_failed:{type(exc).__name__}"] += 1
                             log.warning(
@@ -743,7 +759,9 @@ class DiscoveryCrawler:
             origin=identity.origin,
         )
         if pause_reason:
-            await self._requeue_from_pause(discovery_id, budget, host, pause_reason)
+            requeued = await self._requeue_from_pause(row, budget, host, pause_reason)
+            if not requeued:
+                return {"failed": 1, "errors": {"discovery_requeue_failed": 1}}
             return {"skipped": 1}
 
         inspection_started = time.monotonic()
@@ -759,16 +777,20 @@ class DiscoveryCrawler:
             return result
 
         if inspection.category in {DOMAIN_PAUSED, DOMAIN_BUDGET}:
-            await self._requeue_from_pause(
-                discovery_id,
+            requeued = await self._requeue_from_pause(
+                row,
                 budget,
                 host,
                 inspection.reason or inspection.category,
             )
-            return {
+            result = {
                 "skipped": 1,
                 "resource_budget_limited": inspection.category == DOMAIN_BUDGET,
             }
+            if not requeued:
+                result["failed"] = 1
+                result["errors"] = {"discovery_requeue_failed": 1}
+            return result
 
         metadata = _metadata(row)
         metadata["inspection_latency_ms"] = inspection_latency_ms
@@ -1017,7 +1039,9 @@ class DiscoveryCrawler:
         }
         if status == VERIFIED:
             update["verified_at"] = fetched_at
-        await self._repository.update_discovery(discovery_id, update)
+        # Keep the claim in processing while the required relationship writes
+        # are in flight; a failure must not leave a terminal classification.
+        await self._repository.update_discovery(discovery_id, {"metadata_json": metadata})
 
         if status == VERIFIED:
             acquisition = await self._acquire_original_media(row, page, metadata)
@@ -1047,6 +1071,9 @@ class DiscoveryCrawler:
         outcome["new_domain_sites"] = expansion["new_domain_sites"]
         outcome["skipped_url_count"] = expansion["skipped"]
         outcome["resource_budget_limited"] = expansion["budget_limited"]
+        # Release the claim and apply the final classification only after every
+        # required child edge has been confirmed by the batch writer.
+        await self._repository.update_discovery(discovery_id, update)
         return outcome
 
     async def _discover_sitemap_links(
@@ -1635,26 +1662,53 @@ class DiscoveryCrawler:
 
     async def _requeue_from_pause(
         self,
-        discovery_id: str,
+        row: dict[str, Any],
         budget: RequestBudget,
         host: str,
         reason: str,
-    ) -> None:
+    ) -> bool:
         until = budget.pause_until(host)
-        await self._repository.requeue_discovery(
-            discovery_id,
+        return await self._safe_requeue(
+            row,
             reason=reason,
             next_attempt_at=until.astimezone(UTC).isoformat() if until else None,
         )
 
-    async def _safe_requeue(self, row: dict[str, Any], reason: str) -> None:
+    async def _safe_requeue(
+        self,
+        row: dict[str, Any],
+        reason: str,
+        *,
+        next_attempt_at: str | None = None,
+    ) -> bool:
         discovery_id = row.get("id")
         if not discovery_id:
-            return
+            log.error("Discovery requeue failed discovery_id=missing reason=%s", reason)
+            return False
         try:
-            await self._repository.requeue_discovery(str(discovery_id), reason=reason)
+            result = await self._repository.requeue_discovery(
+                str(discovery_id),
+                reason=reason,
+                next_attempt_at=next_attempt_at,
+                expected_claimed_at=row.get("claimed_at"),
+            )
         except Exception as exc:
-            log.warning("Discovery requeue failed (%s)", type(exc).__name__)
+            log.exception(
+                "Discovery requeue failed discovery_id=%s reason=%s exception=%s",
+                discovery_id,
+                reason,
+                type(exc).__name__,
+            )
+            return False
+        if not isinstance(result, dict) or result.get("status") != "queued":
+            log.error(
+                "Discovery requeue was not confirmed discovery_id=%s reason=%s result_status=%s",
+                discovery_id,
+                reason,
+                result.get("status") if isinstance(result, dict) else None,
+            )
+            return False
+        return True
 
     async def _safe_fail(self, row: dict[str, Any], reason: str) -> None:
         discovery_id = row.get("id")
