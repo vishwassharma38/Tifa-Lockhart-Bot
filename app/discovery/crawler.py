@@ -579,7 +579,9 @@ class DiscoveryCrawler:
                         current_metrics = metrics_snapshot()
                         metric_names = set(metrics_baseline) | set(current_metrics)
                         stats["repository_metrics"] = {
-                            name: max(0, current_metrics.get(name, 0) - metrics_baseline.get(name, 0))
+                            name: max(
+                                0, current_metrics.get(name, 0) - metrics_baseline.get(name, 0)
+                            )
                             for name in sorted(metric_names)
                             if current_metrics.get(name, 0) > metrics_baseline.get(name, 0)
                         }
@@ -654,9 +656,7 @@ class DiscoveryCrawler:
                                 row.get("id"),
                                 type(exc).__name__,
                             )
-                            await self._safe_fail(
-                                row, f"processing_failed:{type(exc).__name__}"
-                            )
+                            await self._safe_fail(row, f"processing_failed:{type(exc).__name__}")
                         continue
                     counters["discovered_count"] += outcome.get("discovered", 0)
                     counters["examined_count"] += outcome.get("examined", 0)
@@ -1489,9 +1489,7 @@ class DiscoveryCrawler:
                     persisted_count,
                     failed_count,
                 )
-                raise DiscoveryEdgeWriteError(
-                    parent_id, persisted_count, failed_count
-                ) from exc
+                raise DiscoveryEdgeWriteError(parent_id, persisted_count, failed_count) from exc
             edge_write_stats["persisted_count"] += unique_edge_count
 
         async def flush_pending() -> None:
