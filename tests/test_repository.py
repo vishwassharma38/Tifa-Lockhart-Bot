@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from app.db.client import SupabaseDatabase
-from app.db.repository import MediaRepository, RepositoryError
+from app.db.repository import DiscoveryEdgePersistenceError, MediaRepository, RepositoryError
 from app.discovery.models import WebCandidate
 from app.reddit.models import RedditCandidate
 
@@ -50,6 +50,11 @@ class FakeQuery:
         self.order_value: tuple[str, bool] | None = None
         self.orders: list[tuple[str, bool]] = []
         self.range_value: tuple[int, int] | None = None
+        self.returning_columns: tuple[str, ...] | None = None
+
+    def select(self, *columns: str) -> FakeQuery:
+        self.returning_columns = columns
+        return self
 
     def eq(self, column: str, value: object) -> FakeQuery:
         self.filters.append((column, value))
@@ -129,6 +134,7 @@ class FakeTable:
         self.queued_counts: dict[str, list[int]] = {}
         self.queries: list[FakeQuery] = []
         self.calls: list[tuple[str, object, object]] = []
+        self.upsert_options: list[dict[str, object]] = []
 
     def select(self, *columns: str, count: str | None = None) -> FakeQuery:
         self.calls.append(("select", columns, None))
@@ -144,11 +150,15 @@ class FakeTable:
 
     def upsert(
         self,
-        payload: dict[str, object],
+        payload: dict[str, object] | list[dict[str, object]],
         *,
         on_conflict: str | None = None,
+        ignore_duplicates: bool = False,
     ) -> FakeQuery:
         self.calls.append(("upsert", payload, on_conflict))
+        self.upsert_options.append(
+            {"on_conflict": on_conflict, "ignore_duplicates": ignore_duplicates}
+        )
         query = FakeQuery(self, "upsert")
         self.queries.append(query)
         return query
@@ -165,13 +175,15 @@ class FakeClient:
         self.tables: dict[str, FakeTable] = {}
         self.rpc_calls: list[tuple[str, dict[str, object]]] = []
         self.rpc_data: object = {"id": "publication-1", "quota_exhausted": False}
+        self.rpc_queue: list[object] = []
 
     def table(self, name: str) -> FakeTable:
         return self.tables.setdefault(name, FakeTable(name))
 
     def rpc(self, name: str, params: dict[str, object]):
         self.rpc_calls.append((name, params))
-        return FakeQueryResult(self.rpc_data)
+        data = self.rpc_queue.pop(0) if self.rpc_queue else self.rpc_data
+        return FakeQueryResult(data)
 
 
 class FakeQueryResult:
@@ -179,6 +191,8 @@ class FakeQueryResult:
         self.data = data
 
     def execute(self) -> FakeResponse:
+        if isinstance(self.data, Exception):
+            raise self.data
         return FakeResponse(self.data)  # type: ignore[arg-type]
 
 
@@ -221,6 +235,20 @@ class AlwaysFailsThread:
     async def __call__(self, function, *args, **kwargs):
         self.calls += 1
         raise self.error
+
+
+class ExecuteThenFailThread:
+    """Execute the first dispatch, then lose its response once."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, function, *args, **kwargs):
+        self.calls += 1
+        result = function(*args, **kwargs)
+        if self.calls == 1:
+            raise httpx.ReadError("response lost after commit")
+        return result
 
 
 class CommitThenDuplicateThread:
@@ -790,6 +818,134 @@ async def test_operational_counts_include_queue_bing_and_pause_state() -> None:
     assert count_query.filters == [("status", "queued")]
 
 
+async def test_runtime_state_cache_reuses_reads_within_ttl_and_refreshes_after_expiry() -> None:
+    client = FakeClient()
+    client.table("runtime_state").queued_results["select"] = [
+        [{"id": 1, "collection_enabled": False}],
+        [{"id": 1, "collection_enabled": True}],
+    ]
+    clock = [100.0]
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=immediate_thread,
+        runtime_state_cache_ttl_seconds=3.0,
+        monotonic=lambda: clock[0],
+    )
+
+    assert (await repository.get_runtime_state())["collection_enabled"] is False
+    clock[0] = 102.9
+    assert (await repository.get_runtime_state())["collection_enabled"] is False
+    assert len([q for q in client.table("runtime_state").queries if q.operation == "select"]) == 1
+
+    clock[0] = 103.0
+    assert (await repository.get_runtime_state())["collection_enabled"] is True
+    assert len([q for q in client.table("runtime_state").queries if q.operation == "select"]) == 2
+
+    metrics = repository.metrics_snapshot()
+    assert metrics["runtime_state_cache_hits"] == 1
+    assert metrics["runtime_state_cache_misses"] == 2
+    assert metrics["runtime_state_reads"] == 2
+
+
+async def test_runtime_state_cache_is_refreshed_immediately_by_start_and_stop() -> None:
+    client = FakeClient()
+    runtime = client.table("runtime_state")
+    runtime.results["select"] = [{"id": 1, "collection_enabled": False}]
+    runtime.queued_results["upsert"] = [
+        [{"id": 1, "collection_enabled": True}],
+        [{"id": 1, "collection_enabled": False}],
+    ]
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=immediate_thread,
+        runtime_state_cache_ttl_seconds=30.0,
+    )
+
+    assert (await repository.get_runtime_state())["collection_enabled"] is False
+    assert (await repository.set_collection_enabled(True))["collection_enabled"] is True
+    assert (await repository.get_runtime_state())["collection_enabled"] is True
+    assert (await repository.set_collection_enabled(False))["collection_enabled"] is False
+    assert (await repository.get_runtime_state())["collection_enabled"] is False
+    assert len([q for q in runtime.queries if q.operation == "select"]) == 1
+
+    metrics = repository.metrics_snapshot()
+    assert metrics["runtime_state_cache_invalidations"] == 2
+    assert metrics["runtime_state_cache_refreshes"] == 2
+    assert metrics["runtime_state_cache_hits"] == 2
+
+
+async def test_runtime_state_cache_does_not_hide_failed_updates_or_cache_failures() -> None:
+    client = FakeClient()
+    runtime = client.table("runtime_state")
+    runtime.results["select"] = [{"id": 1, "collection_enabled": False}]
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=immediate_thread,
+        runtime_state_cache_ttl_seconds=30.0,
+    )
+
+    assert (await repository.get_runtime_state())["collection_enabled"] is False
+    runtime.errors["upsert"] = ValueError("write rejected")
+    with pytest.raises(ValueError, match="write rejected"):
+        await repository.set_collection_enabled(True)
+    # The failed write must leave the last known-good snapshot intact.
+    assert (await repository.get_runtime_state())["collection_enabled"] is False
+    assert len([q for q in runtime.queries if q.operation == "select"]) == 1
+
+    failing_client = FakeClient()
+    failing_runtime = failing_client.table("runtime_state")
+    failing_runtime.errors["select"] = ValueError("read failed")
+    failing_repository = MediaRepository(
+        make_database(failing_client),
+        to_thread=immediate_thread,
+        runtime_state_cache_ttl_seconds=30.0,
+    )
+    with pytest.raises(ValueError, match="read failed"):
+        await failing_repository.get_runtime_state()
+
+    failing_runtime.errors.pop("select")
+    failing_runtime.results["select"] = [{"id": 1, "collection_enabled": True}]
+    assert (await failing_repository.get_runtime_state())["collection_enabled"] is True
+    assert failing_repository.metrics_snapshot()["runtime_state_cache_misses"] == 2
+
+
+async def test_runtime_state_cache_returns_copies_and_ignores_stale_inflight_reads() -> None:
+    client = FakeClient()
+    runtime = client.table("runtime_state")
+    runtime.queued_results["select"] = [[{"id": 1, "collection_enabled": False}]]
+    runtime.results["upsert"] = [{"id": 1, "collection_enabled": True}]
+    entered = asyncio.Event()
+    released = asyncio.Event()
+
+    async def controlled_thread(function, *args, **kwargs):
+        if getattr(function, "__name__", "") == "_runtime_state_sync" and not entered.is_set():
+            entered.set()
+            await released.wait()
+        return function(*args, **kwargs)
+
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=controlled_thread,
+        runtime_state_cache_ttl_seconds=30.0,
+    )
+
+    stale_read = asyncio.create_task(repository.get_runtime_state())
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    await repository.set_collection_enabled(True)
+    released.set()
+    assert (await stale_read)["collection_enabled"] is False
+
+    state = await repository.get_runtime_state()
+    assert state["collection_enabled"] is True
+    state["collection_enabled"] = False
+    assert (await repository.get_runtime_state())["collection_enabled"] is True
+    assert len([q for q in runtime.queries if q.operation == "select"]) == 1
+    metrics = repository.metrics_snapshot()
+    assert metrics["runtime_state_cache_hits"] == 2
+    assert metrics["runtime_state_cache_invalidations"] == 1
+    assert metrics["runtime_state_cache_refreshes"] == 1
+
+
 async def test_generic_discovery_upsert_is_idempotent_by_normalized_url() -> None:
     existing = {"id": "discovery-1", "normalized_url": "https://example.com/a"}
     client = FakeClient()
@@ -802,45 +958,262 @@ async def test_generic_discovery_upsert_is_idempotent_by_normalized_url() -> Non
 
     assert row == existing
     assert created is False
-    assert not [call for call in client.table("discoveries").calls if call[0] == "insert"]
+    discoveries = client.table("discoveries")
+    assert discoveries.upsert_options == [
+        {"on_conflict": "normalized_url", "ignore_duplicates": True}
+    ]
+    select = next(call for call in discoveries.queries if call.operation == "select")
+    assert ("in.normalized_url", ["https://example.com/a"]) in select.filters
+    assert not [call for call in discoveries.calls if call[0] == "insert"]
+    assert not [
+        query
+        for query in discoveries.queries
+        if query.operation == "select" and query.limit_value is not None
+    ]
 
 
 async def test_generic_discovery_upsert_inserts_new_normalized_url() -> None:
     client = FakeClient()
-    client.table("discoveries").results["insert"] = [{"id": "discovery-2"}]
+    client.table("discoveries").results["upsert"] = [
+        {"id": "discovery-2", "normalized_url": "https://example.com/b"}
+    ]
     repository = make_repository(client)
 
     row, created = await repository.upsert_discovery_record(
         {"url": "https://example.com/b", "normalized_url": "https://example.com/b"}
     )
 
-    assert row == {"id": "discovery-2"}
+    assert row == {"id": "discovery-2", "normalized_url": "https://example.com/b"}
     assert created is True
-    insert = next(call for call in client.table("discoveries").calls if call[0] == "insert")
-    assert insert[1]["normalized_url"] == "https://example.com/b"
+    discoveries = client.table("discoveries")
+    upsert = next(call for call in discoveries.calls if call[0] == "upsert")
+    assert isinstance(upsert[1], list)
+    assert upsert[1][0]["normalized_url"] == "https://example.com/b"
+    assert discoveries.upsert_options == [
+        {"on_conflict": "normalized_url", "ignore_duplicates": True}
+    ]
+    # The inserted row resolves the ID, so no preflight or fallback GET is made.
+    assert not [call for call in discoveries.calls if call[0] == "select"]
 
 
-async def test_claim_discoveries_filters_due_rows_and_uses_conditional_update() -> None:
+async def test_batch_discovery_upsert_dedupes_and_bulk_resolves_existing_ids() -> None:
+    new_row = {"id": "new-1", "normalized_url": "https://example.com/new"}
+    existing_row = {"id": "existing-1", "normalized_url": "https://example.com/existing"}
     client = FakeClient()
     discoveries = client.table("discoveries")
-    discoveries.results["select"] = [{"id": "discovery-1", "status": "queued", "depth": 2}]
-    discoveries.results["update"] = [{"id": "discovery-1", "status": "processing", "depth": 2}]
+    discoveries.results["upsert"] = [new_row]
+    discoveries.results["select"] = [existing_row]
     repository = make_repository(client)
 
-    rows = await repository.claim_discoveries(limit=5, max_depth=6)
+    results = await repository.upsert_discovery_records(
+        [
+            {"url": "https://example.com/new", "normalized_url": "https://example.com/new"},
+            {
+                "url": "https://example.com/existing",
+                "normalized_url": "https://example.com/existing",
+            },
+            {
+                "url": "https://example.com/new",
+                "normalized_url": "https://example.com/new",
+                "title": "duplicate must not replace provenance",
+            },
+        ]
+    )
+
+    assert [row["id"] for row, _created in results] == ["new-1", "existing-1", "new-1"]
+    assert [created for _row, created in results] == [True, False, False]
+    upserts = [call for call in discoveries.calls if call[0] == "upsert"]
+    assert len(upserts) == 1
+    assert len(upserts[0][1]) == 2
+    assert upserts[0][1][0]["normalized_url"] == "https://example.com/new"
+    selects = [query for query in discoveries.queries if query.operation == "select"]
+    assert len(selects) == 1
+    assert ("in.normalized_url", ["https://example.com/existing"]) in selects[0].filters
+    assert not selects[0].limit_value
+    metrics = repository.metrics_snapshot()
+    assert metrics["discovery_batch_calls"] == 1
+    assert metrics["discovery_batch_rows"] == 3
+    assert metrics["discovery_batch_unique_rows"] == 2
+    assert metrics["discovery_batch_deduped"] == 1
+    assert metrics["discovery_batch_created"] == 1
+    assert metrics["discovery_batch_lookup_queries"] == 1
+
+
+async def test_batch_discovery_upsert_splits_large_inputs_into_bounded_chunks() -> None:
+    payloads = [
+        {"url": f"https://example.com/{index}", "normalized_url": f"https://example.com/{index}"}
+        for index in range(5)
+    ]
+    client = FakeClient()
+    discoveries = client.table("discoveries")
+    discoveries.queued_results["upsert"] = [
+        [
+            {"id": "1", "normalized_url": "https://example.com/0"},
+            {"id": "2", "normalized_url": "https://example.com/1"},
+        ],
+        [
+            {"id": "3", "normalized_url": "https://example.com/2"},
+            {"id": "4", "normalized_url": "https://example.com/3"},
+        ],
+        [{"id": "5", "normalized_url": "https://example.com/4"}],
+    ]
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=immediate_thread,
+        discovery_batch_size=2,
+    )
+
+    results = await repository.upsert_discovery_records(payloads)
+
+    assert [row["id"] for row, _created in results] == ["1", "2", "3", "4", "5"]
+    upserts = [call for call in discoveries.calls if call[0] == "upsert"]
+    assert [len(call[1]) for call in upserts] == [2, 2, 1]
+    assert not [call for call in discoveries.calls if call[0] == "select"]
+    assert repository.metrics_snapshot()["discovery_batch_chunks"] == 3
+
+
+async def test_batch_discovery_upsert_empty_batch_makes_no_database_calls() -> None:
+    client = FakeClient()
+    repository = make_repository(client)
+
+    assert await repository.upsert_discovery_records([]) == []
+    assert client.table("discoveries").calls == []
+
+
+async def test_batch_discovery_upsert_rejects_unresolved_rows() -> None:
+    client = FakeClient()
+    repository = make_repository(client)
+
+    with pytest.raises(RepositoryError, match="did not resolve"):
+        await repository.upsert_discovery_records(
+            [
+                {
+                    "url": "https://example.com/missing",
+                    "normalized_url": "https://example.com/missing",
+                }
+            ]
+        )
+
+
+async def test_batch_discovery_upsert_requires_normalized_urls() -> None:
+    repository = make_repository(FakeClient())
+
+    with pytest.raises(RepositoryError, match="normalized_url"):
+        await repository.upsert_discovery_records([{"url": "https://example.com/no-normalized"}])
+
+
+async def test_batch_discovery_upsert_retry_recovers_a_lost_commit_response() -> None:
+    row = {"id": "discovery-1", "normalized_url": "https://example.com/accepted"}
+    client = FakeClient()
+    discoveries = client.table("discoveries")
+    discoveries.queued_results["upsert"] = [[row], []]
+    discoveries.results["select"] = [row]
+    thread = ExecuteThenFailThread()
+    repository = make_retrying_repository(client, thread)
+
+    results = await repository.upsert_discovery_records(
+        [{"url": "https://example.com/accepted", "normalized_url": "https://example.com/accepted"}]
+    )
+
+    assert results == [(row, False)]
+    assert thread.calls == 2
+    assert len([call for call in discoveries.calls if call[0] == "upsert"]) == 2
+    selects = [query for query in discoveries.queries if query.operation == "select"]
+    assert len(selects) == 1
+    assert ("in.normalized_url", ["https://example.com/accepted"]) in selects[0].filters
+
+
+async def test_claim_discoveries_uses_atomic_fair_frontier_rpc() -> None:
+    client = FakeClient()
+    client.rpc_data = [{"id": "discovery-1", "status": "processing", "depth": 2}]
+    repository = make_repository(client)
+
+    rows = await repository.claim_discoveries(limit=25, max_depth=6, per_domain_limit=2)
 
     assert rows[0]["status"] == "processing"
-    select_query = discoveries.queries[0]
-    assert ("status", "queued") in select_query.filters
-    assert ("lte.depth", 6) in select_query.filters
-    assert select_query.or_expression is not None
-    assert "next_attempt_at.is.null" in select_query.or_expression
-    assert select_query.order_value == ("discovered_at", False)
-    assert select_query.limit_value == 5
-    update_query = discoveries.queries[1]
-    assert update_query.operation == "update"
-    assert ("id", "discovery-1") in update_query.filters
-    assert ("status", "queued") in update_query.filters
+    assert client.rpc_calls == [
+        (
+            "claim_crawl_discoveries",
+            {
+                "p_limit": 25,
+                "p_max_depth": 6,
+                "p_per_domain_limit": 2,
+                "p_new_domain_share": 0.8,
+            },
+        )
+    ]
+
+
+async def test_crawl_frontier_summary_and_robots_policy_persistence() -> None:
+    client = FakeClient()
+    client.rpc_data = {
+        "domains_discovered": "20",
+        "domains_unexplored": 8,
+        "domains_explored": 12,
+        "domains_cooling_down": 2,
+        "queued_domains": 7,
+        "domains_visited_recently": 6,
+    }
+    client.table("crawl_origin_state").results["select"] = [
+        {
+            "robots_body": "User-agent: *\\nDisallow: /private",
+            "robots_status": 200,
+            "robots_category": "ok",
+            "robots_expires_at": "2026-11-11T00:00:00+00:00",
+        }
+    ]
+    repository = make_repository(client)
+
+    summary = await repository.crawl_frontier_summary()
+    policy = await repository.get_robots_policy("https://example.com")
+    await repository.store_robots_policy(
+        "https://example.com",
+        "example.com",
+        "example.com",
+        {"robots_status": 200, "robots_category": "ok", "robots_body": ""},
+    )
+
+    assert summary["domains_discovered"] == 20
+    assert summary["domains_unexplored"] == 8
+    assert policy["robots_status"] == 200
+    assert client.rpc_calls[-1] == ("crawl_frontier_summary", {"p_max_depth": 6})
+    assert client.table("crawl_origin_state").queries[0].filters == [
+        ("origin", "https://example.com")
+    ]
+    domain_upsert = next(
+        call for call in client.table("crawl_domain_state").calls if call[0] == "upsert"
+    )
+    assert domain_upsert[1] == {
+        "registrable_domain": "example.com",
+        "hostnames": ["example.com"],
+    }
+    upsert = next(call for call in client.table("crawl_origin_state").calls if call[0] == "upsert")
+    assert upsert[1]["registrable_domain"] == "example.com"
+
+
+async def test_frontier_backfill_uses_stored_host_when_legacy_url_is_invalid() -> None:
+    client = FakeClient()
+    discoveries = client.table("discoveries")
+    discoveries.queued_results["select"] = [
+        [
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "normalized_url": "http://localhost/private",
+                "domain": "gallery.example.org",
+            }
+        ],
+        [],
+    ]
+    client.rpc_data = 1
+    repository = make_repository(client)
+
+    updated = await repository.backfill_frontier_domains()
+
+    assert updated == 1
+    assert client.rpc_calls[0][0] == "backfill_crawl_domain_identities"
+    item = client.rpc_calls[0][1]["p_items"][0]
+    assert item["hostname"] == "gallery.example.org"
+    assert item["registrable_domain"] == "example.org"
 
 
 async def test_update_discovery_filters_fields_and_rejects_unknown_status() -> None:
@@ -861,6 +1234,7 @@ async def test_update_discovery_filters_fields_and_rejects_unknown_status() -> N
     _, payload, _ = client.table("discoveries").calls[0]
     assert payload == {
         "status": "verified",
+        "claimed_at": None,
         "http_status": 200,
         "metadata_json": {"title": "Tifa"},
     }
@@ -868,58 +1242,389 @@ async def test_update_discovery_filters_fields_and_rejects_unknown_status() -> N
         await repository.update_discovery("discovery-1", {"status": "unknown"})
 
 
-async def test_record_discovery_edge_deduplicates_and_preserves_root_paths() -> None:
+async def test_requeue_discovery_confirms_processing_claim_transition() -> None:
     client = FakeClient()
-    edges = client.table("discovery_edges")
-    edges.results["select"] = [{"id": "edge-1"}]
+    discoveries = client.table("discoveries")
+    discoveries.results["update"] = [
+        {
+            "id": "discovery-1",
+            "status": "queued",
+            "claimed_at": None,
+            "last_error": "edge_write_failed",
+            "next_attempt_at": None,
+        }
+    ]
     repository = make_repository(client)
 
-    existing = await repository.record_discovery_edge(
-        parent_discovery_id=None,
-        child_discovery_id="child-1",
-        child_normalized_url="https://example.com/child",
-        discovered_from_url="https://www.bing.com/search?q=tifa",
-        depth=0,
+    result = await repository.requeue_discovery(
+        "discovery-1",
+        reason="edge_write_failed",
+        expected_claimed_at="2026-11-13T10:00:00+00:00",
     )
 
-    assert existing == {"id": "edge-1"}
-    root_query = edges.queries[0]
-    assert ("is.parent_discovery_id", "null") in root_query.filters
-    assert not [call for call in edges.calls if call[0] == "insert"]
+    assert result["status"] == "queued"
+    query = next(query for query in discoveries.queries if query.operation == "update")
+    assert ("status", "processing") in query.filters
+    assert ("claimed_at", "2026-11-13T10:00:00+00:00") in query.filters
+    assert query.returning_columns == ("id,status,claimed_at,last_error,next_attempt_at",)
 
-    edges.results["select"] = []
-    edges.results["insert"] = [{"id": "edge-2"}]
+
+async def test_requeue_discovery_reports_unconfirmed_update() -> None:
+    client = FakeClient()
+    discoveries = client.table("discoveries")
+    discoveries.queued_results["update"] = [[]]
+    discoveries.results["select"] = [
+        {
+            "id": "discovery-1",
+            "status": "processing",
+            "claimed_at": "2026-11-13T10:00:00+00:00",
+            "last_error": None,
+        }
+    ]
+    repository = make_repository(client)
+
+    with pytest.raises(RepositoryError, match="Requeue was not confirmed"):
+        await repository.requeue_discovery(
+            "discovery-1",
+            reason="edge_write_failed",
+            expected_claimed_at="2026-11-13T10:00:00+00:00",
+        )
+
+
+async def test_requeue_discovery_confirms_ambiguous_commit_on_retry() -> None:
+    client = FakeClient()
+    discoveries = client.table("discoveries")
+    queued = {
+        "id": "discovery-1",
+        "status": "queued",
+        "claimed_at": None,
+        "last_error": "edge_write_failed",
+        "next_attempt_at": None,
+    }
+    discoveries.queued_results["update"] = [[queued], []]
+    discoveries.queued_results["select"] = [[queued]]
+    thread = ExecuteThenFailThread()
+    repository = make_retrying_repository(client, thread)
+
+    result = await repository.requeue_discovery(
+        "discovery-1",
+        reason="edge_write_failed",
+        expected_claimed_at="2026-11-13T10:00:00+00:00",
+    )
+
+    assert result == queued
+    assert thread.calls == 2
+
+
+async def test_record_discovery_edge_uses_rpc_without_read_before_write() -> None:
+    client = FakeClient()
+    client.rpc_data = {
+        "inserted_count": 1,
+        "edges": [
+            {
+                "id": "edge-1",
+                "parent_discovery_id": "parent-1",
+                "child_normalized_url": "https://example.com/child",
+                "depth": 1,
+            }
+        ],
+    }
+    repository = make_repository(client)
+
     created = await repository.record_discovery_edge(
         parent_discovery_id="parent-1",
         child_discovery_id="child-1",
         child_normalized_url="https://example.com/child",
         discovered_from_url="https://example.com/parent",
         depth=1,
+        original_url="https://example.com/child?ref=parent",
+        link_text="child",
+        source_domain="example.com",
+        destination_domain="example.com",
+        admission_score=73,
+        admission_reason="relevant",
+        discovery_mechanism="html_link",
     )
-    assert created == {"id": "edge-2"}
-    inserted = next(call for call in edges.calls if call[0] == "insert")
-    assert inserted[1]["parent_discovery_id"] == "parent-1"
-    assert inserted[1]["depth"] == 1
+
+    assert created["id"] == "edge-1"
+    assert client.rpc_calls == [
+        (
+            "record_discovery_edges",
+            {
+                "p_edges": [
+                    {
+                        "parent_discovery_id": "parent-1",
+                        "child_discovery_id": "child-1",
+                        "child_normalized_url": "https://example.com/child",
+                        "discovered_from_url": "https://example.com/parent",
+                        "depth": 1,
+                        "original_url": "https://example.com/child?ref=parent",
+                        "link_text": "child",
+                        "source_domain": "example.com",
+                        "destination_domain": "example.com",
+                        "admission_score": 73,
+                        "admission_reason": "relevant",
+                        "discovery_mechanism": "html_link",
+                    }
+                ]
+            },
+        )
+    ]
+    # No discovery_edges table traffic at all: the RPC resolves conflicts inside
+    # PostgreSQL, including the root-child partial unique index.
+    assert client.table("discovery_edges").calls == []
+    assert client.table("discovery_edges").queries == []
+
+
+async def test_record_discovery_edges_preserves_root_paths_and_dedupes_batches() -> None:
+    client = FakeClient()
+    root_row = {
+        "id": "edge-root",
+        "parent_discovery_id": None,
+        "child_normalized_url": "https://example.com/root",
+        "depth": 0,
+    }
+    child_row = {
+        "id": "edge-child",
+        "parent_discovery_id": "parent-1",
+        "child_normalized_url": "https://example.com/child",
+        "depth": 1,
+    }
+    duplicate_row = {
+        "id": "edge-duplicate",
+        "parent_discovery_id": "parent-1",
+        "child_normalized_url": "https://example.com/dup",
+        "depth": 1,
+    }
+    client.rpc_queue = [
+        {"inserted_count": 1, "edges": [root_row, child_row]},
+        {"inserted_count": 0, "edges": [duplicate_row]},
+    ]
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=immediate_thread,
+        discovery_edge_batch_size=2,
+    )
+
+    rows = await repository.record_discovery_edges(
+        [
+            {
+                "parent_discovery_id": None,
+                "child_normalized_url": "https://example.com/root",
+                "discovered_from_url": "https://www.bing.com/search?q=tifa",
+                "depth": 0,
+            },
+            {
+                "parent_discovery_id": "parent-1",
+                "child_normalized_url": "https://example.com/child",
+                "discovered_from_url": "https://example.com/parent",
+                "depth": 1,
+            },
+            {
+                "parent_discovery_id": "parent-1",
+                "child_normalized_url": "https://example.com/dup",
+                "discovered_from_url": "https://example.com/parent",
+                "depth": 1,
+            },
+            {
+                "parent_discovery_id": "parent-1",
+                "child_normalized_url": "https://example.com/dup",
+                "discovered_from_url": "https://example.com/parent",
+                "depth": 1,
+            },
+        ]
+    )
+
+    assert [row["id"] for row in rows] == [
+        "edge-root",
+        "edge-child",
+        "edge-duplicate",
+        "edge-duplicate",
+    ]
+    assert len(client.rpc_calls) == 2
+    assert [len(call[1]["p_edges"]) for call in client.rpc_calls] == [2, 1]
+    assert client.rpc_calls[0][1]["p_edges"][0]["parent_discovery_id"] is None
+    assert all(call[0] == "record_discovery_edges" for call in client.rpc_calls)
+    metrics = repository.metrics_snapshot()
+    assert metrics["edge_batch_calls"] == 1
+    assert metrics["edge_batch_rows"] == 4
+    assert metrics["edge_batch_unique_rows"] == 3
+    assert metrics["edge_batch_deduped"] == 1
+    assert metrics["edge_batch_chunks"] == 2
+    assert metrics["edge_rpc_inserted"] == 1
+    assert metrics["edge_rpc_duplicates"] == 2
+    assert metrics["edge_batch_created"] == 1
+    assert metrics["edge_batch_existing"] == 3
+
+
+async def test_record_discovery_edges_skips_database_for_an_empty_batch() -> None:
+    client = FakeClient()
+    repository = make_repository(client)
+
+    assert await repository.record_discovery_edges([]) == []
+    assert client.rpc_calls == []
+
+
+async def test_record_discovery_edges_rejects_incomplete_rpc_responses() -> None:
+    client = FakeClient()
+    client.rpc_data = {"inserted_count": 1, "edges": []}
+    repository = make_repository(client)
+
+    with pytest.raises(RepositoryError, match="every requested relationship"):
+        await repository.record_discovery_edges(
+            [
+                {
+                    "parent_discovery_id": "parent-1",
+                    "child_normalized_url": "https://example.com/child",
+                    "discovered_from_url": "https://example.com/parent",
+                    "depth": 1,
+                }
+            ]
+        )
+
+
+async def test_record_discovery_edges_reports_confirmed_partial_chunks() -> None:
+    first = {
+        "id": "edge-1",
+        "parent_discovery_id": "parent-1",
+        "child_normalized_url": "https://example.com/one",
+    }
+    client = FakeClient()
+    client.rpc_queue = [
+        {"inserted_count": 1, "edges": [first]},
+        ValueError("RPC unavailable"),
+    ]
+    repository = make_repository(client)
+    repository._discovery_edge_batch_size = 1
+
+    with pytest.raises(DiscoveryEdgePersistenceError) as error:
+        await repository.record_discovery_edges(
+            [
+                {
+                    "parent_discovery_id": "parent-1",
+                    "child_normalized_url": "https://example.com/one",
+                    "discovered_from_url": "https://example.com/parent",
+                    "depth": 1,
+                },
+                {
+                    "parent_discovery_id": "parent-1",
+                    "child_normalized_url": "https://example.com/two",
+                    "discovered_from_url": "https://example.com/parent",
+                    "depth": 1,
+                },
+            ]
+        )
+
+    assert error.value.confirmed_count == 1
+    assert error.value.failed_count == 1
+    assert isinstance(error.value.__cause__, ValueError)
+    assert len(client.rpc_calls) == 2
+
+
+async def test_record_discovery_edges_keeps_confirmed_chunks_across_retries() -> None:
+    first = {
+        "id": "edge-1",
+        "parent_discovery_id": "parent-1",
+        "child_normalized_url": "https://example.com/one",
+    }
+    client = FakeClient()
+    client.rpc_queue = [
+        {"inserted_count": 1, "edges": [first]},
+        httpx.ReadError("later chunk response lost"),
+        httpx.ReadError("retry failed before first chunk response"),
+        httpx.ReadError("final retry failed before first chunk response"),
+    ]
+    repository = make_retrying_repository(client, immediate_thread, discovery_edge_batch_size=1)
+
+    with pytest.raises(DiscoveryEdgePersistenceError) as error:
+        await repository.record_discovery_edges(
+            [
+                {
+                    "parent_discovery_id": "parent-1",
+                    "child_normalized_url": "https://example.com/one",
+                    "discovered_from_url": "https://example.com/parent",
+                    "depth": 1,
+                },
+                {
+                    "parent_discovery_id": "parent-1",
+                    "child_normalized_url": "https://example.com/two",
+                    "discovered_from_url": "https://example.com/parent",
+                    "depth": 1,
+                },
+            ]
+        )
+
+    assert error.value.confirmed_count == 1
+    assert error.value.failed_count == 1
+    assert len(client.rpc_calls) == 4
+
+
+async def test_repository_metric_scopes_are_per_task_and_cumulative_metrics_remain_global() -> None:
+    repository = make_repository(FakeClient())
+
+    async def scoped_operation(name: str) -> dict[str, int]:
+        token = repository.begin_metrics_scope()
+        try:
+            await asyncio.to_thread(repository._bump_metrics, total_calls=1, **{name: 1})
+            await asyncio.sleep(0)
+            return repository.scoped_metrics_snapshot()
+        finally:
+            repository.end_metrics_scope(token)
+
+    first, second = await asyncio.gather(
+        scoped_operation("first_job"), scoped_operation("second_job")
+    )
+
+    assert first == {"total_calls": 1, "first_job": 1}
+    assert second == {"total_calls": 1, "second_job": 1}
+    assert repository.metrics_snapshot() == {
+        "total_calls": 2,
+        "first_job": 1,
+        "second_job": 1,
+    }
+
+
+async def test_record_discovery_edges_retry_is_idempotent_after_a_lost_response() -> None:
+    row = {
+        "id": "edge-1",
+        "parent_discovery_id": "parent-1",
+        "child_normalized_url": "https://example.com/child",
+        "depth": 1,
+    }
+    client = FakeClient()
+    client.rpc_queue = [
+        {"inserted_count": 1, "edges": [row]},
+        {"inserted_count": 0, "edges": [row]},
+    ]
+    thread = ExecuteThenFailThread()
+    repository = make_retrying_repository(client, thread)
+
+    rows = await repository.record_discovery_edges(
+        [
+            {
+                "parent_discovery_id": "parent-1",
+                "child_normalized_url": "https://example.com/child",
+                "discovered_from_url": "https://example.com/parent",
+                "depth": 1,
+            }
+        ]
+    )
+
+    assert rows == [row]
+    assert thread.calls == 2
+    assert len(client.rpc_calls) == 2
+    assert all(name == "record_discovery_edges" for name, _params in client.rpc_calls)
 
 
 async def test_recover_processing_discoveries_requeues_interrupted_rows() -> None:
     client = FakeClient()
-    discoveries = client.table("discoveries")
-    discoveries.results["select"] = [{"id": "discovery-1"}, {"id": "discovery-2"}]
-    discoveries.results["update"] = [{"id": "discovery-1"}]
+    client.rpc_data = 2
     repository = make_repository(client)
 
     recovered = await repository.recover_processing_discoveries()
 
     assert recovered == 2
-    assert discoveries.queries[0].filters == [("status", "processing")]
-    updates = [call for call in discoveries.calls if call[0] == "update"]
-    assert len(updates) == 2
-    assert all(payload["status"] == "queued" for _operation, payload, _conflict in updates)
-    assert all(
-        payload["last_error"] == "interrupted_by_restart"
-        for _operation, payload, _conflict in updates
-    )
+    assert client.rpc_calls == [("recover_expired_crawl_claims", {"p_lease_seconds": 900})]
 
 
 async def test_latest_phase5_runs_filter_job_type_and_order_descending() -> None:

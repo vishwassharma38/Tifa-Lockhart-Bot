@@ -65,6 +65,58 @@ def test_parsed_robots_honour_disallow_and_crawl_delay() -> None:
     assert parser.crawl_delay(USER_AGENT) == 3
 
 
+def test_most_specific_allow_overrides_a_broader_disallow() -> None:
+    parser = parse_robots(
+        "User-agent: *\nDisallow: /\nAllow: /tifa\nDisallow: /tifa/private\n",
+        USER_AGENT,
+    )
+
+    assert parser.can_fetch(USER_AGENT, "https://example.com/tifa") is True
+    assert parser.can_fetch(USER_AGENT, "https://example.com/tifa/gallery") is True
+    assert parser.can_fetch(USER_AGENT, "https://example.com/tifa/private") is False
+    assert parser.can_fetch(USER_AGENT, "https://example.com/other") is False
+
+
+def test_allow_wins_an_equal_length_match() -> None:
+    parser = parse_robots(
+        "User-agent: *\nDisallow: /tifa\nAllow: /tifa\n",
+        USER_AGENT,
+    )
+
+    assert parser.can_fetch(USER_AGENT, "https://example.com/tifa") is True
+
+
+def test_robots_patterns_support_wildcards_end_anchors_and_queries() -> None:
+    parser = parse_robots(
+        "User-agent: *\nDisallow: /*.pdf$\nDisallow: /search?q=\n",
+        USER_AGENT,
+    )
+
+    assert parser.can_fetch(USER_AGENT, "https://example.com/art.pdf") is False
+    assert parser.can_fetch(USER_AGENT, "https://example.com/art.pdf?download=1") is True
+    assert parser.can_fetch(USER_AGENT, "https://example.com/search?q=tifa") is False
+
+
+def test_specific_user_agent_group_does_not_inherit_the_wildcard_rules() -> None:
+    text = (
+        "User-agent: *\n"
+        "Disallow: /blocked\n"
+        "\n"
+        "User-agent: TifaLockhartBot\n"
+        "Allow: /blocked\n"
+        "Disallow: /private\n"
+    )
+    decision = evaluate_robots_result(
+        make_result(status=200, category=OK, body=text.encode()),
+        user_agent=USER_AGENT,
+    )
+
+    assert decision.can_fetch(USER_AGENT, "https://example.com/blocked") is True
+    assert decision.can_fetch(USER_AGENT, "https://example.com/private") is False
+    assert decision.can_fetch("OtherBot/1.0", "https://example.com/blocked") is False
+    assert decision.can_fetch("OtherBot/1.0", "https://example.com/private") is True
+
+
 def test_robots_result_parses_a_successful_file() -> None:
     decision = evaluate_robots_result(
         make_result(
@@ -210,6 +262,41 @@ async def test_robots_cache_treats_fetch_failure_as_unavailable() -> None:
     assert decision.allow_all is False
     assert decision.pause_domain is True
     assert decision.reason == "robots_unavailable"
+
+
+async def test_robots_cache_persists_policy_across_cache_instances() -> None:
+    stored: dict[str, object] = {}
+    fetch_calls = 0
+
+    async def load(origin: str):
+        return stored.get(origin)  # type: ignore[return-value]
+
+    async def save(origin: str, hostname: str, registrable_domain: str, policy: dict[str, object]):
+        stored[origin] = {
+            **policy,
+            "hostname": hostname,
+            "registrable_domain": registrable_domain,
+        }
+
+    async def fetch(_url: str) -> FetchResult:
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return FetchResult(
+            "https://example.com/robots.txt",
+            "https://example.com/robots.txt",
+            200,
+            OK,
+            body=b"User-agent: *\nDisallow: /private\nSitemap: https://example.com/sitemap.xml\n",
+        )
+
+    first = RobotsCache(user_agent="TifaLockhartBot/1.0", load_policy=load, store_policy=save)
+    first_decision = await first.decision_for("https://www.example.com/page", fetch=fetch)
+    restarted = RobotsCache(user_agent="TifaLockhartBot/1.0", load_policy=load, store_policy=save)
+    second_decision = await restarted.decision_for("https://www.example.com/page", fetch=fetch)
+
+    assert fetch_calls == 1
+    assert not first_decision.can_fetch("TifaLockhartBot/1.0", "https://www.example.com/private")
+    assert second_decision.sitemap_urls == ("https://example.com/sitemap.xml",)
 
 
 def test_robots_fetch_size_is_bounded() -> None:

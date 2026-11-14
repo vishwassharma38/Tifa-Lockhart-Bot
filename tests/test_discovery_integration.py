@@ -210,7 +210,34 @@ class StatusRepository:
         return [{"outcome": "failed", "error_summary": "bing_access_restriction"}]
 
     async def latest_crawl_runs(self, _limit: int):
-        return [{"outcome": "partial", "error_summary": "rate_limited: 1"}]
+        return [
+            {
+                "outcome": "partial",
+                "error_summary": "rate_limited: 1",
+                "domains_visited_count": 4,
+                "new_domains_discovered_count": 3,
+                "external_links_admitted_count": 6,
+                "internal_links_admitted_count": 2,
+                "skipped_url_count": 5,
+                "resource_budget_limited": True,
+            }
+        ]
+
+    async def crawl_frontier_summary(self, *, max_depth=6):
+        return {
+            "domains_discovered": 20,
+            "domains_unexplored": 8,
+            "domains_explored": 12,
+            "domains_cooling_down": 2,
+            "queued_domains": 7,
+            "domains_visited_recently": 6,
+            "queued_urls": 30,
+            "due_urls": 21,
+            "delayed_urls": 9,
+            "processing_urls": 3,
+            "retry_backlog": 4,
+            "oldest_queued_seconds": 7200,
+        }
 
     async def latest_digest_runs(self, _limit: int):
         return [{"outcome": "succeeded", "error_summary": None}]
@@ -273,6 +300,17 @@ async def test_status_reports_bing_pause_runs_and_queue_state(make_settings) -> 
     assert "http_403_access_denied" in fields["Bing discovery"]
     assert fields["Latest Bing run"].startswith("failed")
     assert fields["Latest crawler run"].startswith("partial")
+    assert "domains visited: 4" in fields["Latest crawler run"]
+    assert "external/internal links: 6/2" in fields["Latest crawler run"]
+    assert "skipped links: 5" in fields["Latest crawler run"]
+    assert "budget limited: yes" in fields["Latest crawler run"]
+    assert "known: 20" in fields["Crawler domains"]
+    assert "queued URLs: 30" in fields["Crawler queue"]
+    assert "due: 21" in fields["Crawler queue"]
+    assert "delayed: 9" in fields["Crawler queue"]
+    assert "processing: 3" in fields["Crawler queue"]
+    assert "retry backlog: 4" in fields["Crawler queue"]
+    assert "oldest queued: 2.0h" in fields["Crawler queue"]
     assert fields["Queue / backlog"] == "12"
     assert fields["Dumpster"] == "4"
     assert fields["Last successful Bing discovery"] == "2026-01-02T00:00:00+00:00"
@@ -342,7 +380,10 @@ async def test_scheduler_registers_phase_five_jobs_with_required_intervals(
             "daily_digest",
         }
         assert jobs["bing_discovery"].trigger.interval.total_seconds() == 8 * 3600
-        assert jobs["crawl_processing"].trigger.interval.total_seconds() == 300
+        assert jobs["crawl_processing"].trigger.run_date == bot._crawler_cooldown_until
+        assert jobs["crawl_processing"].coalesce is True
+        assert jobs["crawl_processing"].max_instances == 1
+        assert jobs["crawl_processing"].misfire_grace_time is None
         assert "hour='4'" in str(jobs["daily_digest"].trigger)
         assert "minute='0'" in str(jobs["daily_digest"].trigger)
         assert jobs["daily_digest"].coalesce is True
@@ -432,6 +473,8 @@ def test_phase_five_crawler_defaults_are_locked_and_bounded() -> None:
     assert settings.crawl_connect_timeout_seconds == 10.0
     assert settings.crawl_read_timeout_seconds == 20.0
     assert settings.max_crawl_depth == 6
+    assert settings.crawl_domain_batch_limit == 2
+    assert settings.crawl_new_domain_share == 0.8
     assert settings.crawl_max_attempts == 3
     assert settings.bing_html_enabled is False
     assert settings.bing_html_access_approved is False
@@ -450,6 +493,8 @@ def test_phase_five_settings_are_independently_configurable() -> None:
             "MAX_URLS_PER_JOB": "100",
             "MAX_PAGES_PER_DOMAIN": "10",
             "CRAWL_BATCH_SIZE": "10",
+            "CRAWL_DOMAIN_BATCH_LIMIT": "3",
+            "CRAWL_NEW_DOMAIN_SHARE": "0.7",
         },
         load_env_file=False,
     )
@@ -461,6 +506,8 @@ def test_phase_five_settings_are_independently_configurable() -> None:
     assert settings.max_urls_per_job == 100
     assert settings.max_pages_per_domain == 10
     assert settings.crawl_batch_size == 10
+    assert settings.crawl_domain_batch_limit == 3
+    assert settings.crawl_new_domain_share == 0.7
 
 
 @pytest.mark.parametrize(
@@ -475,6 +522,9 @@ def test_phase_five_settings_are_independently_configurable() -> None:
         {"BING_SEARCH_BASE_URL": "https://user:pass@www.bing.com/search"},
         {"MAX_PAGE_BYTES": "5000001"},
         {"MAX_CRAWL_DEPTH": "7"},
+        {"CRAWL_DOMAIN_BATCH_LIMIT": "11"},
+        {"CRAWL_NEW_DOMAIN_SHARE": "0.4"},
+        {"CRAWL_NEW_DOMAIN_SHARE": "0.96"},
         {"MAX_URLS_PER_JOB": "301"},
         {"MAX_PAGES_PER_DOMAIN": "21"},
         {"MAX_CONCURRENT_REQUESTS": "6"},

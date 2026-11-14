@@ -277,6 +277,12 @@ class PhaseFourCommands(commands.Cog):
             state = await self.bot.repository.get_runtime_state()
             runs = await self.bot.repository.latest_reddit_runs(1)
             counts = await self.bot.repository.operational_counts()
+            frontier_service = getattr(self.bot.repository, "crawl_frontier_summary", None)
+            frontier = (
+                await frontier_service(max_depth=self.bot.settings.max_crawl_depth)
+                if callable(frontier_service)
+                else {}
+            )
             latest = runs[0] if runs else None
             effective = bool(state.get("collection_enabled")) and blocked is None
             embed.set_field_at(
@@ -328,6 +334,19 @@ class PhaseFourCommands(commands.Cog):
                     return "No runs"
                 return f"{row.get('outcome')}: {row.get('error_summary') or 'no errors'}"
 
+            def crawl_run_summary(row: dict[str, object] | None) -> str:
+                if not row:
+                    return "No runs"
+                return (
+                    f"{row.get('outcome')}; domains visited: {row.get('domains_visited_count', 0)}; "
+                    f"new domains: {row.get('new_domains_discovered_count', 0)}; "
+                    f"external/internal links: {row.get('external_links_admitted_count', 0)}/"
+                    f"{row.get('internal_links_admitted_count', 0)}; "
+                    f"skipped links: {row.get('skipped_url_count', 0)}; "
+                    f"budget limited: {'yes' if row.get('resource_budget_limited') else 'no'}; "
+                    f"errors: {row.get('error_summary') or 'none'}"
+                )
+
             embed.add_field(
                 name="Bing discovery",
                 value=(
@@ -350,7 +369,7 @@ class PhaseFourCommands(commands.Cog):
             )
             embed.add_field(
                 name="Latest crawler run",
-                value=run_summary(crawl_latest),
+                value=crawl_run_summary(crawl_latest),
                 inline=False,
             )
             embed.add_field(
@@ -393,6 +412,32 @@ class PhaseFourCommands(commands.Cog):
             )
             embed.add_field(name="Queue / backlog", value=str(counts["queued"]), inline=True)
             embed.add_field(name="Dumpster", value=str(counts["dumpster"]), inline=True)
+            if frontier:
+                embed.add_field(
+                    name="Crawler domains",
+                    value=(
+                        f"known: {frontier.get('domains_discovered', 0)}; "
+                        f"explored: {frontier.get('domains_explored', 0)}; "
+                        f"unexplored: {frontier.get('domains_unexplored', 0)}; "
+                        f"queued: {frontier.get('queued_domains', 0)}; "
+                        f"cooling: {frontier.get('domains_cooling_down', 0)}; "
+                        f"visited in 7d: {frontier.get('domains_visited_recently', 0)}"
+                    ),
+                    inline=False,
+                )
+                oldest_hours = int(frontier.get("oldest_queued_seconds", 0) or 0) / 3600
+                embed.add_field(
+                    name="Crawler queue",
+                    value=(
+                        f"queued URLs: {frontier.get('queued_urls', 0)}; "
+                        f"due: {frontier.get('due_urls', 0)}; "
+                        f"delayed: {frontier.get('delayed_urls', 0)}; "
+                        f"processing: {frontier.get('processing_urls', 0)}; "
+                        f"retry backlog: {frontier.get('retry_backlog', 0)}; "
+                        f"oldest queued: {oldest_hours:.1f}h"
+                    ),
+                    inline=False,
+                )
         except Exception as exc:
             log.warning("Extended status unavailable (%s)", type(exc).__name__)
         await interaction.followup.send(embed=embed, ephemeral=True)

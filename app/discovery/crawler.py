@@ -9,7 +9,7 @@ import random
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
@@ -17,8 +17,11 @@ from urllib.parse import urlsplit
 from app.config import Settings
 from app.discovery.challenges import detect_challenge
 from app.discovery.classifier import DUMPSTER, VERIFIED, Classification, classify_page
+from app.discovery.domains import domain_identity
 from app.discovery.extractor import (
+    ExtractedLink,
     ExtractedPage,
+    extract_http_link_header,
     extract_page,
     is_direct_media_url,
 )
@@ -35,18 +38,28 @@ from app.discovery.http import (
     OVERSIZE,
     RATE_LIMITED,
     ROBOTS_CONTENT_TYPES,
+    ROBOTS_DISALLOWED,
     SERVER_ERROR,
     TIMEOUT,
     TOO_MANY_REDIRECTS,
     UNSUPPORTED_CONTENT_TYPE,
     DomainThrottle,
     FetchResult,
+    RedirectPolicyResult,
     RequestBudget,
     SafeHttpClient,
     retry_delay_seconds,
 )
+from app.discovery.links import score_link
 from app.discovery.models import WebCandidate
 from app.discovery.robots import RobotsCache, RobotsDecision, robots_fetch_max_bytes
+from app.discovery.sitemaps import (
+    MAX_SITEMAP_BYTES,
+    MAX_SITEMAP_FILES_PER_DOMAIN,
+    MAX_SITEMAP_URLS_PER_DOMAIN,
+    SitemapError,
+    parse_sitemap,
+)
 from app.discovery.url_safety import (
     UrlSafetyError,
     normalize_url,
@@ -77,10 +90,25 @@ class PageInspection:
     extracted: ExtractedPage | None = None
     retry_after_seconds: float | None = None
     attempts: int = 0
+    response_headers: dict[str, str] = field(default_factory=dict)
+    retryable: bool = True
 
     @property
     def ok(self) -> bool:
         return self.category == OK and self.extracted is not None
+
+
+class DiscoveryEdgeWriteError(RuntimeError):
+    """A required discovery relationship could not be confirmed as persisted."""
+
+    def __init__(self, parent_discovery_id: str, persisted_count: int, failed_count: int) -> None:
+        self.parent_discovery_id = parent_discovery_id
+        self.persisted_count = persisted_count
+        self.failed_count = failed_count
+        super().__init__(
+            f"Discovery edge persistence incomplete for parent={parent_discovery_id}: "
+            f"{persisted_count} confirmed, {failed_count} unconfirmed"
+        )
 
 
 def _metadata(row: dict[str, Any]) -> dict[str, Any]:
@@ -124,7 +152,8 @@ class PageInspector:
         throttle: DomainThrottle,
         robots: RobotsCache,
     ) -> PageInspection:
-        host = (urlsplit(url).hostname or "").lower()
+        identity = domain_identity(url)
+        host = identity.hostname
 
         async def fetch_robots(robots_url: str) -> FetchResult:
             return await self._client.fetch(
@@ -138,7 +167,7 @@ class PageInspector:
             )
 
         decision = await robots.decision_for(url, fetch=fetch_robots)
-        self._apply_robots_pause(budget, host, decision)
+        self._apply_robots_pause(budget, host, identity.origin, decision)
         if not decision.allow_all and decision.parser is not None:
             if not decision.can_fetch(CRAWLER_USER_AGENT, url):
                 return PageInspection(
@@ -147,6 +176,7 @@ class PageInspector:
                     status=None,
                     category="robots_disallowed",
                     reason="robots_disallowed",
+                    retry_after_seconds=decision.retry_after_seconds,
                 )
         elif not decision.allow_all:
             return PageInspection(
@@ -155,6 +185,30 @@ class PageInspector:
                 status=None,
                 category="robots_disallowed",
                 reason=decision.reason,
+                retry_after_seconds=decision.retry_after_seconds,
+            )
+
+        async def check_redirect_policy(redirect_url: str) -> RedirectPolicyResult:
+            redirect_identity = domain_identity(redirect_url)
+            redirect_decision = await robots.decision_for(redirect_url, fetch=fetch_robots)
+            self._apply_robots_pause(
+                budget,
+                redirect_identity.hostname,
+                redirect_identity.origin,
+                redirect_decision,
+            )
+            if redirect_decision.allow_all:
+                return RedirectPolicyResult(True, crawl_delay=redirect_decision.crawl_delay)
+            if redirect_decision.parser is not None and redirect_decision.can_fetch(
+                CRAWLER_USER_AGENT, redirect_url
+            ):
+                return RedirectPolicyResult(True, crawl_delay=redirect_decision.crawl_delay)
+            if redirect_decision.reason == "robots_parsed":
+                return RedirectPolicyResult(False, reason="robots_disallowed")
+            return RedirectPolicyResult(
+                False,
+                reason=redirect_decision.reason,
+                retry_after_seconds=redirect_decision.retry_after_seconds,
             )
 
         result = await self._fetch_with_retries(
@@ -162,13 +216,15 @@ class PageInspector:
             budget=budget,
             throttle=throttle,
             crawl_delay=decision.crawl_delay,
+            redirect_policy=check_redirect_policy,
         )
-        return self._interpret(result, url, budget, host)
+        return self._interpret(result, url, budget, host, identity.registrable_domain)
 
     def _apply_robots_pause(
         self,
         budget: RequestBudget,
         host: str,
+        origin: str,
         decision: RobotsDecision,
     ) -> None:
         if not decision.pause_domain:
@@ -178,7 +234,7 @@ class PageInspector:
             until = self._now().astimezone(UTC) + timedelta(
                 seconds=max(0.0, decision.retry_after_seconds)
             )
-        budget.pause(host, decision.reason, until=until)
+        budget.pause(host, decision.reason, until=until, origin=origin)
 
     async def _fetch_with_retries(
         self,
@@ -187,6 +243,7 @@ class PageInspector:
         budget: RequestBudget,
         throttle: DomainThrottle,
         crawl_delay: float | None,
+        redirect_policy: Callable[[str], Awaitable[RedirectPolicyResult]],
     ) -> FetchResult:
         result = FetchResult(url, None, None, NETWORK_ERROR, error="not_attempted")
         for attempt in range(1, self._settings.crawl_max_attempts + 1):
@@ -198,10 +255,13 @@ class PageInspector:
                 allowed_content_types=HTML_CONTENT_TYPES,
                 max_bytes=self._settings.max_page_bytes,
                 crawl_delay=crawl_delay,
+                redirect_policy=redirect_policy,
             )
             if result.category not in _TRANSIENT_CATEGORIES:
                 return replace(result, attempts=attempt)
             if attempt >= self._settings.crawl_max_attempts:
+                return replace(result, attempts=attempt)
+            if result.retry_after_seconds is not None:
                 return replace(result, attempts=attempt)
             delay = retry_delay_seconds(attempt, jitter=self._jitter)
             log.info(
@@ -219,11 +279,22 @@ class PageInspector:
         url: str,
         budget: RequestBudget,
         host: str,
+        registrable_domain: str,
     ) -> PageInspection:
         if result.category == DOMAIN_PAUSED:
             return PageInspection(url, result.final_url, None, "domain_paused", result.error)
         if result.category == DOMAIN_BUDGET:
             return PageInspection(url, result.final_url, None, "domain_budget", result.error)
+        if result.category == ROBOTS_DISALLOWED:
+            return PageInspection(
+                url,
+                result.final_url,
+                None,
+                "robots_disallowed",
+                result.error or "robots_disallowed",
+                retry_after_seconds=result.retry_after_seconds,
+                attempts=result.attempts,
+            )
         if result.category == BLOCKED:
             reason = result.error or "blocked"
             if result.status in {401, 403} or reason.startswith(("http_401", "http_403")):
@@ -241,7 +312,13 @@ class PageInspector:
             until = None
             if delay is not None:
                 until = self._now().astimezone(UTC) + timedelta(seconds=max(0.0, delay))
-            budget.pause(host, "http_429_rate_limited", until=until)
+            budget.pause(
+                host,
+                "http_429_rate_limited",
+                until=until,
+                registrable_domain=registrable_domain,
+                site_wide=True,
+            )
             return PageInspection(
                 url,
                 result.final_url,
@@ -258,6 +335,7 @@ class PageInspector:
                 result.status,
                 "failed",
                 result.error or result.category,
+                retry_after_seconds=result.retry_after_seconds,
                 attempts=result.attempts,
             )
         if result.category in _PERMANENT_HTTP_CATEGORIES:
@@ -268,6 +346,7 @@ class PageInspector:
                 "failed",
                 result.error or result.category,
                 attempts=1,
+                retryable=False,
             )
         if result.category == OVERSIZE:
             return PageInspection(
@@ -295,6 +374,7 @@ class PageInspector:
                 "failed",
                 result.error or result.category,
                 attempts=1,
+                retryable=False,
             )
 
         html = result.body.decode("utf-8", errors="replace")
@@ -309,7 +389,7 @@ class PageInspector:
             )
         challenge = detect_challenge(html)
         if challenge:
-            budget.pause(host, challenge)
+            budget.pause(host, challenge, origin=domain_identity(url).origin)
             return PageInspection(
                 url,
                 result.final_url,
@@ -339,6 +419,7 @@ class PageInspector:
             None,
             extracted,
             attempts=result.attempts,
+            response_headers=result.headers,
         )
 
 
@@ -356,6 +437,14 @@ class _UrlAdmission:
             return False
         self.admitted += 1
         return True
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingChild:
+    payload: dict[str, Any]
+    edge: dict[str, Any]
+    external: bool
+    domain_site: str
 
 
 class DiscoveryCrawler:
@@ -401,8 +490,8 @@ class DiscoveryCrawler:
         if self._owns_client:
             await self._client.close()
 
-    async def run_once(self, *, scheduled: bool = True) -> dict[str, int]:
-        counters = {
+    async def run_once(self, *, scheduled: bool = True) -> dict[str, Any]:
+        counters: dict[str, Any] = {
             key: 0
             for key in (
                 "discovered_count",
@@ -412,6 +501,12 @@ class DiscoveryCrawler:
                 "stored_count",
                 "skipped_count",
                 "failed_count",
+                "domains_visited_count",
+                "new_domains_discovered_count",
+                "external_links_admitted_count",
+                "internal_links_admitted_count",
+                "skipped_url_count",
+                "resource_budget_limited",
             )
         }
         if self._lock.locked():
@@ -425,6 +520,7 @@ class DiscoveryCrawler:
                     "max_urls": self._settings.max_urls_per_job,
                     "max_pages_per_domain": self._settings.max_pages_per_domain,
                     "max_depth": self._settings.max_crawl_depth,
+                    "domain_batch_limit": self._settings.crawl_domain_batch_limit,
                 },
                 job_type="crawl",
             )
@@ -434,22 +530,91 @@ class DiscoveryCrawler:
                 sleep=self._sleep,
                 clock=self._clock,
             )
-            robots = RobotsCache(user_agent=CRAWLER_USER_AGENT)
+            load_robots = getattr(self._repository, "get_robots_policy", None)
+            store_robots = getattr(self._repository, "store_robots_policy", None)
+            robots = RobotsCache(
+                user_agent=CRAWLER_USER_AGENT,
+                load_policy=load_robots if callable(load_robots) else None,
+                store_policy=store_robots if callable(store_robots) else None,
+                now=self._now,
+            )
             admission = _UrlAdmission(self._settings.max_urls_per_job)
             seen_edges: set[tuple[str, str]] = set()
+            visited_domains: set[str] = set()
+            linked_external_domains: set[str] = set()
+            sitemap_scan_domains: set[str] = set()
             errors: Counter[str] = Counter()
             paused_for_collection = False
+            metrics_snapshot = getattr(self._repository, "metrics_snapshot", None)
+            metrics_baseline: dict[str, int] = {}
+            if callable(metrics_snapshot):
+                try:
+                    metrics_baseline = metrics_snapshot()
+                except Exception as exc:
+                    log.debug("Repository metrics baseline unavailable (%s)", type(exc).__name__)
+            begin_metrics_scope = getattr(self._repository, "begin_metrics_scope", None)
+            end_metrics_scope = getattr(self._repository, "end_metrics_scope", None)
+            scoped_metrics_snapshot = getattr(self._repository, "scoped_metrics_snapshot", None)
+            metrics_scope_token = (
+                begin_metrics_scope()
+                if callable(begin_metrics_scope)
+                and callable(end_metrics_scope)
+                and callable(scoped_metrics_snapshot)
+                else None
+            )
+            edge_write_stats = {"persisted_count": 0, "failed_count": 0}
+
+            def job_stats_json() -> dict[str, Any]:
+                stats: dict[str, Any] = {
+                    "error_breakdown": dict(sorted(errors.items())),
+                    "visited_domains": sorted(visited_domains)[:50],
+                    "new_domains": sorted(linked_external_domains)[:50],
+                    "sitemap_scanned_domains": len(sitemap_scan_domains),
+                    "discovery_edges": dict(edge_write_stats),
+                }
+                try:
+                    if metrics_scope_token is not None:
+                        stats["repository_metrics"] = scoped_metrics_snapshot()
+                    elif callable(metrics_snapshot):
+                        current_metrics = metrics_snapshot()
+                        metric_names = set(metrics_baseline) | set(current_metrics)
+                        stats["repository_metrics"] = {
+                            name: max(
+                                0, current_metrics.get(name, 0) - metrics_baseline.get(name, 0)
+                            )
+                            for name in sorted(metric_names)
+                            if current_metrics.get(name, 0) > metrics_baseline.get(name, 0)
+                        }
+                except Exception as exc:
+                    log.debug("Repository metrics snapshot unavailable (%s)", type(exc).__name__)
+                return stats
+
             try:
+                recover_processing = getattr(
+                    self._repository, "recover_processing_discoveries", None
+                )
+                if callable(recover_processing):
+                    try:
+                        recovered = await recover_processing()
+                        if recovered:
+                            log.info("Recovered %s expired crawl claim(s)", recovered)
+                    except Exception:
+                        errors["processing_claim_recovery_failed"] += 1
+                        log.exception("Expired crawl claim recovery failed")
                 claimed = await self._repository.claim_discoveries(
                     limit=self._settings.crawl_batch_size,
                     max_depth=self._settings.max_crawl_depth,
+                    per_domain_limit=self._settings.crawl_domain_batch_limit,
+                    new_domain_share=self._settings.crawl_new_domain_share,
                 )
                 for row in claimed:
                     if scheduled and not paused_for_collection:
                         if not await self._automation_enabled():
                             paused_for_collection = True
                     if paused_for_collection:
-                        await self._safe_requeue(row, "collection_paused")
+                        if not await self._safe_requeue(row, "collection_paused"):
+                            counters["failed_count"] += 1
+                            errors["discovery_requeue_failed"] += 1
                         counters["skipped_count"] += 1
                         continue
                     try:
@@ -460,6 +625,8 @@ class DiscoveryCrawler:
                             robots=robots,
                             admission=admission,
                             seen_edges=seen_edges,
+                            sitemap_scan_domains=sitemap_scan_domains,
+                            edge_write_stats=edge_write_stats,
                             scheduled=scheduled,
                         )
                     except asyncio.CancelledError:
@@ -467,13 +634,29 @@ class DiscoveryCrawler:
                         raise
                     except Exception as exc:
                         counters["failed_count"] += 1
-                        errors[f"discovery_processing_failed:{type(exc).__name__}"] += 1
-                        log.warning(
-                            "Discovery processing failed discovery_id=%s (%s)",
-                            row.get("id"),
-                            type(exc).__name__,
-                        )
-                        await self._safe_fail(row, f"processing_failed:{type(exc).__name__}")
+                        if isinstance(exc, DiscoveryEdgeWriteError):
+                            errors["discovery_edge_persistence_failed"] += exc.failed_count
+                            log.error(
+                                "Required discovery edges were not confirmed discovery_id=%s "
+                                "parent_id=%s persisted=%s failed=%s cause=%s",
+                                row.get("id"),
+                                exc.parent_discovery_id,
+                                exc.persisted_count,
+                                exc.failed_count,
+                                str(exc.__cause__)[:300] if exc.__cause__ else "unknown",
+                            )
+                            if not await self._safe_requeue(
+                                row, "discovery_edge_persistence_failed"
+                            ):
+                                errors["discovery_requeue_failed"] += 1
+                        else:
+                            errors[f"discovery_processing_failed:{type(exc).__name__}"] += 1
+                            log.warning(
+                                "Discovery processing failed discovery_id=%s (%s)",
+                                row.get("id"),
+                                type(exc).__name__,
+                            )
+                            await self._safe_fail(row, f"processing_failed:{type(exc).__name__}")
                         continue
                     counters["discovered_count"] += outcome.get("discovered", 0)
                     counters["examined_count"] += outcome.get("examined", 0)
@@ -482,6 +665,26 @@ class DiscoveryCrawler:
                     counters["stored_count"] += outcome.get("stored", 0)
                     counters["skipped_count"] += outcome.get("skipped", 0)
                     counters["failed_count"] += outcome.get("failed", 0)
+                    for key in (
+                        "external_links_admitted_count",
+                        "internal_links_admitted_count",
+                        "skipped_url_count",
+                    ):
+                        counters[key] += int(outcome.get(key, 0) or 0)
+                    linked_external_domains.update(
+                        value
+                        for value in outcome.get("new_domain_sites", ())
+                        if isinstance(value, str)
+                    )
+                    counters["new_domains_discovered_count"] = len(linked_external_domains)
+                    domain_visited = outcome.get("visited_domain")
+                    if isinstance(domain_visited, str) and domain_visited not in visited_domains:
+                        visited_domains.add(domain_visited)
+                        counters["domains_visited_count"] = len(visited_domains)
+                    counters["resource_budget_limited"] = bool(
+                        counters["resource_budget_limited"]
+                        or outcome.get("resource_budget_limited")
+                    )
                     for category, count in outcome.get("errors", {}).items():
                         errors[category] += count
 
@@ -498,16 +701,21 @@ class DiscoveryCrawler:
                     ]
                     or None
                 )
+                counters["stats_json"] = job_stats_json()
                 await self._repository.finish_job_run(job_id, counters, outcome, error_summary)
             except Exception as exc:
                 counters["failed_count"] += 1
+                counters["stats_json"] = job_stats_json()
                 await self._repository.finish_job_run(
                     job_id,
                     counters,
                     "failed",
-                    f"crawl_job_failed:{type(exc).__name__}",
+                    f"crawl_job_failed:{type(exc).__name__}:{str(exc)[:300]}",
                 )
                 log.exception("Crawl job failed")
+            finally:
+                if metrics_scope_token is not None:
+                    end_metrics_scope(metrics_scope_token)
             return counters
 
     async def _automation_enabled(self) -> bool:
@@ -523,6 +731,8 @@ class DiscoveryCrawler:
         robots: RobotsCache,
         admission: _UrlAdmission,
         seen_edges: set[tuple[str, str]],
+        sitemap_scan_domains: set[str],
+        edge_write_stats: dict[str, int],
         scheduled: bool,
     ) -> dict[str, Any]:
         discovery_id = str(row.get("id") or "")
@@ -541,25 +751,49 @@ class DiscoveryCrawler:
             )
             return {"failed": 1, "errors": {"depth_exceeds_limit": 1}}
 
-        host = (urlsplit(url).hostname or "").lower()
-        pause_reason = budget.pause_reason(host)
+        identity = domain_identity(url)
+        host = identity.hostname
+        pause_reason = budget.pause_reason(
+            host,
+            registrable_domain=identity.registrable_domain,
+            origin=identity.origin,
+        )
         if pause_reason:
-            await self._requeue_from_pause(discovery_id, budget, host, pause_reason)
+            requeued = await self._requeue_from_pause(row, budget, host, pause_reason)
+            if not requeued:
+                return {"failed": 1, "errors": {"discovery_requeue_failed": 1}}
             return {"skipped": 1}
 
+        inspection_started = time.monotonic()
         inspection = await self._inspector.inspect(
             url, budget=budget, throttle=throttle, robots=robots
         )
+        inspection_latency_ms = round(max(0.0, time.monotonic() - inspection_started) * 1000, 2)
+        visited_domain = identity.registrable_domain if inspection.status is not None else None
+
+        def with_visit(result: dict[str, Any]) -> dict[str, Any]:
+            if visited_domain is not None:
+                result["visited_domain"] = visited_domain
+            return result
+
         if inspection.category in {DOMAIN_PAUSED, DOMAIN_BUDGET}:
-            await self._requeue_from_pause(
-                discovery_id,
+            requeued = await self._requeue_from_pause(
+                row,
                 budget,
                 host,
                 inspection.reason or inspection.category,
             )
-            return {"skipped": 1}
+            result = {
+                "skipped": 1,
+                "resource_budget_limited": inspection.category == DOMAIN_BUDGET,
+            }
+            if not requeued:
+                result["failed"] = 1
+                result["errors"] = {"discovery_requeue_failed": 1}
+            return result
 
         metadata = _metadata(row)
+        metadata["inspection_latency_ms"] = inspection_latency_ms
         metadata["fetch_category"] = inspection.category
         if inspection.final_url:
             metadata["final_url"] = inspection.final_url
@@ -568,16 +802,32 @@ class DiscoveryCrawler:
         fetched_at = _now_iso(self._now)
 
         if inspection.category == "robots_disallowed":
+            reason = inspection.reason or "robots_disallowed"
+            temporary_policy_failure = reason.startswith(
+                ("robots_unavailable", "robots_unreadable", "robots_rate_limited")
+            )
+            retry_count = int(row.get("retry_count") or 0)
+            can_retry = temporary_policy_failure and (
+                retry_count + 1 < self._settings.crawl_max_attempts
+            )
+            delay = inspection.retry_after_seconds or 300.0
+            next_attempt = _retry_at(self._now, delay) if can_retry else None
             await self._repository.update_discovery(
                 discovery_id,
                 {
-                    "status": "blocked",
-                    "last_error": inspection.reason or "robots_disallowed",
+                    "status": "queued" if can_retry else "blocked",
+                    "retry_count": retry_count + 1 if temporary_policy_failure else retry_count,
+                    "last_error": reason,
                     "metadata_json": metadata,
-                    "next_attempt_at": None,
+                    "next_attempt_at": next_attempt,
                 },
             )
-            return {"failed": 1, "errors": {"robots_disallowed": 1}}
+            return with_visit(
+                {
+                    "failed": 1,
+                    "errors": {"robots_temporary_failure" if can_retry else "robots_disallowed": 1},
+                }
+            )
 
         if inspection.category in {"blocked", "challenge"}:
             metadata["fetched_at"] = fetched_at
@@ -592,29 +842,46 @@ class DiscoveryCrawler:
                     "next_attempt_at": None,
                 },
             )
-            return {"failed": 1, "errors": {inspection.category: 1}}
+            return with_visit({"failed": 1, "errors": {inspection.category: 1}})
 
         if inspection.category == "rate_limited":
+            retry_count = int(row.get("retry_count") or 0)
             delay = inspection.retry_after_seconds
             if delay is None:
                 delay = 300.0
+            retry_exhausted = retry_count + 1 >= self._settings.crawl_max_attempts
             next_attempt = _retry_at(self._now, delay)
             if not budget.pause_reason(host):
-                budget.pause(host, "http_429_rate_limited")
+                budget.pause(
+                    host,
+                    "http_429_rate_limited",
+                    registrable_domain=identity.registrable_domain,
+                    site_wide=True,
+                )
+            pause_domain = getattr(self._repository, "pause_crawl_domain", None)
+            if callable(pause_domain):
+                try:
+                    await pause_domain(
+                        identity.registrable_domain,
+                        until=next_attempt,
+                        reason="http_429_rate_limited",
+                    )
+                except Exception as exc:
+                    log.warning("Domain cooldown persistence failed (%s)", type(exc).__name__)
             metadata["retry_not_before"] = next_attempt
             await self._repository.update_discovery(
                 discovery_id,
                 {
-                    "status": "queued",
+                    "status": "failed" if retry_exhausted else "queued",
                     "http_status": inspection.status,
-                    "retry_count": int(row.get("retry_count") or 0) + 1,
+                    "retry_count": retry_count + 1,
                     "last_error": "http_429_rate_limited",
                     "metadata_json": metadata,
                     "fetched_at": fetched_at,
-                    "next_attempt_at": next_attempt,
+                    "next_attempt_at": None if retry_exhausted else next_attempt,
                 },
             )
-            return {"failed": 1, "errors": {"rate_limited": 1}}
+            return with_visit({"failed": 1, "errors": {"rate_limited": 1}})
 
         if inspection.category == "oversize":
             metadata["fetched_at"] = fetched_at
@@ -629,7 +896,7 @@ class DiscoveryCrawler:
                     "next_attempt_at": None,
                 },
             )
-            return {"failed": 1, "errors": {"oversize": 1}}
+            return with_visit({"failed": 1, "errors": {"oversize": 1}})
 
         if inspection.category == "rejected":
             metadata["fetched_at"] = fetched_at
@@ -644,7 +911,7 @@ class DiscoveryCrawler:
                     "next_attempt_at": None,
                 },
             )
-            return {"skipped": 1}
+            return with_visit({"skipped": 1})
 
         if inspection.category == "extraction_failed":
             metadata["fetched_at"] = fetched_at
@@ -660,27 +927,62 @@ class DiscoveryCrawler:
                     "next_attempt_at": None,
                 },
             )
-            return {"processed": 1, "skipped": 1}
+            return with_visit({"processed": 1, "skipped": 1})
 
         if not inspection.ok:
             metadata["fetched_at"] = fetched_at
+            retry_count = int(row.get("retry_count") or 0)
+            attempts_used = max(1, inspection.attempts)
+            cumulative_attempts = retry_count + attempts_used
+            can_retry = (
+                inspection.retryable and cumulative_attempts < self._settings.crawl_max_attempts
+            )
+            retry_at = _retry_at(
+                self._now,
+                retry_delay_seconds(
+                    retry_count + 1,
+                    retry_after=inspection.retry_after_seconds,
+                    jitter=self._jitter,
+                ),
+            )
+            if can_retry and inspection.retry_after_seconds is not None:
+                pause_domain = getattr(self._repository, "pause_crawl_domain", None)
+                if callable(pause_domain):
+                    try:
+                        await pause_domain(
+                            identity.registrable_domain,
+                            until=retry_at,
+                            reason="server_retry_after",
+                        )
+                    except Exception as exc:
+                        log.warning("Domain cooldown persistence failed (%s)", type(exc).__name__)
             await self._repository.update_discovery(
                 discovery_id,
                 {
-                    "status": "failed",
+                    "status": "queued" if can_retry else "failed",
                     "http_status": inspection.status,
-                    "retry_count": int(row.get("retry_count") or 0) + max(1, inspection.attempts),
+                    "retry_count": min(self._settings.crawl_max_attempts, cumulative_attempts),
                     "last_error": inspection.reason or inspection.category,
                     "metadata_json": metadata,
                     "fetched_at": fetched_at,
-                    "next_attempt_at": None,
+                    "next_attempt_at": retry_at if can_retry else None,
                 },
             )
-            return {"failed": 1, "errors": {inspection.category: 1}}
+            return with_visit({"failed": 1, "errors": {inspection.category: 1}})
 
         page = inspection.extracted
         if page is None:
             return {"failed": 1, "errors": {"missing_extraction": 1}}
+        header_links = extract_http_link_header(
+            inspection.response_headers.get("Link"), page.final_url
+        )
+        if header_links:
+            merged_links: dict[str, ExtractedLink] = {link.url: link for link in page.links}
+            for link in header_links:
+                current = merged_links.get(link.url)
+                if current is None or link.quality_score > current.quality_score:
+                    merged_links[link.url] = link
+            page = replace(page, links=tuple(merged_links.values()))
         metadata["fetched_at"] = fetched_at
         metadata["page"] = page.to_metadata()
         classification = classify_page(
@@ -695,9 +997,23 @@ class DiscoveryCrawler:
             source_type=row.get("source_type"),
         )
         metadata["classification"] = classification.to_metadata()
+        sitemap_links = await self._discover_sitemap_links(
+            page.final_url,
+            budget=budget,
+            throttle=throttle,
+            robots=robots,
+            scanned_domains=sitemap_scan_domains,
+        )
+        if sitemap_links:
+            page = replace(page, links=page.links + sitemap_links)
+            metadata["page"] = page.to_metadata()
         status = classification.status
 
-        outcome: dict[str, Any] = {"examined": 1, "processed": 1}
+        outcome: dict[str, Any] = {
+            "examined": 1,
+            "processed": 1,
+            "visited_domain": visited_domain,
+        }
         if status == VERIFIED and not page.original_media:
             review_reason = (
                 "preview_only_original_unavailable" if page.media else "original_media_not_found"
@@ -723,7 +1039,9 @@ class DiscoveryCrawler:
         }
         if status == VERIFIED:
             update["verified_at"] = fetched_at
-        await self._repository.update_discovery(discovery_id, update)
+        # Keep the claim in processing while the required relationship writes
+        # are in flight; a failure must not leave a terminal classification.
+        await self._repository.update_discovery(discovery_id, {"metadata_json": metadata})
 
         if status == VERIFIED:
             acquisition = await self._acquire_original_media(row, page, metadata)
@@ -736,17 +1054,166 @@ class DiscoveryCrawler:
             for category, count in acquisition["errors"].items():
                 outcome.setdefault("errors", {})[category] = count
 
-        if classification.allows_child_crawl:
-            admitted = await self._admit_children(
-                row,
-                page,
-                depth=depth,
-                admission=admission,
-                seen_edges=seen_edges,
-                scheduled=scheduled,
-            )
-            outcome["discovered"] = admitted
+        expansion = await self._admit_children(
+            row,
+            page,
+            classification=classification,
+            depth=depth,
+            admission=admission,
+            seen_edges=seen_edges,
+            edge_write_stats=edge_write_stats,
+            scheduled=scheduled,
+        )
+        outcome["discovered"] = expansion["admitted"]
+        outcome["duplicate"] = outcome.get("duplicate", 0) + expansion["duplicates"]
+        outcome["external_links_admitted_count"] = expansion["external"]
+        outcome["internal_links_admitted_count"] = expansion["internal"]
+        outcome["new_domain_sites"] = expansion["new_domain_sites"]
+        outcome["skipped_url_count"] = expansion["skipped"]
+        outcome["resource_budget_limited"] = expansion["budget_limited"]
+        # Release the claim and apply the final classification only after every
+        # required child edge has been confirmed by the batch writer.
+        await self._repository.update_discovery(discovery_id, update)
         return outcome
+
+    async def _discover_sitemap_links(
+        self,
+        page_url: str,
+        *,
+        budget: RequestBudget,
+        throttle: DomainThrottle,
+        robots: RobotsCache,
+        scanned_domains: set[str],
+    ) -> tuple[ExtractedLink, ...]:
+        identity = domain_identity(page_url)
+        site = identity.registrable_domain
+        if site in scanned_domains:
+            return ()
+        scanned_domains.add(site)
+
+        due_check = getattr(self._repository, "sitemap_scan_is_due", None)
+        if callable(due_check):
+            try:
+                if not await due_check(site, max_age_days=30):
+                    return ()
+            except Exception as exc:
+                log.warning("Sitemap schedule lookup failed (%s)", type(exc).__name__)
+                return ()
+
+        async def fetch_robots(robots_url: str) -> FetchResult:
+            return await self._client.fetch(
+                robots_url,
+                budget=budget,
+                throttle=throttle,
+                accept=ROBOTS_ACCEPT,
+                allowed_content_types=ROBOTS_CONTENT_TYPES,
+                max_bytes=robots_fetch_max_bytes(self._settings),
+                allow_missing_content_type=True,
+            )
+
+        try:
+            page_policy = robots.decision_for_url(page_url)
+            if page_policy is None:
+                return ()
+        except Exception as exc:
+            log.info(
+                "Sitemap skipped because robots policy was unavailable (%s)", type(exc).__name__
+            )
+            return ()
+        if not page_policy.allow_all and page_policy.parser is None:
+            return ()
+
+        sitemap_queue = list(page_policy.sitemap_urls)
+        if not sitemap_queue:
+            sitemap_queue.append(f"{identity.origin}/sitemap.xml")
+        page_urls: list[str] = []
+        visited_sitemaps: set[str] = set()
+        scan_resolved = False
+
+        while sitemap_queue and len(visited_sitemaps) < MAX_SITEMAP_FILES_PER_DOMAIN:
+            raw_sitemap_url = sitemap_queue.pop(0)
+            try:
+                sitemap_identity = domain_identity(raw_sitemap_url)
+            except UrlSafetyError:
+                continue
+            if sitemap_identity.registrable_domain != site:
+                continue
+            sitemap_url = normalize_url(raw_sitemap_url).normalized
+            if sitemap_url in visited_sitemaps:
+                continue
+            visited_sitemaps.add(sitemap_url)
+
+            policy = robots.decision_for_url(sitemap_url)
+            if policy is None:
+                try:
+                    policy = await robots.decision_for(sitemap_url, fetch=fetch_robots)
+                except Exception:
+                    continue
+            if not policy.allow_all and (
+                policy.parser is None or not policy.can_fetch(CRAWLER_USER_AGENT, sitemap_url)
+            ):
+                continue
+
+            result = await self._client.fetch(
+                sitemap_url,
+                budget=budget,
+                throttle=throttle,
+                accept="application/xml,text/xml,application/gzip,application/octet-stream,*/*;q=0.1",
+                allowed_content_types=None,
+                max_bytes=MAX_SITEMAP_BYTES,
+            )
+            if result.status is not None and result.status < 500 and result.status != 429:
+                scan_resolved = True
+            if result.category != OK or not result.body:
+                continue
+            try:
+                document = parse_sitemap(
+                    result.body,
+                    result.final_url or sitemap_url,
+                    max_urls=MAX_SITEMAP_URLS_PER_DOMAIN - len(page_urls),
+                )
+            except SitemapError as exc:
+                log.info("Sitemap ignored (%s)", str(exc))
+                continue
+            page_urls.extend(document.page_urls)
+            sitemap_queue.extend(document.sitemap_urls)
+            if len(page_urls) >= MAX_SITEMAP_URLS_PER_DOMAIN:
+                break
+
+        if scan_resolved:
+            mark_scanned = getattr(self._repository, "mark_sitemap_scan", None)
+            if callable(mark_scanned):
+                try:
+                    await mark_scanned(site)
+                except Exception as exc:
+                    log.warning(
+                        "Sitemap scan timestamp could not be saved (%s)", type(exc).__name__
+                    )
+
+        links: list[ExtractedLink] = []
+        seen: set[str] = set()
+        for url in page_urls:
+            try:
+                normalized = normalize_url(url).normalized
+            except UrlSafetyError:
+                continue
+            if normalized in seen or is_direct_media_url(normalized):
+                continue
+            seen.add(normalized)
+            quality, reasons, trap = score_link(normalized, kind="sitemap")
+            if trap:
+                continue
+            links.append(
+                ExtractedLink(
+                    url=normalized,
+                    text="",
+                    original_url=url,
+                    kind="sitemap",
+                    quality_score=quality,
+                    quality_reasons=reasons,
+                )
+            )
+        return tuple(links)
 
     async def _acquire_original_media(
         self,
@@ -823,37 +1290,280 @@ class DiscoveryCrawler:
         row: dict[str, Any],
         page: ExtractedPage,
         *,
+        classification: Classification,
         depth: int,
         admission: _UrlAdmission,
         seen_edges: set[tuple[str, str]],
+        edge_write_stats: dict[str, int],
         scheduled: bool,
-    ) -> int:
+    ) -> dict[str, Any]:
         if depth >= self._settings.max_crawl_depth:
-            return 0
+            return {
+                "admitted": 0,
+                "external": 0,
+                "internal": 0,
+                "new_domains": 0,
+                "new_domain_sites": [],
+                "duplicates": 0,
+                "skipped": len(page.links),
+                "budget_limited": False,
+            }
         parent_id = str(row.get("id") or "")
         parent_url = page.final_url
         source_type = str(row.get("source_type") or "web_legacy")
         metadata = _metadata(row)
-        admitted = 0
-        for index, link in enumerate(page.links):
+        source_identity = domain_identity(parent_url)
+        source_evidence = classification.evidence
+        source_relevance = 2 if int(source_evidence.get("direct_score") or 0) > 0 else 0
+
+        ranked_links: list[tuple[int, tuple[str, ...], bool, ExtractedLink, Any]] = []
+        skipped = 0
+        page_domains: set[str] = set()
+        for link in page.links:
+            try:
+                normalized = normalize_url(link.url).normalized
+                destination_identity = domain_identity(normalized)
+            except UrlSafetyError:
+                skipped += 1
+                continue
+            if is_direct_media_url(normalized):
+                skipped += 1
+                continue
+            external = destination_identity.registrable_domain != source_identity.registrable_domain
+            score, reasons, trap = score_link(
+                normalized,
+                text=link.text,
+                context=link.context,
+                kind=link.kind,
+            )
+            if trap:
+                skipped += 1
+                continue
+            # Sitemap membership is discovery evidence in its own right. Keep
+            # its priority modest while allowing ordinary pages through the
+            # same safety, depth, per-page and job-budget gates as HTML links.
+            if link.kind == "sitemap":
+                score = max(score, 4)
+                reasons += ("sitemap_discovery_evidence",)
+            destination_signal = score
+            if external:
+                score += 2
+                reasons += ("external_domain_expansion",)
+                if destination_identity.registrable_domain not in page_domains and (
+                    destination_signal > 0 or source_relevance > 0
+                ):
+                    score += 2
+                    reasons += ("first_link_to_domain_on_page",)
+                page_domains.add(destination_identity.registrable_domain)
+            score += source_relevance
+            if source_relevance:
+                reasons += ("source_page_has_character_evidence",)
+            threshold = 2 if source_relevance else 4
+            if score < threshold:
+                skipped += 1
+                continue
+            ranked_links.append((score, reasons, external, link, destination_identity))
+
+        ranked_links.sort(
+            key=lambda item: (
+                -item[0],
+                not item[2],
+                item[1],
+                item[3].url,
+            )
+        )
+        admitted = external_admitted = internal_admitted = new_domains = duplicates = 0
+        new_domain_sites: list[str] = []
+        admitted_domain_sites: set[str] = set()
+        internal_limit = 10
+        external_limit = 40
+        next_page_admitted = False
+        budget_limited = False
+        pending: list[_PendingChild] = []
+
+        async def write_children(children: list[_PendingChild]) -> None:
+            nonlocal admitted, external_admitted, internal_admitted
+            nonlocal duplicates, skipped, new_domains
+            payloads = [child.payload for child in children]
+            batch_upsert = getattr(self._repository, "upsert_discovery_records", None)
+            results: list[tuple[dict[str, Any], bool] | None]
+            if callable(batch_upsert):
+                try:
+                    results = list(await batch_upsert(payloads))
+                except Exception as exc:
+                    log.warning(
+                        "Child discovery batch failed (%s); retrying %s item(s) individually",
+                        type(exc).__name__,
+                        len(payloads),
+                    )
+                    results = await self._upsert_children_individually(payloads)
+            else:
+                results = await self._upsert_children_individually(payloads)
+            if len(results) != len(children):
+                log.warning(
+                    "Child discovery batch returned %s result(s) for %s item(s)",
+                    len(results),
+                    len(children),
+                )
+                results = (results + [None] * len(children))[: len(children)]
+
+            edges: list[dict[str, Any]] = []
+            for child, result in zip(children, results, strict=True):
+                if result is None:
+                    skipped += 1
+                    continue
+                child_row, created = result
+                if created:
+                    if not admission.admit():
+                        skipped += 1
+                        continue
+                    admitted += 1
+                    if child.external:
+                        external_admitted += 1
+                        if child.domain_site not in admitted_domain_sites:
+                            new_domains += 1
+                            admitted_domain_sites.add(child.domain_site)
+                            new_domain_sites.append(child.domain_site)
+                    else:
+                        internal_admitted += 1
+                else:
+                    duplicates += 1
+                child_id = child_row.get("id")
+                edge = dict(child.edge)
+                edge["child_discovery_id"] = str(child_id) if child_id else None
+                edges.append(edge)
+
+            if not edges:
+                return
+            batch_edges = getattr(self._repository, "record_discovery_edges", None)
+            unique_edge_count = len(
+                {
+                    (
+                        str(edge.get("parent_discovery_id") or "") or None,
+                        str(edge["child_normalized_url"]),
+                    )
+                    for edge in edges
+                }
+            )
+            if not callable(batch_edges):
+                edge_write_stats["failed_count"] += unique_edge_count
+                cause = RuntimeError("repository does not provide batch discovery-edge persistence")
+                log.error(
+                    "Required discovery edge batch writer is unavailable parent_id=%s edges=%s",
+                    parent_id,
+                    unique_edge_count,
+                )
+                raise DiscoveryEdgeWriteError(parent_id, 0, unique_edge_count) from cause
+            try:
+                rows = await batch_edges(edges)
+                if not isinstance(rows, list) or len(rows) != len(edges):
+                    raise RuntimeError(
+                        "discovery edge batch returned an incomplete relationship result"
+                    )
+            except Exception as exc:
+                persisted_count = max(
+                    0,
+                    min(unique_edge_count, int(getattr(exc, "confirmed_count", 0) or 0)),
+                )
+                failed_count = max(
+                    0,
+                    min(
+                        unique_edge_count - persisted_count,
+                        int(
+                            getattr(
+                                exc,
+                                "failed_count",
+                                unique_edge_count - persisted_count,
+                            )
+                            or 0
+                        ),
+                    ),
+                )
+                failed_count += unique_edge_count - persisted_count - failed_count
+                edge_write_stats["persisted_count"] += persisted_count
+                edge_write_stats["failed_count"] += failed_count
+                log.exception(
+                    "Discovery edge batch failed; no individual fallback will be attempted "
+                    "parent_id=%s persisted=%s unconfirmed=%s",
+                    parent_id,
+                    persisted_count,
+                    failed_count,
+                )
+                raise DiscoveryEdgeWriteError(parent_id, persisted_count, failed_count) from exc
+            edge_write_stats["persisted_count"] += unique_edge_count
+
+        async def flush_pending() -> None:
+            nonlocal budget_limited, skipped
+            while pending:
+                if admission.remaining <= 0:
+                    budget_limited = True
+                    return
+                external_available = max(0, external_limit - external_admitted)
+                internal_available = max(0, internal_limit - internal_admitted)
+                budget_available = admission.remaining
+                selected: list[_PendingChild] = []
+                deferred: list[_PendingChild] = []
+                external_reserved = internal_reserved = 0
+                for child in pending:
+                    if len(selected) >= budget_available:
+                        deferred.append(child)
+                        continue
+                    if child.external:
+                        if external_reserved >= external_available:
+                            deferred.append(child)
+                            continue
+                        external_reserved += 1
+                    else:
+                        if internal_reserved >= internal_available:
+                            deferred.append(child)
+                            continue
+                        internal_reserved += 1
+                    selected.append(child)
+
+                pending[:] = deferred
+                if not selected:
+                    # Only children whose per-page type cap is already full
+                    # remain, so they cannot be admitted on this page.
+                    skipped += len(pending)
+                    pending.clear()
+                    return
+
+                await write_children(selected)
+
+        for index, (score, reasons, external, link, destination_identity) in enumerate(
+            ranked_links
+        ):
             if admission.remaining <= 0:
+                budget_limited = True
+                skipped += len(ranked_links) - index
                 break
             child_depth = depth + 1
             if child_depth > self._settings.max_crawl_depth:
+                skipped += len(ranked_links) - index
                 break
-            try:
-                normalized = normalize_url(link.url).normalized
-            except UrlSafetyError:
+            if external and external_admitted >= external_limit:
+                skipped += 1
                 continue
+            if not external and internal_admitted >= internal_limit:
+                skipped += 1
+                continue
+            if link.kind == "next":
+                if next_page_admitted:
+                    skipped += 1
+                    continue
+                next_page_admitted = True
+            normalized = normalize_url(link.url).normalized
             if normalized in {parent_url, row.get("normalized_url")}:
-                continue
-            if is_direct_media_url(normalized):
+                skipped += 1
                 continue
             edge_key = (parent_id, normalized)
             if edge_key in seen_edges:
+                skipped += 1
                 continue
             seen_edges.add(edge_key)
             if scheduled and index % 10 == 0 and not await self._automation_enabled():
+                await flush_pending()
+                skipped += len(ranked_links) - index
                 break
             child_metadata: dict[str, Any] = {
                 "discovered_via": "crawl_link",
@@ -861,6 +1571,17 @@ class DiscoveryCrawler:
                 "parent_discovery_id": parent_id,
                 "origin_source_type": source_type,
                 "link_text": link.text[:300],
+                "link_kind": link.kind,
+                "link_context": link.context[:500],
+                "original_url": link.original_url or link.url,
+                "source_domain": source_identity.registrable_domain,
+                "source_registrable_domain": source_identity.registrable_domain,
+                "source_hostname": source_identity.hostname,
+                "destination_domain": destination_identity.registrable_domain,
+                "destination_hostname": destination_identity.hostname,
+                "crawl_priority": max(0, min(100, score * 10)),
+                "admission_score": max(0, min(100, score * 10)),
+                "admission_reasons": list(reasons),
                 "discovered_at": _now_iso(self._now),
             }
             search_phrase = metadata.get("search_phrase")
@@ -872,56 +1593,120 @@ class DiscoveryCrawler:
                 "source_type": source_type,
                 "title": None,
                 "description": link.text[:500] or None,
-                "domain": urlsplit(normalized).hostname,
+                "domain": destination_identity.hostname,
+                "hostname": destination_identity.hostname,
+                "registrable_domain": destination_identity.registrable_domain,
+                "crawl_priority": max(0, min(100, score * 10)),
                 "parent_discovery_id": parent_id,
                 "depth": child_depth,
                 "status": "queued",
                 "metadata_json": child_metadata,
             }
+            pending.append(
+                _PendingChild(
+                    payload=payload,
+                    edge={
+                        "parent_discovery_id": parent_id,
+                        "child_discovery_id": None,
+                        "child_normalized_url": normalized,
+                        "discovered_from_url": parent_url,
+                        "depth": child_depth,
+                        "original_url": link.original_url or link.url,
+                        "link_text": link.text,
+                        "source_domain": source_identity.registrable_domain,
+                        "destination_domain": destination_identity.registrable_domain,
+                        "admission_score": max(0, min(100, score * 10)),
+                        "admission_reason": ";".join(reasons),
+                        "discovery_mechanism": (
+                            "sitemap" if link.kind == "sitemap" else "html_link"
+                        ),
+                    },
+                    external=external,
+                    domain_site=destination_identity.registrable_domain,
+                )
+            )
+            # Flush each ten-link wave so a pause observed at the next
+            # automation boundary still preserves everything admitted before it.
+            if (index + 1) % 10 == 0 or index + 1 == len(ranked_links):
+                await flush_pending()
+
+        await flush_pending()
+        if pending:
+            budget_limited = True
+            skipped += len(pending)
+            pending.clear()
+        return {
+            "admitted": admitted,
+            "external": external_admitted,
+            "internal": internal_admitted,
+            "new_domains": new_domains,
+            "new_domain_sites": new_domain_sites,
+            "duplicates": duplicates,
+            "skipped": skipped,
+            "budget_limited": budget_limited,
+        }
+
+    async def _upsert_children_individually(
+        self, payloads: list[dict[str, Any]]
+    ) -> list[tuple[dict[str, Any], bool] | None]:
+        results: list[tuple[dict[str, Any], bool] | None] = []
+        for payload in payloads:
             try:
-                child_row, created = await self._repository.upsert_discovery_record(payload)
+                results.append(await self._repository.upsert_discovery_record(payload))
             except Exception as exc:
                 log.warning("Child discovery insert failed (%s)", type(exc).__name__)
-                continue
-            if created and not admission.admit():
-                break
-            if created:
-                admitted += 1
-            child_id = child_row.get("id")
-            try:
-                await self._repository.record_discovery_edge(
-                    parent_discovery_id=parent_id,
-                    child_discovery_id=str(child_id) if child_id else None,
-                    child_normalized_url=normalized,
-                    discovered_from_url=parent_url,
-                    depth=child_depth,
-                )
-            except Exception as exc:
-                log.warning("Discovery edge insert failed (%s)", type(exc).__name__)
-        return admitted
+                results.append(None)
+        return results
 
     async def _requeue_from_pause(
         self,
-        discovery_id: str,
+        row: dict[str, Any],
         budget: RequestBudget,
         host: str,
         reason: str,
-    ) -> None:
+    ) -> bool:
         until = budget.pause_until(host)
-        await self._repository.requeue_discovery(
-            discovery_id,
+        return await self._safe_requeue(
+            row,
             reason=reason,
             next_attempt_at=until.astimezone(UTC).isoformat() if until else None,
         )
 
-    async def _safe_requeue(self, row: dict[str, Any], reason: str) -> None:
+    async def _safe_requeue(
+        self,
+        row: dict[str, Any],
+        reason: str,
+        *,
+        next_attempt_at: str | None = None,
+    ) -> bool:
         discovery_id = row.get("id")
         if not discovery_id:
-            return
+            log.error("Discovery requeue failed discovery_id=missing reason=%s", reason)
+            return False
         try:
-            await self._repository.requeue_discovery(str(discovery_id), reason=reason)
+            result = await self._repository.requeue_discovery(
+                str(discovery_id),
+                reason=reason,
+                next_attempt_at=next_attempt_at,
+                expected_claimed_at=row.get("claimed_at"),
+            )
         except Exception as exc:
-            log.warning("Discovery requeue failed (%s)", type(exc).__name__)
+            log.exception(
+                "Discovery requeue failed discovery_id=%s reason=%s exception=%s",
+                discovery_id,
+                reason,
+                type(exc).__name__,
+            )
+            return False
+        if not isinstance(result, dict) or result.get("status") != "queued":
+            log.error(
+                "Discovery requeue was not confirmed discovery_id=%s reason=%s result_status=%s",
+                discovery_id,
+                reason,
+                result.get("status") if isinstance(result, dict) else None,
+            )
+            return False
+        return True
 
     async def _safe_fail(self, row: dict[str, Any], reason: str) -> None:
         discovery_id = row.get("id")

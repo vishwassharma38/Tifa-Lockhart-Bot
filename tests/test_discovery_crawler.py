@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+from contextvars import ContextVar
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -24,8 +27,10 @@ from app.discovery.http import (
     DomainThrottle,
     FetchResult,
     RequestBudget,
+    SafeHttpClient,
 )
 from app.discovery.robots import RobotsCache
+from app.discovery.url_safety import validate_url_literal
 from app.pipeline.phase2 import Phase2Result, Phase2Status
 
 
@@ -200,6 +205,68 @@ async def test_inspector_returns_extracted_metadata_for_html(make_settings) -> N
     assert client.calls[1][1]["allowed_content_types"] is not None
 
 
+async def test_inspector_checks_robots_for_cross_domain_redirect_destination(make_settings) -> None:
+    class Content:
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+
+        async def iter_chunked(self, _size: int):
+            if self.body:
+                yield self.body
+
+    class Response:
+        def __init__(self, status: int, headers: dict[str, str], body: bytes = b"") -> None:
+            self.status = status
+            self.headers = headers
+            self.content = Content(body)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc_info: object) -> bool:
+            return False
+
+    class Session:
+        def __init__(self) -> None:
+            self.responses = [
+                Response(404, {}),
+                Response(302, {"Location": "https://target.example/private/page"}),
+                Response(
+                    200,
+                    {"Content-Type": "text/plain"},
+                    b"User-agent: *\nDisallow: /private",
+                ),
+            ]
+            self.calls: list[str] = []
+
+        def get(self, url: str, **_kwargs: object):
+            self.calls.append(url)
+            return self.responses.pop(0)
+
+    async def validate_public(url: str):
+        return SimpleNamespace(url=validate_url_literal(url), addresses=("8.8.8.8",))
+
+    session = Session()
+    settings = make_settings()
+    client = SafeHttpClient(session=session, validator=validate_public)
+    inspector = PageInspector(settings, client, sleep=no_sleep)
+
+    inspection = await inspector.inspect(
+        "https://source.example/start",
+        budget=RequestBudget(max_domain_requests=20),
+        throttle=make_throttle(),
+        robots=RobotsCache(user_agent="TifaLockhartBot/1.0"),
+    )
+
+    assert inspection.category == "robots_disallowed"
+    assert inspection.reason == "robots_disallowed"
+    assert session.calls == [
+        "https://source.example/robots.txt",
+        "https://source.example/start",
+        "https://target.example/robots.txt",
+    ]
+
+
 async def test_inspector_obeys_robots_disallow_without_fetching_the_page(make_settings) -> None:
     settings = make_settings()
     client = FakeHttpClient(
@@ -361,6 +428,7 @@ async def test_inspector_does_not_retry_permanent_http_errors(make_settings) -> 
 
     assert inspection.category == "failed"
     assert inspection.attempts == 1
+    assert inspection.retryable is False
     assert len([call for call in client.calls if not call[0].endswith("robots.txt")]) == 1
 
 
@@ -512,8 +580,35 @@ class FakeRepository:
         self.metadata_updates: list[tuple[str, dict[str, Any]]] = []
         self.upserts: list[dict[str, Any]] = []
         self.edges: list[dict[str, Any]] = []
+        self.upsert_batches: list[list[dict[str, Any]]] = []
+        self.edge_batches: list[list[dict[str, Any]]] = []
         self.requeues: list[tuple[str, str | None, str | None]] = []
         self.claims: list[tuple[int, int]] = []
+        self.events: list[tuple[str, Any]] = []
+        self._metrics: Counter[str] = Counter()
+        self._scoped_metrics: ContextVar[Counter[str] | None] = ContextVar(
+            f"fake_repository_metrics_{id(self)}", default=None
+        )
+
+    def _bump_metrics(self, **increments: int) -> None:
+        scoped = self._scoped_metrics.get()
+        for name, value in increments.items():
+            self._metrics[name] += value
+            if scoped is not None:
+                scoped[name] += value
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        return dict(self._metrics)
+
+    def begin_metrics_scope(self):
+        return self._scoped_metrics.set(Counter())
+
+    def end_metrics_scope(self, token) -> None:
+        self._scoped_metrics.reset(token)
+
+    def scoped_metrics_snapshot(self) -> dict[str, int]:
+        scoped = self._scoped_metrics.get()
+        return dict(scoped) if scoped is not None else {}
 
     async def get_runtime_state(self) -> dict[str, Any]:
         return self.state
@@ -534,12 +629,21 @@ class FakeRepository:
     ) -> None:
         self.finished.append((job_id, dict(counters), outcome, error))
 
-    async def claim_discoveries(self, *, limit: int, max_depth: int):
+    async def claim_discoveries(
+        self,
+        *,
+        limit: int,
+        max_depth: int,
+        per_domain_limit: int = 2,
+        new_domain_share: float = 0.8,
+    ):
         self.claims.append((limit, max_depth))
+        self._bump_metrics(claim_calls=1)
         return self.rows
 
     async def update_discovery(self, discovery_id: str, fields: dict[str, Any]):
         self.updates.append((discovery_id, dict(fields)))
+        self.events.append(("discovery_update", fields.get("status")))
         return {"id": discovery_id, **fields}
 
     async def update_discovery_metadata(self, discovery_id: str, metadata: dict[str, Any]):
@@ -561,9 +665,21 @@ class FakeRepository:
             **payload,
         }, created
 
+    async def upsert_discovery_records(
+        self, payloads: list[dict[str, Any]]
+    ) -> list[tuple[dict[str, Any], bool]]:
+        self.upsert_batches.append([dict(payload) for payload in payloads])
+        return [await self.upsert_discovery_record(payload) for payload in payloads]
+
     async def record_discovery_edge(self, **kwargs: Any):
         self.edges.append(kwargs)
         return {"id": f"edge-{len(self.edges)}", **kwargs}
+
+    async def record_discovery_edges(self, edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self.edge_batches.append([dict(edge) for edge in edges])
+        rows = [await self.record_discovery_edge(**edge) for edge in edges]
+        self.events.append(("edges_persisted", len(edges)))
+        return rows
 
     async def requeue_discovery(
         self,
@@ -571,8 +687,10 @@ class FakeRepository:
         *,
         reason: str | None = None,
         next_attempt_at: str | None = None,
+        expected_claimed_at: str | None = None,
     ):
         self.requeues.append((discovery_id, reason, next_attempt_at))
+        self.events.append(("requeue", discovery_id))
         return {"id": discovery_id, "status": "queued"}
 
 
@@ -673,10 +791,15 @@ async def test_crawler_verifies_acquires_and_admits_bounded_children(make_settin
     assert candidate.discovery_id == "discovery-1"
     assert candidate.source_type == "bing_html"
     assert [asset.url for asset in candidate.media_assets] == ["https://example.com/full.jpg"]
-    verified_update = repository.updates[0][1]
+    verified_update = next(
+        fields for _discovery_id, fields in repository.updates if fields.get("status") == "verified"
+    )
     assert verified_update["status"] == "verified"
     assert verified_update["next_attempt_at"] is None
     assert verified_update["metadata_json"]["classification"]["status"] == "verified"
+    assert repository.events.index(("edges_persisted", 2)) < repository.events.index(
+        ("discovery_update", "verified")
+    )
     assert len(repository.upserts) == 2
     first_child = repository.upserts[0]
     assert first_child["parent_discovery_id"] == "discovery-1"
@@ -685,6 +808,8 @@ async def test_crawler_verifies_acquires_and_admits_bounded_children(make_settin
     assert first_child["metadata_json"]["search_phrase"] == "Tifa Lockhart"
     assert all(edge["parent_discovery_id"] == "discovery-1" for edge in repository.edges)
     assert repository.finished[-1][2] == "succeeded"
+    assert repository.finished[-1][1]["stats_json"]["visited_domains"] == ["example.com"]
+    assert repository.finished[-1][1]["stats_json"]["new_domains"] == ["other.example"]
 
 
 async def test_reddit_seed_root_is_crawled_and_children_keep_reddit_provenance(
@@ -719,7 +844,7 @@ async def test_crawler_stages_verified_pages_without_original_media(make_setting
 
     counters = await crawler_.run_once(scheduled=True)
 
-    update = repository.updates[0][1]
+    update = next(fields for _discovery_id, fields in repository.updates if fields.get("status"))
     assert update["status"] == "dumpster"
     assert update["metadata_json"]["review_reason"] == "original_media_not_found"
     assert pipeline.calls == []
@@ -739,11 +864,11 @@ async def test_crawler_stages_preview_only_pages(make_settings) -> None:
 
     await crawler_.run_once(scheduled=True)
 
-    assert repository.updates[0][1]["status"] == "dumpster"
-    assert (
-        repository.updates[0][1]["metadata_json"]["review_reason"]
-        == "preview_only_original_unavailable"
+    status_update = next(
+        fields for _discovery_id, fields in repository.updates if fields.get("status")
     )
+    assert status_update["status"] == "dumpster"
+    assert status_update["metadata_json"]["review_reason"] == "preview_only_original_unavailable"
     assert pipeline.calls == []
 
 
@@ -758,7 +883,12 @@ async def test_crawler_crawls_children_from_dumpster_but_not_rejected_pages(
 
     await crawler_.run_once(scheduled=True)
 
-    assert repository.updates[0][1]["status"] == "dumpster"
+    assert (
+        next(fields for _discovery_id, fields in repository.updates if fields.get("status"))[
+            "status"
+        ]
+        == "dumpster"
+    )
     assert len(repository.upserts) == 1
 
     rejected_page = extract_page(
@@ -776,7 +906,12 @@ async def test_crawler_crawls_children_from_dumpster_but_not_rejected_pages(
 
     await rejected_crawler.run_once(scheduled=True)
 
-    assert rejected_repository.updates[0][1]["status"] == "rejected"
+    assert (
+        next(
+            fields for _discovery_id, fields in rejected_repository.updates if fields.get("status")
+        )["status"]
+        == "rejected"
+    )
     assert rejected_repository.upserts == []
 
 
@@ -921,6 +1056,188 @@ async def test_crawler_records_retry_attempts_for_exhausted_failures(make_settin
     assert update["retry_count"] == 3
 
 
+async def test_crawler_does_not_requeue_permanent_http_failures(make_settings) -> None:
+    inspection = PageInspection(
+        "https://example.com/page",
+        None,
+        404,
+        "failed",
+        "http_404",
+        attempts=1,
+        retryable=False,
+    )
+    repository = FakeRepository(rows=[row()])
+    crawler_ = crawler(make_settings, repository, FakePipeline(), FakeInspector([inspection]))
+
+    await crawler_.run_once(scheduled=True)
+
+    update = repository.updates[0][1]
+    assert update["status"] == "failed"
+    assert update["next_attempt_at"] is None
+    assert update["retry_count"] == 1
+
+
+async def test_crawler_recursively_follows_a_b_c_d_across_domains(make_settings) -> None:
+    urls = [
+        "https://creator-a.com/start",
+        "https://creator-b.com/gallery",
+        "https://creator-c.com/portfolio",
+        "https://creator-d.com/art",
+    ]
+    html_by_url = {
+        urls[index]: (
+            "<html><head><title>Tifa Lockhart fan art</title></head><body>"
+            "<p>Artist portfolio featuring Tifa Lockhart.</p>"
+            + (
+                f'<a href="{urls[index + 1]}">Tifa Lockhart fan art portfolio</a>'
+                if index < len(urls) - 1
+                else ""
+            )
+            + "</body></html>"
+        )
+        for index in range(len(urls))
+    }
+
+    class RecursiveRepository(FakeRepository):
+        async def claim_discoveries(self, *, limit: int, max_depth: int, **_kwargs: Any):
+            claimed, self.rows = self.rows[:limit], self.rows[limit:]
+            return claimed
+
+        async def upsert_discovery_record(self, payload: dict[str, Any]):
+            child, created = await super().upsert_discovery_record(payload)
+            if created:
+                self.rows.append(child)
+            return child, created
+
+    class MappingInspector:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def inspect(self, url: str, **_kwargs: Any) -> PageInspection:
+            self.calls.append(url)
+            page = extract_page(html_by_url[url], url)
+            return ok_inspection(page, url)
+
+    repository = RecursiveRepository(
+        rows=[row(url=urls[0], metadata={"search_phrase": "Tifa Lockhart"})]
+    )
+    inspector = MappingInspector()
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        inspector,
+        CRAWL_BATCH_SIZE="25",
+        MAX_CRAWL_DEPTH="6",
+    )
+
+    for _ in urls:
+        await crawler_.run_once(scheduled=True)
+
+    assert inspector.calls == urls
+    assert len(repository.edges) == 3
+    assert [edge["discovered_from_url"] for edge in repository.edges] == urls[:3]
+    assert [edge["child_normalized_url"] for edge in repository.edges] == urls[1:]
+    assert [edge["depth"] for edge in repository.edges] == [1, 2, 3]
+
+
+async def test_weak_page_admits_relevant_external_link_but_not_generic_navigation(
+    make_settings,
+) -> None:
+    url = "https://travel-blog.example/journal"
+    page = extract_page(
+        "<html><head><title>Weekend travel journal</title></head><body>"
+        '<nav><a href="https://social.example/about">About</a></nav>'
+        '<main><a href="https://artist-portfolio.example/portfolio">Artist portfolio</a></main>'
+        "</body></html>",
+        url,
+    )
+    repository = FakeRepository(rows=[row(url=url)])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page, url)),
+    )
+
+    counters = await crawler_.run_once(scheduled=True)
+
+    assert [item["normalized_url"] for item in repository.upserts] == [
+        "https://artist-portfolio.example/portfolio"
+    ]
+    assert counters["skipped_url_count"] >= 1
+
+
+async def test_search_result_evidence_alone_does_not_expand_generic_links(make_settings) -> None:
+    url = "https://travel-blog.example/journal"
+    page = extract_page(
+        "<html><head><title>Weekend travel journal</title></head><body>"
+        '<a href="/next">More posts</a></body></html>',
+        url,
+    )
+    repository = FakeRepository(
+        rows=[
+            row(
+                url=url,
+                metadata={
+                    "search_result_title": "Tifa Lockhart Fan Art",
+                    "search_result_snippet": "Artwork of Tifa Lockhart",
+                    "search_phrase": "Tifa Lockhart",
+                },
+            )
+        ]
+    )
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page, url)),
+    )
+
+    await crawler_.run_once(scheduled=True)
+
+    assert repository.upserts == []
+
+
+async def test_crawler_admits_sitemap_locations_through_the_normal_frontier(make_settings) -> None:
+    page_url = "https://example.com/home"
+    sitemap_url = "https://example.com/sitemap.xml"
+    sitemap_pages = (
+        "https://example.com/about",
+        "https://example.com/creators",
+        "https://example.com/gallery/123",
+        "https://example.com/tifa-artist-gallery",
+    )
+    html = b"<html><head><title>Example</title></head><body>Welcome.</body></html>"
+    sitemap = (
+        b'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        + b"".join(b"<url><loc>" + url.encode() + b"</loc></url>" for url in sitemap_pages)
+        + b"</urlset>"
+    )
+    client = FakeHttpClient(
+        {
+            page_url: make_result(page_url, body=html),
+            sitemap_url: make_result(sitemap_url, body=sitemap),
+        }
+    )
+    repository = FakeRepository(rows=[row(url=page_url)])
+    settings = make_settings()
+    crawler_ = DiscoveryCrawler(
+        settings,
+        repository,
+        FakePipeline(),
+        client=client,
+        inspector=make_inspector(settings, client),
+    )
+
+    await crawler_.run_once(scheduled=True)
+
+    assert sorted(item["normalized_url"] for item in repository.upserts) == sorted(sitemap_pages)
+    assert all(
+        item["metadata_json"]["discovered_via"] == "crawl_link" for item in repository.upserts
+    )
+
+
 async def test_crawler_stages_extraction_failures_in_the_dumpster(make_settings) -> None:
     inspection = PageInspection(
         "https://example.com/page",
@@ -940,6 +1257,23 @@ async def test_crawler_stages_extraction_failures_in_the_dumpster(make_settings)
     assert update["metadata_json"]["review_reason"] == "extraction_failed:ValueError"
     assert counters["processed_count"] == 1
     assert counters["skipped_count"] == 1
+
+
+async def test_domain_request_budget_exhaustion_is_reported_in_job_result(make_settings) -> None:
+    url = "https://example.com/page"
+    inspection = PageInspection(
+        url,
+        url,
+        None,
+        DOMAIN_BUDGET,
+        reason="domain_request_budget_exhausted",
+    )
+    repository = FakeRepository(rows=[row(url=url)])
+    crawler_ = crawler(make_settings, repository, FakePipeline(), FakeInspector([inspection]))
+
+    counters = await crawler_.run_once(scheduled=True)
+
+    assert counters["resource_budget_limited"] is True
 
 
 async def test_crawler_requeues_rows_interrupted_by_shutdown(make_settings) -> None:
@@ -1011,6 +1345,7 @@ async def test_crawler_requeues_remaining_rows_if_collection_is_paused_mid_job(
         ("two", "collection_paused", None),
     ]
     assert counters["skipped_count"] == 2
+    assert repository.finished[-1][1]["stats_json"]["repository_metrics"] == {"claim_calls": 1}
 
 
 async def test_crawler_aggregates_acquisition_results(make_settings) -> None:
@@ -1049,7 +1384,12 @@ async def test_crawler_records_pipeline_exceptions_without_losing_the_page(make_
 
     counters = await crawler_.run_once(scheduled=True)
 
-    assert repository.updates[0][1]["status"] == "verified"
+    assert (
+        next(fields for _discovery_id, fields in repository.updates if fields.get("status"))[
+            "status"
+        ]
+        == "verified"
+    )
     summary = repository.metadata_updates[0][1]["acquisition"]
     assert summary["error"] == "acquisition_failed:RuntimeError"
     assert counters["failed_count"] == 1
@@ -1088,6 +1428,367 @@ async def test_crawler_records_an_edge_even_when_the_child_already_exists(make_s
     assert counters["discovered_count"] == 0
     assert len(repository.edges) == 1
     assert repository.edges[0]["child_normalized_url"] == "https://example.com/existing"
+
+
+async def test_crawler_verifies_parent_with_no_required_child_edges(make_settings) -> None:
+    page = extracted_page(media=("/full.jpg",), links=())
+    repository = FakeRepository(rows=[row()])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page)),
+    )
+
+    await crawler_.run_once(scheduled=False)
+
+    assert repository.edge_batches == []
+    assert ("discovery_update", "verified") in repository.events
+
+
+def external_batch_links(count: int) -> tuple[str, ...]:
+    return tuple(f"https://artist-{index:02d}.example/tifa-lockhart-art" for index in range(count))
+
+
+async def test_crawler_flushes_children_and_edges_in_bounded_waves(make_settings) -> None:
+    links = external_batch_links(25)
+    page = extracted_page(media=("/full.jpg",), links=links)
+    repository = FakeRepository(rows=[row()])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page)),
+        MAX_URLS_PER_JOB="100",
+    )
+
+    counters = await crawler_.run_once(scheduled=True)
+
+    assert [len(batch) for batch in repository.upsert_batches] == [10, 10, 5]
+    assert [len(batch) for batch in repository.edge_batches] == [10, 10, 5]
+    assert counters["discovered_count"] == 25
+    assert [payload["normalized_url"] for payload in repository.upserts] == list(links)
+    assert [edge["child_normalized_url"] for edge in repository.edges] == list(links)
+
+
+async def test_crawler_batches_duplicate_children_once_and_keeps_every_edge(make_settings) -> None:
+    links = external_batch_links(2)
+    page = extracted_page(media=("/full.jpg",), links=links)
+    repository = FakeRepository(rows=[row()], created=[True, False])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page)),
+        MAX_URLS_PER_JOB="100",
+    )
+
+    counters = await crawler_.run_once(scheduled=True)
+
+    assert [len(batch) for batch in repository.upsert_batches] == [2]
+    assert [len(batch) for batch in repository.edge_batches] == [2]
+    assert counters["discovered_count"] == 1
+    assert counters["duplicate_count"] == 1
+    assert [edge["child_normalized_url"] for edge in repository.edges] == list(links)
+
+
+async def test_crawler_fails_job_when_required_edge_batch_fails(make_settings) -> None:
+    links = external_batch_links(2)
+    page = extracted_page(media=("/full.jpg",), links=links)
+
+    class BatchFailingRepository(FakeRepository):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.parent_status = "processing"
+
+        async def upsert_discovery_records(self, payloads):
+            self.upsert_batches.append([dict(payload) for payload in payloads])
+            raise RuntimeError("batch unavailable")
+
+        async def record_discovery_edges(self, edges):
+            assert self.parent_status == "processing"
+            self.edge_batches.append([dict(edge) for edge in edges])
+            raise RuntimeError("edge batch unavailable")
+
+        async def record_discovery_edge(self, **kwargs):
+            pytest.fail("failed batch edges must not be retried through the same RPC")
+
+        async def requeue_discovery(
+            self,
+            discovery_id: str,
+            *,
+            reason: str | None = None,
+            next_attempt_at: str | None = None,
+            expected_claimed_at: str | None = None,
+        ):
+            self.requeues.append((discovery_id, reason, next_attempt_at))
+            self.parent_status = "queued"
+            return {"id": discovery_id, "status": "queued"}
+
+    repository = BatchFailingRepository(rows=[row()])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page)),
+        MAX_URLS_PER_JOB="100",
+    )
+
+    counters = await crawler_.run_once(scheduled=True)
+
+    assert [len(batch) for batch in repository.upsert_batches] == [2]
+    assert [len(batch) for batch in repository.edge_batches] == [2]
+    assert counters["discovered_count"] == 0
+    assert counters["failed_count"] == 1
+    assert [payload["normalized_url"] for payload in repository.upserts] == list(links)
+    assert repository.edges == []
+    assert repository.requeues == [("discovery-1", "discovery_edge_persistence_failed", None)]
+    assert repository.parent_status == "queued"
+    assert repository.finished[-1][2] == "failed"
+    assert repository.finished[-1][1]["stats_json"]["discovery_edges"] == {
+        "persisted_count": 0,
+        "failed_count": 2,
+    }
+    assert repository.finished[-1][1]["stats_json"]["error_breakdown"] == {
+        "discovery_edge_persistence_failed": 2
+    }
+    assert repository.finished[-1][1]["stats_json"]["repository_metrics"] == {"claim_calls": 1}
+    assert ("discovery_update", "verified") not in repository.events
+
+
+async def test_crawler_accounts_for_confirmed_edges_before_partial_batch_failure(
+    make_settings,
+) -> None:
+    links = external_batch_links(2)
+    page = extracted_page(media=("/full.jpg",), links=links)
+
+    class PartiallyFailingRepository(FakeRepository):
+        async def record_discovery_edges(self, edges):
+            self.edge_batches.append([dict(edge) for edge in edges])
+            error = RuntimeError("later edge chunk unavailable")
+            error.confirmed_count = 1  # type: ignore[attr-defined]
+            error.failed_count = 1  # type: ignore[attr-defined]
+            raise error
+
+    repository = PartiallyFailingRepository(rows=[row()])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page)),
+        MAX_URLS_PER_JOB="100",
+    )
+
+    await crawler_.run_once(scheduled=True)
+
+    assert repository.finished[-1][2] == "failed"
+    assert repository.finished[-1][1]["stats_json"]["discovery_edges"] == {
+        "persisted_count": 1,
+        "failed_count": 1,
+    }
+
+
+async def test_edge_and_requeue_double_failure_recovers_expired_claim_and_retries(
+    make_settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    links = external_batch_links(1)
+    page = extracted_page(media=("/full.jpg",), links=links)
+
+    class ExpiringClaimRepository(FakeRepository):
+        def __init__(self) -> None:
+            super().__init__(rows=[row()])
+            self.clock = 1_000
+            self.parent_status = "queued"
+            self.parent_claimed_at: int | None = None
+            self.fail_requeue = True
+            self.fail_first_edge_batch = True
+            self.edge_attempts = 0
+
+        async def recover_processing_discoveries(self) -> int:
+            if (
+                self.parent_status == "processing"
+                and self.parent_claimed_at is not None
+                and self.clock - self.parent_claimed_at >= 900
+            ):
+                self.parent_status = "queued"
+                self.parent_claimed_at = None
+                self.events.append(("claim_recovered", self.clock))
+                return 1
+            return 0
+
+        async def claim_discoveries(
+            self,
+            *,
+            limit: int,
+            max_depth: int,
+            per_domain_limit: int = 2,
+            new_domain_share: float = 0.8,
+        ):
+            self.claims.append((limit, max_depth))
+            if self.parent_status != "queued":
+                return []
+            self.parent_status = "processing"
+            self.parent_claimed_at = self.clock
+            self._bump_metrics(claim_calls=1)
+            return [{**self.rows[0], "status": "processing", "claimed_at": self.clock}]
+
+        async def update_discovery(self, discovery_id: str, fields: dict[str, Any]):
+            self.updates.append((discovery_id, dict(fields)))
+            self.events.append(("discovery_update", fields.get("status")))
+            if "status" in fields:
+                self.parent_status = str(fields["status"])
+                if self.parent_status != "processing":
+                    self.parent_claimed_at = None
+            return {"id": discovery_id, **fields}
+
+        async def requeue_discovery(
+            self,
+            discovery_id: str,
+            *,
+            reason: str | None = None,
+            next_attempt_at: str | None = None,
+            expected_claimed_at: str | None = None,
+        ):
+            self.requeues.append((discovery_id, reason, next_attempt_at))
+            if self.fail_requeue:
+                raise RuntimeError("requeue database unavailable")
+            if self.parent_status != "processing" or self.parent_claimed_at != expected_claimed_at:
+                return {"id": discovery_id, "status": self.parent_status}
+            self.parent_status = "queued"
+            self.parent_claimed_at = None
+            return {"id": discovery_id, "status": "queued"}
+
+        async def record_discovery_edges(self, edges: list[dict[str, Any]]):
+            self.edge_batches.append([dict(edge) for edge in edges])
+            self.edge_attempts += 1
+            if self.fail_first_edge_batch:
+                self.fail_first_edge_batch = False
+                raise RuntimeError("edge RPC unavailable")
+            rows = [await self.record_discovery_edge(**edge) for edge in edges]
+            self.events.append(("edges_persisted", len(edges)))
+            return rows
+
+    repository = ExpiringClaimRepository()
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector([ok_inspection(page), ok_inspection(page)]),
+        MAX_URLS_PER_JOB="100",
+    )
+
+    first = await crawler_.run_once(scheduled=False)
+
+    assert repository.parent_status == "processing"
+    assert repository.parent_claimed_at == 1_000
+    assert ("discovery_update", "verified") not in repository.events
+    assert first["stats_json"]["error_breakdown"] == {
+        "discovery_edge_persistence_failed": 1,
+        "discovery_requeue_failed": 1,
+    }
+    assert (
+        "Discovery requeue failed discovery_id=discovery-1 reason=discovery_edge_persistence_failed"
+    ) in caplog.text
+
+    repository.clock = 1_901
+    second = await crawler_.run_once(scheduled=False)
+
+    assert ("claim_recovered", 1_901) in repository.events
+    assert second["failed_count"] == 0
+    assert repository.parent_status == "verified"
+    assert repository.parent_claimed_at is None
+    assert repository.events.index(("edges_persisted", 1)) < repository.events.index(
+        ("discovery_update", "verified")
+    )
+    assert repository.edge_attempts == 2
+
+    await crawler_.run_once(scheduled=False)
+    assert repository.edge_attempts == 2
+
+
+async def test_crawler_repository_metrics_are_job_scoped_and_cumulative_counters_remain(
+    make_settings,
+) -> None:
+    repository = FakeRepository(rows=[])
+    repository._bump_metrics(unrelated_operations=2)
+    crawler_ = crawler(make_settings, repository, FakePipeline(), FakeInspector([]))
+
+    first = await crawler_.run_once(scheduled=False)
+    repository._bump_metrics(unrelated_operations=3)
+    second = await crawler_.run_once(scheduled=False)
+
+    assert first["stats_json"]["repository_metrics"] == {"claim_calls": 1}
+    assert second["stats_json"]["repository_metrics"] == {"claim_calls": 1}
+    assert repository.metrics_snapshot() == {"claim_calls": 2, "unrelated_operations": 5}
+
+
+async def test_crawler_preserves_admissions_before_a_wave_boundary_pause(make_settings) -> None:
+    links = external_batch_links(25)
+    page = extracted_page(media=("/full.jpg",), links=links)
+    repository = FakeRepository(rows=[row()])
+    state_calls = {"count": 0}
+
+    async def state_sequence():
+        state_calls["count"] += 1
+        return {"collection_enabled": state_calls["count"] <= 3}
+
+    repository.get_runtime_state = state_sequence  # type: ignore[method-assign]
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page)),
+        MAX_URLS_PER_JOB="100",
+    )
+
+    counters = await crawler_.run_once(scheduled=True)
+
+    assert state_calls["count"] == 4
+    assert [len(batch) for batch in repository.upsert_batches] == [10]
+    assert [len(batch) for batch in repository.edge_batches] == [10]
+    assert counters["discovered_count"] == 10
+    assert counters["skipped_url_count"] == 16
+
+
+async def test_crawler_applies_internal_page_cap_before_batching(make_settings) -> None:
+    links = tuple(f"https://example.com/tifa-lockhart-art-{index}" for index in range(12))
+    page = extracted_page(media=("/full.jpg",), links=links)
+    repository = FakeRepository(rows=[row()])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page)),
+        MAX_URLS_PER_JOB="100",
+    )
+
+    counters = await crawler_.run_once(scheduled=True)
+
+    assert [len(batch) for batch in repository.upsert_batches] == [10]
+    assert [len(batch) for batch in repository.edge_batches] == [10]
+    assert counters["discovered_count"] == 10
+    assert counters["skipped_url_count"] == 3
+    admitted_urls = [payload["normalized_url"] for payload in repository.upserts]
+    assert len(admitted_urls) == 10
+    assert set(admitted_urls) <= set(links)
+
+
+async def test_crawler_skips_batch_writes_when_a_page_admits_no_children(make_settings) -> None:
+    page = extracted_page(media=("/full.jpg",), links=())
+    repository = FakeRepository(rows=[row()])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector(ok_inspection(page)),
+    )
+
+    await crawler_.run_once(scheduled=True)
+
+    assert repository.upsert_batches == []
+    assert repository.edge_batches == []
+    assert repository.upserts == []
+    assert repository.edges == []
 
 
 class FakeValidator:

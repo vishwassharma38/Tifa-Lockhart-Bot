@@ -10,6 +10,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
+from app.discovery.links import score_link
 from app.discovery.url_safety import UrlSafetyError, normalize_url
 from app.media.validation import normalize_extension
 
@@ -28,9 +29,19 @@ class ExtractedLink:
     url: str
     text: str
     original_url: str | None = None
+    kind: str = "anchor"
+    context: str = ""
+    quality_score: int = 0
+    quality_reasons: tuple[str, ...] = ()
 
-    def to_metadata(self) -> dict[str, str]:
-        return {"url": self.url, "text": self.text[:300]}
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "url": self.url,
+            "text": self.text[:300],
+            "kind": self.kind,
+            "quality_score": self.quality_score,
+            "quality_reasons": list(self.quality_reasons),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +168,18 @@ def _canonical_url(soup: BeautifulSoup, base_url: str) -> str | None:
     return None
 
 
+def _document_base(soup: BeautifulSoup, final_url: str) -> str:
+    """Resolve relative references against the first valid HTML base element."""
+    tag = soup.find("base", href=True)
+    href = tag.get("href") if tag is not None else None
+    if not isinstance(href, str) or not href.strip():
+        return final_url
+    try:
+        return normalize_url(urljoin(final_url, href.strip())).normalized
+    except UrlSafetyError:
+        return final_url
+
+
 def _safe_url(value: str | None, base_url: str) -> str | None:
     if not isinstance(value, str):
         return None
@@ -203,23 +226,142 @@ def _tags(soup: BeautifulSoup, text: str, metadata: dict[str, str]) -> tuple[str
 
 
 def _links(soup: BeautifulSoup, base_url: str) -> tuple[ExtractedLink, ...]:
-    results: list[ExtractedLink] = []
-    seen: set[str] = set()
-    for anchor in soup.find_all("a"):
-        href = anchor.get("href")
+    best_by_url: dict[str, ExtractedLink] = {}
+    candidates: list[tuple[Any, str]] = [(tag, "anchor") for tag in soup.find_all("a")]
+    candidates.extend((tag, "area") for tag in soup.find_all("area"))
+    useful_relations = {"alternate", "author", "next", "prev", "related", "tag"}
+    for tag in soup.find_all("link"):
+        raw_rel = tag.get("rel") or []
+        relations = {str(value).lower() for value in raw_rel}
+        chosen = sorted(relations & useful_relations)
+        if chosen:
+            candidates.append((tag, chosen[0]))
+
+    for tag, kind in candidates:
+        href = tag.get("href")
         if not isinstance(href, str) or not href.strip():
             continue
         candidate = href.strip()
         if candidate.lower().startswith(_NON_HTTP_PREFIXES):
             continue
         url = _safe_url(candidate, base_url)
+        if url is None:
+            continue
+        text_value = tag.get("aria-label") or tag.get("title")
+        text = clean_text(
+            tag.get_text(" ", strip=True) or (text_value if isinstance(text_value, str) else ""),
+            limit=300,
+        )
+        parent = tag.parent
+        parent_name = getattr(parent, "name", "")
+        context = ""
+        if parent is not None and parent_name not in {
+            "body",
+            "main",
+            "nav",
+            "header",
+            "footer",
+            "aside",
+            "ul",
+            "ol",
+        }:
+            context = clean_text(parent.get_text(" ", strip=True), limit=500)
+        quality, reasons, trap = score_link(url, text=text, context=context, kind=kind)
+        if trap:
+            continue
+        original = urljoin(base_url, candidate)
+        link = ExtractedLink(
+            url=url,
+            text=text,
+            original_url=original,
+            kind=kind,
+            context=context,
+            quality_score=quality,
+            quality_reasons=reasons,
+        )
+        current = best_by_url.get(url)
+        if current is None or (link.quality_score, bool(link.text)) > (
+            current.quality_score,
+            bool(current.text),
+        ):
+            best_by_url[url] = link
+        if len(best_by_url) >= _MAX_LINKS:
+            break
+    return tuple(best_by_url.values())
+
+
+def extract_http_link_header(value: str | None, base_url: str) -> tuple[ExtractedLink, ...]:
+    """Extract useful RFC 8288 Link relations without following canonical blindly."""
+    if not value:
+        return ()
+
+    members: list[str] = []
+    start = 0
+    angle_depth = 0
+    quoted = False
+    escaped = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\" and quoted:
+            escaped = True
+        elif character == '"':
+            quoted = not quoted
+        elif not quoted and character == "<":
+            angle_depth += 1
+        elif not quoted and character == ">":
+            angle_depth = max(0, angle_depth - 1)
+        elif not quoted and angle_depth == 0 and character == ",":
+            members.append(value[start:index].strip())
+            start = index + 1
+    members.append(value[start:].strip())
+
+    results: list[ExtractedLink] = []
+    seen: set[str] = set()
+    useful = {"author", "next", "prev", "related", "tag", "alternate"}
+    for member in members:
+        if not member.startswith("<") or ">" not in member:
+            continue
+        end = member.find(">")
+        reference = member[1:end].strip()
+        parameters = member[end + 1 :]
+        relation_match = re.search(
+            r"(?:^|;)\s*rel\s*=\s*(?:\"([^\"]*)\"|([^;\s]+))", parameters, re.I
+        )
+        if relation_match is None:
+            continue
+        relations = (relation_match.group(1) or relation_match.group(2) or "").lower().split()
+        relation = next((item for item in relations if item in useful), None)
+        if relation is None:
+            continue
+        title_match = re.search(
+            r"(?:^|;)\s*title\s*=\s*(?:\"([^\"]*)\"|([^;\s]+))", parameters, re.I
+        )
+        title = (
+            clean_text(title_match.group(1) or title_match.group(2), limit=300)
+            if title_match
+            else ""
+        )
+        url = _safe_url(reference, base_url)
         if url is None or url in seen:
             continue
+        quality, reasons, trap = score_link(url, text=title, kind=relation)
+        if trap:
+            continue
         seen.add(url)
-        text = clean_text(anchor.get_text(" ", strip=True), limit=300)
-        original = urljoin(base_url, candidate)
-        results.append(ExtractedLink(url=url, text=text, original_url=original))
-        if len(results) >= _MAX_LINKS:
+        results.append(
+            ExtractedLink(
+                url=url,
+                text=title,
+                original_url=urljoin(base_url, reference),
+                kind=relation,
+                context="HTTP Link header",
+                quality_score=quality,
+                quality_reasons=reasons,
+            )
+        )
+        if len(results) >= 100:
             break
     return tuple(results)
 
@@ -373,13 +515,15 @@ def extract_page(html: str, final_url: str) -> ExtractedPage:
     except Exception as exc:  # pragma: no cover - exercised with a parser stub
         raise ValueError(f"HTML parsing failed ({type(exc).__name__})") from exc
 
+    effective_url = normalize_url(final_url).normalized
+    base_url = _document_base(soup, effective_url)
     metadata = _meta_values(soup)
     text = _visible_text(soup)
     return ExtractedPage(
-        final_url=normalize_url(final_url).normalized,
+        final_url=effective_url,
         title=_title(soup),
         description=metadata.get("description"),
-        canonical_url=_canonical_url(soup, final_url),
+        canonical_url=_canonical_url(soup, base_url),
         og_title=metadata.get("og:title"),
         og_description=metadata.get("og:description"),
         twitter_title=metadata.get("twitter:title"),
@@ -389,6 +533,6 @@ def extract_page(html: str, final_url: str) -> ExtractedPage:
         ),
         tags=_tags(soup, text, metadata),
         text=text,
-        links=_links(soup, final_url),
-        media=_media(soup, final_url, metadata),
+        links=_links(soup, base_url),
+        media=_media(soup, base_url, metadata),
     )

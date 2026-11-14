@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from types import SimpleNamespace
@@ -17,11 +18,13 @@ from app.discovery.http import (
     OK,
     OVERSIZE,
     RATE_LIMITED,
+    ROBOTS_DISALLOWED,
     SERVER_ERROR,
     TIMEOUT,
     TOO_MANY_REDIRECTS,
     UNSUPPORTED_CONTENT_TYPE,
     DomainThrottle,
+    RedirectPolicyResult,
     RequestBudget,
     SafeHttpClient,
     parse_retry_after,
@@ -160,6 +163,8 @@ def test_parse_retry_after_supports_seconds_and_http_dates() -> None:
     assert parse_retry_after({"Retry-After": "120"}, now=now) == 120.0
     assert parse_retry_after({"retry-after": "0.5"}, now=now) == 0.5
     assert parse_retry_after({"Retry-After": "-4"}, now=now) == 0.0
+    assert parse_retry_after({"Retry-After": "NaN"}, now=now) is None
+    assert parse_retry_after({"Retry-After": "1e100"}, now=now) < 300_000_000_000
     assert parse_retry_after({"Retry-After": future}, now=now) == pytest.approx(45.0)
     assert parse_retry_after({"Retry-After": "not-a-delay"}, now=now) is None
     assert parse_retry_after({}, now=now) is None
@@ -174,6 +179,27 @@ def test_request_budget_counts_and_exhausts_per_domain() -> None:
     assert budget_.request_count("EXAMPLE.COM") == 2
     assert budget_.budget_exhausted("example.com") is True
     assert budget_.try_acquire("other.example") is True
+
+
+def test_request_budget_shares_a_registrable_domain_limit_across_subdomains() -> None:
+    budget_ = budget(1)
+
+    assert (
+        budget_.try_acquire(
+            "www.example.com",
+            registrable_domain="example.com",
+            origin="https://www.example.com",
+        )
+        is True
+    )
+    assert (
+        budget_.try_acquire(
+            "artist.example.com",
+            registrable_domain="example.com",
+            origin="https://artist.example.com",
+        )
+        is False
+    )
 
 
 def test_request_budget_pause_can_expire() -> None:
@@ -211,6 +237,21 @@ async def test_domain_throttle_serializes_start_times() -> None:
     assert sleeps == [2.0]
 
 
+async def test_concurrent_requests_reserve_distinct_domain_start_slots() -> None:
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await asyncio.sleep(0)
+        clock[0] += seconds
+
+    throttle_ = DomainThrottle(2.0, sleep=sleep, clock=lambda: clock[0])
+    await asyncio.gather(*(throttle_.wait("example.com") for _ in range(3)))
+
+    assert sorted(sleeps) == [2.0, 4.0]
+
+
 async def test_domain_throttle_uses_the_larger_crawl_delay() -> None:
     clock = [0.0]
     sleeps: list[float] = []
@@ -224,6 +265,98 @@ async def test_domain_throttle_uses_the_larger_crawl_delay() -> None:
     await throttle_.wait("example.com")
 
     assert sleeps == [10.0]
+
+
+async def test_domain_throttle_shares_delay_across_subdomains() -> None:
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    throttle_ = DomainThrottle(2.0, sleep=sleep, clock=lambda: clock[0])
+
+    await throttle_.wait(
+        "www.example.com",
+        registrable_domain="example.com",
+        origin="https://www.example.com",
+    )
+    await throttle_.wait(
+        "artist.example.com",
+        registrable_domain="example.com",
+        origin="https://artist.example.com",
+    )
+
+    assert sleeps == [2.0]
+
+
+async def test_domain_throttle_adapts_to_failures_retry_after_and_recovers() -> None:
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    throttle_ = DomainThrottle(1.0, sleep=sleep, clock=lambda: clock[0])
+    throttle_.observe(
+        "a.example.com",
+        latency_seconds=0.2,
+        status=429,
+        category=RATE_LIMITED,
+        retry_after_seconds=5.0,
+        registrable_domain="example.com",
+        origin="https://a.example.com",
+    )
+
+    await throttle_.wait("a.example.com", registrable_domain="example.com")
+    await throttle_.wait("a.example.com", registrable_domain="example.com")
+    assert sleeps[:2] == [5.0, 2.0]
+
+    throttle_.observe(
+        "a.example.com",
+        latency_seconds=0.1,
+        status=200,
+        category=OK,
+        registrable_domain="example.com",
+        origin="https://a.example.com",
+    )
+    previous_delay = throttle_._adaptive_delay["example.com"]
+    throttle_.observe(
+        "a.example.com",
+        latency_seconds=0.1,
+        status=200,
+        category=OK,
+        registrable_domain="example.com",
+        origin="https://a.example.com",
+    )
+    throttle_.observe(
+        "other.example",
+        latency_seconds=0.1,
+        status=200,
+        category=OK,
+        registrable_domain="other.example",
+        origin="https://other.example",
+    )
+
+    assert throttle_._adaptive_delay["example.com"] < previous_delay
+    assert throttle_._adaptive_delay["other.example"] == 1.0
+
+
+def test_domain_throttle_increases_after_repeated_slow_successes() -> None:
+    throttle_ = DomainThrottle(1.0, clock=lambda: 10.0)
+
+    for _ in range(2):
+        throttle_.observe(
+            "slow.example",
+            latency_seconds=3.0,
+            status=200,
+            category=OK,
+            registrable_domain="slow.example",
+        )
+
+    assert throttle_._adaptive_delay["slow.example"] == 1.25
 
 
 async def test_fetch_returns_a_successful_bounded_response() -> None:
@@ -318,6 +451,77 @@ async def test_fetch_follows_and_revalidates_redirects() -> None:
     ]
 
 
+async def test_cross_domain_redirect_checks_robots_before_each_hop() -> None:
+    session = FakeSession(
+        [
+            html_response(status=302, headers={"Location": "https://other.example/page"}),
+            html_response(status=302, headers={"Location": "https://third.example/final"}),
+            html_response(body=b"final"),
+        ]
+    )
+    checked: list[str] = []
+
+    async def redirect_policy(url: str):
+        checked.append(url)
+        return None
+
+    result = await fetch(
+        make_client(session),
+        "https://example.com/start",
+        redirect_policy=redirect_policy,
+    )
+
+    assert result.category == OK
+    assert result.final_url == "https://third.example/final"
+    assert checked == ["https://other.example/page", "https://third.example/final"]
+
+
+async def test_disallowed_redirect_destination_is_not_requested() -> None:
+    session = FakeSession(
+        [html_response(status=302, headers={"Location": "https://other.example/private"})]
+    )
+
+    async def redirect_policy(_url: str):
+        return RedirectPolicyResult(False, reason="robots_disallowed")
+
+    result = await fetch(
+        make_client(session),
+        "https://example.com/start",
+        redirect_policy=redirect_policy,
+    )
+
+    assert result.category == ROBOTS_DISALLOWED
+    assert result.error == "robots_disallowed"
+    assert len(session.calls) == 1
+
+
+async def test_redirect_uses_destination_crawl_delay() -> None:
+    session = FakeSession(
+        [
+            html_response(status=302, headers={"Location": "https://other.example/page"}),
+            html_response(body=b"final"),
+        ]
+    )
+    waits: list[tuple[str, float | None]] = []
+
+    class RecordingThrottle:
+        async def wait(self, host: str, *, delay_seconds: float | None = None, **_kwargs: object):
+            waits.append((host, delay_seconds))
+
+    async def redirect_policy(_url: str):
+        return RedirectPolicyResult(True, crawl_delay=7.0)
+
+    result = await fetch(
+        make_client(session),
+        "https://example.com/start",
+        throttle=RecordingThrottle(),
+        redirect_policy=redirect_policy,
+    )
+
+    assert result.category == OK
+    assert waits == [("example.com", None), ("other.example", 7.0)]
+
+
 async def test_fetch_rejects_a_redirect_to_a_private_destination() -> None:
     session = FakeSession([html_response(status=302, headers={"Location": "http://127.0.0.1/"})])
     result = await fetch(make_client(session))
@@ -408,5 +612,5 @@ def test_retry_delay_uses_exponential_backoff_and_respects_server_delay() -> Non
     assert retry_delay_seconds(1, jitter=jitter) == pytest.approx(0.625)
     assert retry_delay_seconds(2, jitter=jitter) == pytest.approx(1.125)
     assert retry_delay_seconds(20, jitter=jitter) == pytest.approx(8.125)
-    assert retry_delay_seconds(1, retry_after=100.0) == 30.0
+    assert retry_delay_seconds(1, retry_after=100.0) == 100.0
     assert retry_delay_seconds(1, retry_after=-5.0) == 0.0

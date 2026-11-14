@@ -245,9 +245,9 @@ Command registration behavior:
 1. Create a Supabase project.
 2. Set `SUPABASE_URL` to the project API URL.
 3. Set `SUPABASE_SERVICE_ROLE_KEY` to the server-side service-role key. This key bypasses Row Level Security and must never be exposed to browsers, clients, logs, or source control.
-4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If the project is already at migration 007, apply `008_global_digest_budget.sql` through `012_bing_search_provider.sql` before deploying this version. Migration 008 adds cycle and reservation columns, preserves historical publication rows, backfills one canonical digest record per media item, and creates the database-side atomic reservation function and indexes. Migration 009 adds expiring, token-fenced delivery claims and persisted retry scheduling. Migration 010 adds terminal exhaustion, safe rollover for active never-attempted reservations, and active-claim-aware retry selection. Migration 011 validates the supplied cycle against PostgreSQL's Asia/Kolkata clock and adds claim-fenced destination updates. Migration 012 replaces the retired search-provider state with Bing public-HTML state and preserves discovery/job history. These migrations preserve publication and media history.
+4. Apply the checked-in migrations in numeric order. The recommended local workflow is to open the Supabase Dashboard SQL Editor, review each file under `migrations/`, and run them once in order. If the project is already at migration 007, apply `008_global_digest_budget.sql` through `012_bing_search_provider.sql` before deploying this version. Migration 008 adds cycle and reservation columns, preserves historical publication rows, backfills one canonical digest record per media item, and creates the database-side atomic reservation function and indexes. Migration 009 adds expiring, token-fenced delivery claims and persisted retry scheduling. Migration 010 adds terminal exhaustion, safe rollover for active never-attempted reservations, and active-claim-aware retry selection. Migration 011 validates the supplied cycle against PostgreSQL's Asia/Kolkata clock and adds claim-fenced destination updates. Migration 012 replaces the retired search-provider state with Bing public-HTML state and preserves discovery/job history. Migrations 013 through 015 add the domain-aware crawl frontier, accurate frontier status RPC, and the batched `record_discovery_edges` RPC; none of these rewrite discovery or edge history. These migrations preserve publication and media history.
 
-The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. Migration 006 extends the existing `job_runs` and `runtime_state` tables in place. Migration 007 extends `discoveries` and `runtime_state` in place. Migration 012 extends `runtime_state`, updates the discovery source constraint, and updates the job-type constraint without rewriting historical job rows. The migrations do not delete data or store media binaries in PostgreSQL.
+The migrations create `discoveries`, `discovery_edges`, `media_items`, `media_sources`, `publications`, `job_runs`, `runtime_state`, and `digest_state`. Migration 006 extends the existing `job_runs` and `runtime_state` tables in place. Migration 007 extends `discoveries` and `runtime_state` in place. Migration 012 extends `runtime_state`, updates the discovery source constraint, and updates the job-type constraint without rewriting historical job rows. Migrations 013 and 014 extend the discovery frontier and its status reporting in place. Migration 015 adds the `record_discovery_edges(jsonb)` function and grants it only to `service_role`; it does not add indexes or change existing edge rows. The migrations do not delete data or store media binaries in PostgreSQL.
 
 Verify the tables after applying:
 
@@ -442,16 +442,20 @@ When `REDDIT_SEED_DISCOVERY_ENABLED=true` (the default), each collected submissi
 
 #### Persistent queue and discovery path
 
-Bing search results and external links from Reddit submission destinations or self-text independently supply initial discovery URLs. Both sources insert root records into the existing Supabase `discoveries` infrastructure; the existing crawler processes eligible records, discovers child links recursively, and sends eligible pages through the existing media classification and archive pipeline. Manual public-URL saves use this same infrastructure. There is no second queue, crawler, or scheduler.
+Bing search results and external links from Reddit submission destinations or self-text independently supply initial discovery URLs. Both sources insert root records into the existing Supabase `discoveries` infrastructure; the existing crawler processes eligible records, discovers child links recursively across registrable domains, and sends pages through the existing media classification and archive pipeline. Manual public-URL saves use this same infrastructure. There is no second queue, crawler, or scheduler.
 
 A queue row moves through statuses such as `queued`, `processing`, `verified`, `dumpster`, `rejected`, `blocked`, `failed`, and `oversize`.
 
 - `next_attempt_at` provides durable retry scheduling. HTTP `429` honors `Retry-After` when present and otherwise schedules a later attempt; interrupted or paused work is returned to `queued`.
-- Each crawl pass claims at most `CRAWL_BATCH_SIZE` (default `25`) due rows and atomically moves them to `processing`. A single in-process lock prevents overlapping crawl runs.
+- Each crawl pass uses the PostgreSQL `claim_crawl_discoveries` RPC to atomically claim at most `CRAWL_BATCH_SIZE` (default `25`) due rows. Claims rotate through registrable domains, apply a per-domain row cap, and reserve most of each batch for domains that have not yet been crawled. A single in-process lock prevents overlapping crawl runs.
 - On startup, job rows left in `running` are marked interrupted and `processing` discoveries are returned to `queued`, so a restart does not strand work.
 - `discovery_edges` records parent/child relationships, the discovered-from URL, and depth. Descendants keep the originating `source_type`; crawler-link evidence is retained in metadata and the edge record.
-- Only `verified` and `dumpster` pages propagate child links. `rejected`, `blocked`, `failed`, and `oversize` pages do not.
+- Discoveries and edges from each page are written in bounded batches. Discovery inserts use one atomic upsert per chunk (`on_conflict=normalized_url`, duplicates ignored) plus one bulk ID lookup only for URLs that already existed. Edges use one `record_discovery_edges` RPC per chunk with `on conflict do nothing`; the RPC returns existing matching rows so provenance and IDs remain available. Batch failures fall back to the existing single-record methods per item, so one rejected payload does not discard the rest of the page's discoveries.
+- Collection state is cached in process for `RUNTIME_STATE_CACHE_TTL_SECONDS` (default `3`). `/start` and `/stop` invalidate and refresh that cache after a successful write. Another process can observe an external change after at most the TTL, while persisted `runtime_state` remains authoritative across restarts.
+- Successfully fetched HTML can propagate links regardless of its media classification. Strong artist, portfolio, gallery, creator, character, and franchise signals can expand a weak page; generic navigation alone cannot. Pages that cannot be inspected because of robots, access restrictions, transport failures, unsupported content, or size limits have no extracted links to propagate.
 - Each crawler job applies `MAX_URLS_PER_JOB` to child-link admissions and does not process rows deeper than `MAX_CRAWL_DEPTH`.
+- Hostnames are grouped by an offline Public Suffix List snapshot, including private suffixes such as `github.io`, so subdomains share crawl budgets and scheduler fairness. The persistent `crawl_domain_state` table tracks domain exploration and health; origin-scoped robots policies and cooldowns survive restarts.
+- HTML anchors, areas, selected link relations, HTTP `Link` headers, and bounded same-host sitemap entries can seed descendants. Link scoring rejects login, account, search, calendar, and repetitive path traps. Direct media links continue through media-specific workflows.
 
 Verified pages with original media are archived through the existing Phase 2 media pipeline with publication disabled. They become normal archived assets but are not posted to Discord automatically. A verified page that exposes only previews, or no original media, is moved to The Dumpster with a review reason. Direct media links discovered as children are skipped by the crawler; acquisition uses the media pipeline and its safe media fetcher.
 
@@ -462,7 +466,9 @@ The defaults are hard maximums enforced by configuration validation; malformed v
 | Limit | Default and maximum | Setting |
 |---|---|---|
 | URL admission budget per applicable run or job | `300` | `MAX_URLS_PER_JOB` |
-| Pages per domain per job | `20` | `MAX_PAGES_PER_DOMAIN` |
+| Requests per registrable domain per job, including robots and sitemaps | `20` | `MAX_PAGES_PER_DOMAIN` |
+| Rows claimed per registrable domain per pass | `2` | `CRAWL_DOMAIN_BATCH_LIMIT` |
+| Batch share reserved for unexplored domains | `80%` | `CRAWL_NEW_DOMAIN_SHARE` |
 | Globally concurrent requests | `5` | `MAX_CONCURRENT_REQUESTS` |
 | Minimum delay per domain | `2` seconds (configurable up to `60`) | `PER_DOMAIN_DELAY_SECONDS` |
 | Page body ceiling | `5,000,000` bytes | `MAX_PAGE_BYTES` |
@@ -475,7 +481,7 @@ The defaults are hard maximums enforced by configuration validation; malformed v
 
 `MAX_URLS_PER_JOB` is an independent admission budget for each applicable run or job, not a single global limit. Bing discovery has its own budget, Reddit collection has its own budget for newly created seed records, and each crawler job has its own budget for child-link admissions. For example, a value of `300` does not cap all Bing, Reddit, and crawler admissions combined at 300.
 
-The concurrency limit is global to the crawler instance, not per domain. No two requests to the same domain begin less than the configured delay apart, and a parsed `robots.txt` `Crawl-delay` can increase that spacing. Waits are coordinated through shared throttling rather than scattered fixed sleeps.
+The concurrency limit is global to the crawler instance, not per domain. No two requests to the same registrable domain begin less than the configured delay apart, and a parsed `robots.txt` `Crawl-delay` can increase that spacing. Waits are coordinated through shared throttling rather than scattered fixed sleeps.
 
 #### URL normalization and SSRF protection
 
@@ -491,7 +497,7 @@ These checks are transport-level protections, not a substitute for site terms or
 
 #### robots.txt policy
 
-The crawler fetches and caches `robots.txt` once per origin for each crawl job. A `2xx` response is parsed and its rules and `Crawl-delay` are honored. `404` and `410` are treated as no restrictions, following the unavailable policy in RFC 9309. A `401`, `403`, `429`, `5xx`, network failure, timeout, or unreadable policy marks that origin unavailable for the rest of the job; this is deliberately stricter than the RFC so an unreadable policy cannot be used to ignore a restriction. A disallowed URL is recorded as `blocked` with `robots_disallowed` and is not retried during that job.
+The crawler caches `robots.txt` decisions per origin in memory for each job and persists them with bounded expiry. A `2xx` response is parsed and its rules and `Crawl-delay` are honored. `404` and `410` are treated as no restrictions, following the unavailable policy in RFC 9309. A `401`, `403`, `429`, `5xx`, network failure, timeout, or unreadable policy marks that origin unavailable; this is deliberately stricter than the RFC so an unreadable policy cannot be used to ignore a restriction. Every redirect destination is checked against that origin's robots policy before the next page request. A disallowed URL is recorded as `blocked` with `robots_disallowed` and is not retried during that job.
 
 #### HTTP status, redirect, and retry behavior
 
@@ -500,6 +506,7 @@ The crawler fetches and caches `robots.txt` once per origin for each crawl job. 
 - `429` pauses the domain, records `retry_not_before`, and returns the row to `queued` for a durable retry instead of hammering the site.
 - Other permanent `4xx` responses, unsupported content types, invalid redirects, and too many redirects are recorded as rejected or failed without endless retries.
 - `5xx`, network errors, and timeouts are retried up to three times with bounded exponential backoff and jitter (maximum 30 seconds per delay). Exhausted attempts mark the row `failed`.
+- `Retry-After` is stored as a durable due time without shortening the site's requested delay. Domain cooldowns also pause other queued URLs for that registrable domain.
 - A detected challenge page marks the row `blocked`; for Bing it also triggers the persistent adapter pause described above.
 
 #### Classification outcomes and The Dumpster
@@ -686,10 +693,15 @@ The implemented settings are:
 | `CRAWL_READ_TIMEOUT_SECONDS` | Read timeout in seconds (maximum `20`) | `20` |
 | `CRAWL_MAX_ATTEMPTS` | Transient request attempts (`1`-`3`) | `3` |
 | `CRAWL_BATCH_SIZE` | Due queue rows claimed per crawl pass | `25` |
+| `CRAWL_DOMAIN_BATCH_LIMIT` | Due rows claimed per registrable domain (`1`-`10`) | `2` |
+| `CRAWL_NEW_DOMAIN_SHARE` | Batch share for unexplored domains (`0.5`-`0.95`) | `0.8` |
+| `DISCOVERY_BATCH_SIZE` | Discovery rows per atomic upsert chunk (`1`-`200`) | `25` |
+| `DISCOVERY_EDGE_BATCH_SIZE` | Edge rows per RPC chunk (`1`-`200`) | `50` |
+| `RUNTIME_STATE_CACHE_TTL_SECONDS` | In-process collection-state cache lifetime (`0.5`-`10`) | `3` |
 
 `REDDIT_SEARCH_PHRASES` and `BING_SEARCH_PHRASES` are pipe-separated optional settings; both default to `Tifa Lockhart`, `Tifa Lockhart fanart`, `Tifa cosplay`, `Tifa Lockhart cosplay`, and `Tifa Lockhart NSFW`, but are configured independently. `/start` persists desired state, while collection also requires both Reddit gates and credentials. Applying migration 006 is required for Phase 4 runtime controls and run counters. Automated collection stores assets without publishing; `/save` publishes immediately and `/random` delivers one verified archived file.
 
-The Bing phrase list is independent of the Reddit list. Both Bing gates are required in addition to enabled collection and Supabase availability. The crawler settings are enforced as hard upper bounds: configuration that exceeds them fails startup rather than silently relaxing SSRF, concurrency, depth, redirect, or size limits. Applying migration `012` is required for durable queue retry scheduling, Bing search-state columns, and the provider-neutral legacy source type. Automated crawler acquisitions are archived without immediate Discord publication; `/save` with a public URL applies the same safe fetch and publishes immediately.
+The Bing phrase list is independent of the Reddit list. Both Bing gates are required in addition to enabled collection and Supabase availability. The crawler settings are enforced as hard upper bounds: configuration that exceeds them fails startup rather than silently relaxing SSRF, concurrency, depth, redirect, or size limits. Apply migration `012` for durable queue retry scheduling, Bing search-state columns, and the provider-neutral legacy source type. Apply `013_domain_aware_crawl_frontier.sql`, `014_accurate_frontier_status.sql`, and `015_batch_record_discovery_edges.sql` before deploying this crawler version; they add the domain-aware claim RPC, persistent domain and robots state, crawl counters, status counts aligned with queue claim eligibility, and the service-role-only batch edge RPC. Startup then backfills Public Suffix List identities for existing discoveries in pages of 500. A 24-hour post-deployment comparison of `GET /discoveries`, `POST /discoveries`, `GET /discovery_edges`, `POST /discovery_edges`, and `GET /runtime_state` is the appropriate way to measure the traffic reduction. Automated crawler acquisitions are archived without immediate Discord publication; `/save` with a public URL applies the same safe fetch and publishes immediately.
 
 The Phase 6 digest needs all four `DISCORD_CATEGORY_CHANNELS_JSON` destinations and migration 008. The bounded retry limit is three total attempts per canonical media item. The digest job remains scheduled at 04:00 `Asia/Kolkata` and does not derive its schedule from `TIMEZONE`.
 
@@ -722,7 +734,7 @@ The Phase 6 digest needs all four `DISCORD_CATEGORY_CHANNELS_JSON` destinations 
 - **Phase 2 run reports `publication_record_failed_recoverable`** - apply migration `004`; the `test_discovery` publication purpose must be allowed by the database constraint.
 - **Bing job is skipped or `/status` says access is not approved** - set `BING_HTML_ENABLED=true` and `BING_HTML_ACCESS_APPROVED=true` only after reviewing the current Bing terms, `robots.txt`, and applicable law. The scheduled job also requires collection to be enabled with `/start`.
 - **Bing is persistently paused** - `/status` shows the stored reason. Read it before doing anything else. If it is a challenge or access restriction, leave the adapter paused; do not attempt to defeat the control. Resume only after an owner review confirms access is permitted, using the operator process in the Phase 5 section.
-- **Queue rows are not progressing** - confirm `/start` is active, Supabase is configured and reachable, migration `012` is applied, and a crawl run is not already holding the in-process lock. Rows with a future `next_attempt_at` are intentionally waiting for a retry.
+- **Queue rows are not progressing** - confirm `/start` is active, Supabase is configured and reachable, migrations `012` through `015` are applied, and a crawl run is not already holding the in-process lock. Rows with a future `next_attempt_at` are intentionally waiting for a retry.
 - **Crawler row is `blocked` with `robots_disallowed`** - the site's `robots.txt` does not permit that URL for the crawler identity. Leave it blocked; do not override robots policy.
 - **Crawler row is `failed` with `http_429_rate_limited`** - the row is requeued with `retry_not_before`. Reduce search scope or wait; the crawler already honors `Retry-After` and pauses the domain.
 - **`/save` returns `invalid_url:<reason>`** - the public URL failed normalization, DNS validation, or the public-address check. `blocked_destination`, `dns_error`, and `credentials_in_url` are deliberate rejections; do not try to bypass them.

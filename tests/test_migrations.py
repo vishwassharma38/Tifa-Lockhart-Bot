@@ -15,6 +15,8 @@ REQUIRED_TABLES = {
     "job_runs",
     "runtime_state",
     "digest_state",
+    "crawl_domain_state",
+    "crawl_origin_state",
 }
 
 
@@ -256,6 +258,93 @@ def test_phase5_migration_adds_durable_discovery_controls() -> None:
     assert "create table" not in lowered
     assert "drop table" not in lowered
     assert "drop column" not in lowered
+    assert "delete from" not in lowered
+    assert "truncate" not in lowered
+
+
+def test_domain_frontier_migration_is_additive_fair_and_atomic() -> None:
+    sql = read_migration("013_domain_aware_crawl_frontier.sql").lower()
+
+    for column in (
+        "hostname",
+        "registrable_domain",
+        "crawl_priority",
+        "claimed_at",
+    ):
+        assert f"add column if not exists {column}" in sql
+    assert "claim_crawl_discoveries" in sql
+    assert "p_new_domain_share numeric default 0.8" in sql
+    assert "row_number() over" in sql
+    assert "partition by coalesce(nullif(d.registrable_domain" in sql
+    assert "cold_domain_rank" in sql
+    assert "domain_round <= greatest(1, least(p_per_domain_limit, 10))" in sql
+    assert "for update of d skip locked" in sql
+    assert re.search(
+        r"limit greatest\(0, least\(p_limit, 300\)\)\s+for update of d skip locked", sql
+    )
+    assert "set status = 'processing'" in sql
+    assert "last_claimed_at = pg_catalog.now()" in sql
+    assert "recover_expired_crawl_claims" in sql
+    assert "backfill_crawl_domain_identities" in sql
+    assert "crawl_origin_state" in sql
+    assert "robots_expires_at" in sql
+    assert "next_eligible_at" in sql
+    assert "create index if not exists idx_discoveries_frontier_round" in sql
+    assert "create index if not exists idx_discoveries_frontier_due" in sql
+    assert "alter table public.crawl_domain_state enable row level security" in sql
+    assert "alter table public.crawl_origin_state enable row level security" in sql
+    assert "grant execute on function public.claim_crawl_discoveries" in sql
+    assert "source_type_check" not in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+    assert "truncate" not in sql
+    assert "on delete cascade" not in sql
+
+
+def test_frontier_status_migration_counts_actual_claim_eligibility() -> None:
+    sql = read_migration("014_accurate_frontier_status.sql").lower()
+
+    assert "drop function if exists public.crawl_frontier_summary()" in sql
+    assert "p_max_depth integer default 6" in sql
+    assert "d.depth <= greatest(0, least(p_max_depth, 6))" in sql
+    assert "d.next_attempt_at <= pg_catalog.now()" in sql
+    assert "ds.next_eligible_at <= pg_catalog.now()" in sql
+    assert "d.next_attempt_at > pg_catalog.now()" in sql
+    assert "ds.next_eligible_at > pg_catalog.now()" in sql
+
+
+def test_batch_edge_rpc_migration_is_atomic_and_service_role_only() -> None:
+    sql = read_migration("015_batch_record_discovery_edges.sql")
+    lowered = sql.lower()
+
+    assert "create or replace function public.record_discovery_edges(p_edges jsonb)" in lowered
+    assert "returns jsonb" in lowered
+    assert "language plpgsql" in lowered
+    assert "security invoker" in lowered
+    assert "set search_path = ''" in lowered
+    assert "on conflict do nothing" in lowered
+    assert "returning * into v_row" in lowered
+    assert "uq_discovery_edges_parent_child" in lowered
+    assert "uq_discovery_edges_root_child" in lowered
+    assert "pg_catalog.jsonb_array_elements" in lowered
+    assert "pg_catalog.jsonb_typeof(p_edges) <> 'array'" in lowered
+    assert "v_input_count > 200" in lowered
+    assert "'inserted_count'" in lowered
+    assert "'edges'" in lowered
+    assert "nullif(v_edge ->> 'child_normalized_url', '')" in lowered
+    assert "nullif(v_edge ->> 'discovered_from_url', '')" in lowered
+    assert "e.child_normalized_url = v_child_normalized_url" in lowered
+    assert "e.parent_discovery_id is null" in lowered
+    assert "e.parent_discovery_id = v_parent_discovery_id" in lowered
+    assert "revoke all on function public.record_discovery_edges(jsonb)" in lowered
+    assert "from public, anon, authenticated" in lowered
+    assert "grant execute on function public.record_discovery_edges(jsonb) to service_role" in (
+        lowered
+    )
+    assert "grant select, insert on table public.discovery_edges to service_role" in lowered
+    assert "create index" not in lowered
+    assert "security definer" not in lowered
+    assert "drop table" not in lowered
     assert "delete from" not in lowered
     assert "truncate" not in lowered
 

@@ -5,7 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import threading
+import time
+from collections import Counter
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar, Token
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -13,6 +17,7 @@ from urllib.parse import urlparse
 import httpx
 
 from app.db.client import SupabaseDatabase
+from app.discovery.domains import domain_identity, identity_from_row
 from app.reddit.models import RedditCandidate
 
 log = logging.getLogger(__name__)
@@ -27,6 +32,13 @@ _TRANSIENT_DB_EXCEPTIONS = (
     httpx.ReadError,
     httpx.ReadTimeout,
 )
+
+_DEFAULT_DISCOVERY_BATCH_SIZE = 25
+_DEFAULT_DISCOVERY_EDGE_BATCH_SIZE = 50
+_DEFAULT_RUNTIME_STATE_CACHE_TTL_SECONDS = 3.0
+_MAX_BATCH_SIZE = 200
+_MAX_RUNTIME_STATE_CACHE_TTL_SECONDS = 60.0
+_DISCOVERY_EDGE_RPC = "record_discovery_edges"
 
 _JOB_TYPES = ("reddit_collection", "bing_discovery", "crawl", "daily_digest")
 _DIGEST_STATE_FIELDS = frozenset(
@@ -56,12 +68,32 @@ _DISCOVERY_UPDATE_FIELDS = frozenset(
         "creator_name",
         "creator_profile_url",
         "domain",
+        "hostname",
+        "registrable_domain",
+        "crawl_priority",
+        "claimed_at",
     }
 )
 
 
 class RepositoryError(RuntimeError):
     """Raised when a repository operation cannot be completed."""
+
+
+class DiscoveryEdgePersistenceError(RepositoryError):
+    """An edge batch failed after the given number of relationships were confirmed."""
+
+    def __init__(
+        self, confirmed_count: int, failed_count: int, cause: Exception | None = None
+    ) -> None:
+        self.confirmed_count = confirmed_count
+        self.failed_count = failed_count
+        cause_detail = f" ({type(cause).__name__}: {cause})" if cause is not None else ""
+        super().__init__(
+            "record_discovery_edges failed after confirming "
+            f"{confirmed_count} relationship(s); {failed_count} remain unconfirmed"
+            f"{cause_detail}"
+        )
 
 
 def _operation_name(function: Callable[..., Any]) -> str:
@@ -92,11 +124,59 @@ class MediaRepository:
         to_thread: Callable[..., Awaitable[Any]] = asyncio.to_thread,
         retry_sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         jitter: Callable[[float, float], float] = random.uniform,
+        discovery_batch_size: int = _DEFAULT_DISCOVERY_BATCH_SIZE,
+        discovery_edge_batch_size: int = _DEFAULT_DISCOVERY_EDGE_BATCH_SIZE,
+        runtime_state_cache_ttl_seconds: float = _DEFAULT_RUNTIME_STATE_CACHE_TTL_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._database = database
         self._to_thread = to_thread
         self._retry_sleep = retry_sleep
         self._jitter = jitter
+        self._discovery_batch_size = max(1, min(_MAX_BATCH_SIZE, int(discovery_batch_size)))
+        self._discovery_edge_batch_size = max(
+            1, min(_MAX_BATCH_SIZE, int(discovery_edge_batch_size))
+        )
+        self._runtime_state_cache_ttl_seconds = max(
+            0.0, min(_MAX_RUNTIME_STATE_CACHE_TTL_SECONDS, float(runtime_state_cache_ttl_seconds))
+        )
+        self._monotonic = monotonic
+        self._runtime_state_cache: dict[str, Any] | None = None
+        self._runtime_state_cache_expires_at = 0.0
+        self._runtime_state_generation = 0
+        self._metrics: Counter[str] = Counter()
+        self._metrics_lock = threading.Lock()
+        self._scoped_metrics: ContextVar[Counter[str] | None] = ContextVar(
+            f"repository_metrics_{id(self)}", default=None
+        )
+
+    def _bump_metrics(self, **increments: int) -> None:
+        with self._metrics_lock:
+            for name, value in increments.items():
+                if value:
+                    self._metrics[name] += value
+                    scoped_metrics = self._scoped_metrics.get()
+                    if scoped_metrics is not None:
+                        scoped_metrics[name] += value
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        """Return a copy of lightweight database-operation counters."""
+        with self._metrics_lock:
+            return dict(self._metrics)
+
+    def begin_metrics_scope(self) -> Token[Counter[str] | None]:
+        """Attribute repository operations in this async context to one job."""
+        return self._scoped_metrics.set(Counter())
+
+    def end_metrics_scope(self, token: Token[Counter[str] | None]) -> None:
+        """Restore the prior metric scope after a job finishes."""
+        self._scoped_metrics.reset(token)
+
+    def scoped_metrics_snapshot(self) -> dict[str, int]:
+        """Return counters attributed to the current job scope."""
+        with self._metrics_lock:
+            metrics = self._scoped_metrics.get()
+            return dict(metrics) if metrics is not None else {}
 
     async def _run(self, function: Callable[..., Any], *args: Any, retry: bool = False) -> Any:
         """Dispatch one database operation under the shared concurrency limit.
@@ -158,7 +238,39 @@ class MediaRepository:
             raise RepositoryError(f"Supabase client unavailable ({type(exc).__name__})") from None
 
     async def get_runtime_state(self) -> dict[str, Any]:
-        return await self._run(self._runtime_state_sync, retry=True)
+        cached = self._cached_runtime_state()
+        if cached is not None:
+            self._bump_metrics(runtime_state_cache_hits=1)
+            return dict(cached)
+
+        self._bump_metrics(runtime_state_cache_misses=1, runtime_state_reads=1)
+        generation = self._runtime_state_generation
+        state = await self._run(self._runtime_state_sync, retry=True)
+        snapshot = dict(state)
+        # Do not let a read that raced with a local /start or /stop overwrite
+        # the fresher state persisted by that command.
+        if generation == self._runtime_state_generation:
+            self._cache_runtime_state(snapshot)
+        return dict(snapshot)
+
+    def _cached_runtime_state(self) -> dict[str, Any] | None:
+        if self._runtime_state_cache is None:
+            return None
+        if self._monotonic() >= self._runtime_state_cache_expires_at:
+            return None
+        return self._runtime_state_cache
+
+    def _cache_runtime_state(self, state: dict[str, Any]) -> None:
+        self._runtime_state_cache = dict(state)
+        self._runtime_state_cache_expires_at = (
+            self._monotonic() + self._runtime_state_cache_ttl_seconds
+        )
+
+    def _invalidate_runtime_state_cache(self) -> None:
+        self._runtime_state_cache = None
+        self._runtime_state_cache_expires_at = 0.0
+        self._runtime_state_generation += 1
+        self._bump_metrics(runtime_state_cache_invalidations=1)
 
     def _runtime_state_sync(self) -> dict[str, Any]:
         rows = self._rows(
@@ -167,7 +279,14 @@ class MediaRepository:
         return rows[0] if rows else {"id": 1, "collection_enabled": False}
 
     async def set_collection_enabled(self, enabled: bool) -> dict[str, Any]:
-        return await self._run(self._set_collection_enabled_sync, enabled, retry=True)
+        state = await self._run(self._set_collection_enabled_sync, enabled, retry=True)
+        # The write already returned the persisted row. Invalidate any older
+        # snapshot and seed the cache immediately so the next crawler check
+        # observes the owner's command without another database read.
+        self._invalidate_runtime_state_cache()
+        self._bump_metrics(runtime_state_cache_refreshes=1)
+        self._cache_runtime_state(state)
+        return dict(state)
 
     def _set_collection_enabled_sync(self, enabled: bool) -> dict[str, Any]:
         rows = self._rows(
@@ -246,20 +365,69 @@ class MediaRepository:
         return await self._run(self._recover_processing_discoveries_sync, retry=True)
 
     def _recover_processing_discoveries_sync(self) -> int:
-        client = self._client()
-        rows = self._rows(
-            client.table("discoveries").select("id").eq("status", "processing").execute()
+        result = (
+            self._client().rpc("recover_expired_crawl_claims", {"p_lease_seconds": 900}).execute()
         )
-        now = datetime.now(tz=UTC).isoformat()
-        for row in rows:
-            client.table("discoveries").update(
-                {
-                    "status": "queued",
-                    "last_error": "interrupted_by_restart",
-                    "next_attempt_at": now,
-                }
-            ).eq("id", row["id"]).execute()
-        return len(rows)
+        data = getattr(result, "data", None)
+        if isinstance(data, int):
+            return data
+        if isinstance(data, dict):
+            return int(data.get("recovered_count") or 0)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return int(data[0].get("recovered_count") or 0)
+        return 0
+
+    async def backfill_frontier_domains(self, *, batch_size: int = 500) -> int:
+        """Backfill PSL identities for legacy queued and processing discoveries."""
+        return await self._run(self._backfill_frontier_domains_sync, batch_size, retry=True)
+
+    def _backfill_frontier_domains_sync(self, batch_size: int) -> int:
+        client = self._client()
+        size = max(1, min(1000, batch_size))
+        updated = 0
+        while True:
+            rows = self._rows(
+                client.table("discoveries")
+                .select("id,normalized_url,domain,discovered_at,status,fetched_at")
+                .is_("registrable_domain", "null")
+                .range(0, size - 1)
+                .execute()
+            )
+            if not rows:
+                break
+            identities = []
+            for row in rows:
+                raw_url = row.get("normalized_url") or row.get("url")
+                try:
+                    if not isinstance(raw_url, str):
+                        raise ValueError("discovery URL missing")
+                    identity = domain_identity(raw_url)
+                except ValueError:
+                    identity = identity_from_row(row)
+                if identity.hostname == "unknown":
+                    continue
+                identities.append(
+                    {
+                        "id": row.get("id"),
+                        "hostname": identity.hostname,
+                        "registrable_domain": identity.registrable_domain,
+                    }
+                )
+            if not identities:
+                break
+            result = client.rpc(
+                "backfill_crawl_domain_identities", {"p_items": identities}
+            ).execute()
+            data = getattr(result, "data", None)
+            if isinstance(data, int):
+                updated += data
+            elif isinstance(data, dict):
+                updated += int(data.get("updated_count") or len(identities))
+            else:
+                updated += len(identities)
+            if len(rows) < size:
+                break
+        return updated
 
     async def latest_jobs(self, job_type: str, limit: int = 1) -> list[dict[str, Any]]:
         return await self._run(self._latest_jobs_sync, job_type, limit, retry=True)
@@ -316,8 +484,120 @@ class MediaRepository:
             "bing_pause_reason": state.get("bing_pause_reason"),
         }
 
+    async def crawl_frontier_summary(self, *, max_depth: int = 6) -> dict[str, int]:
+        return await self._run(self._crawl_frontier_summary_sync, max_depth, retry=True)
+
+    def _crawl_frontier_summary_sync(self, max_depth: int) -> dict[str, int]:
+        response = (
+            self._client()
+            .rpc("crawl_frontier_summary", {"p_max_depth": max(0, min(6, int(max_depth)))})
+            .execute()
+        )
+        data = getattr(response, "data", None)
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            data = data[0]
+        if not isinstance(data, dict):
+            return {}
+        return {key: int(value or 0) for key, value in data.items()}
+
+    async def get_robots_policy(self, origin: str) -> dict[str, Any] | None:
+        return await self._run(self._get_robots_policy_sync, origin, retry=True)
+
+    def _get_robots_policy_sync(self, origin: str) -> dict[str, Any] | None:
+        rows = self._rows(
+            self._client()
+            .table("crawl_origin_state")
+            .select("robots_body,robots_status,robots_category,robots_expires_at")
+            .eq("origin", origin)
+            .limit(1)
+            .execute()
+        )
+        return rows[0] if rows else None
+
+    async def store_robots_policy(
+        self, origin: str, hostname: str, registrable_domain: str, policy: dict[str, Any]
+    ) -> None:
+        await self._run(
+            self._store_robots_policy_sync,
+            origin,
+            hostname,
+            registrable_domain,
+            dict(policy),
+            retry=True,
+        )
+
+    def _store_robots_policy_sync(
+        self, origin: str, hostname: str, registrable_domain: str, policy: dict[str, Any]
+    ) -> None:
+        client = self._client()
+        # Redirect targets can introduce an origin before its registrable domain
+        # has a frontier row. The origin policy table references that row, so
+        # register the minimum identity idempotently before persisting robots.
+        client.table("crawl_domain_state").upsert(
+            {
+                "registrable_domain": registrable_domain,
+                "hostnames": [hostname],
+            },
+            on_conflict="registrable_domain",
+            ignore_duplicates=True,
+        ).execute()
+        payload = {
+            "origin": origin,
+            "hostname": hostname,
+            "registrable_domain": registrable_domain,
+            **policy,
+        }
+        client.table("crawl_origin_state").upsert(payload, on_conflict="origin").execute()
+
+    async def pause_crawl_domain(self, registrable_domain: str, *, until: str, reason: str) -> None:
+        await self._run(
+            self._pause_crawl_domain_sync, registrable_domain, until, reason, retry=True
+        )
+
+    def _pause_crawl_domain_sync(self, registrable_domain: str, until: str, reason: str) -> None:
+        self._client().rpc(
+            "pause_crawl_domain",
+            {
+                "p_registrable_domain": registrable_domain,
+                "p_next_eligible_at": until,
+                "p_reason": reason[:120],
+            },
+        ).execute()
+
+    async def sitemap_scan_is_due(self, registrable_domain: str, *, max_age_days: int = 30) -> bool:
+        return await self._run(
+            self._sitemap_scan_is_due_sync, registrable_domain, max_age_days, retry=True
+        )
+
+    def _sitemap_scan_is_due_sync(self, registrable_domain: str, max_age_days: int) -> bool:
+        rows = self._rows(
+            self._client()
+            .table("crawl_domain_state")
+            .select("sitemap_checked_at")
+            .eq("registrable_domain", registrable_domain)
+            .limit(1)
+            .execute()
+        )
+        value = rows[0].get("sitemap_checked_at") if rows else None
+        if not value:
+            return True
+        try:
+            checked = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        return (datetime.now(tz=UTC) - checked).total_seconds() >= max_age_days * 86400
+
+    async def mark_sitemap_scan(self, registrable_domain: str) -> None:
+        await self._run(self._mark_sitemap_scan_sync, registrable_domain, retry=True)
+
+    def _mark_sitemap_scan_sync(self, registrable_domain: str) -> None:
+        self._client().table("crawl_domain_state").update(
+            {"sitemap_checked_at": datetime.now(tz=UTC).isoformat()}
+        ).eq("registrable_domain", registrable_domain).execute()
+
     async def mark_reddit_success(self) -> None:
         await self._run(self._mark_reddit_success_sync, retry=True)
+        self._invalidate_runtime_state_cache()
 
     def _mark_reddit_success_sync(self) -> None:
         self._client().table("runtime_state").update(
@@ -326,6 +606,7 @@ class MediaRepository:
 
     async def mark_bing_success(self) -> None:
         await self._run(self._mark_bing_success_sync, retry=True)
+        self._invalidate_runtime_state_cache()
 
     def _mark_bing_success_sync(self) -> None:
         self._client().table("runtime_state").update(
@@ -334,6 +615,7 @@ class MediaRepository:
 
     async def pause_bing(self, reason: str) -> None:
         await self._run(self._pause_bing_sync, reason, retry=True)
+        self._invalidate_runtime_state_cache()
 
     def _pause_bing_sync(self, reason: str) -> None:
         self._client().table("runtime_state").update(
@@ -351,6 +633,7 @@ class MediaRepository:
         action and never runs automatically on startup or from ``/start``.
         """
         await self._run(self._clear_bing_pause_sync, retry=True)
+        self._invalidate_runtime_state_cache()
 
     def _clear_bing_pause_sync(self) -> None:
         self._client().table("runtime_state").update(
@@ -484,42 +767,120 @@ class MediaRepository:
         provenance because the same destination may already be verified,
         rejected, or have a shallower discovery path.
         """
-        normalized_url = payload.get("normalized_url")
-        if not isinstance(normalized_url, str) or not normalized_url:
-            raise RepositoryError("Discovery payload requires normalized_url")
-        return await self._run(self._upsert_discovery_record_sync, dict(payload), retry=True)
+        results = await self.upsert_discovery_records([payload])
+        return results[0]
 
-    def _upsert_discovery_record_sync(self, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-        normalized_url = str(payload["normalized_url"])
-        existing = self._get_discovery_by_url_sync(normalized_url)
-        if existing is not None:
-            return existing, False
-        try:
-            response = self._client().table("discoveries").insert(payload).execute()
-        except Exception as exc:
-            if _is_unique_violation(exc):
-                existing = self._get_discovery_by_url_sync(normalized_url)
-                if existing is not None:
-                    return existing, False
-            raise
-        rows = self._rows(response)
-        if rows:
-            return rows[0], True
-        fallback = self._get_discovery_by_url_sync(normalized_url)
-        if fallback is not None:
-            return fallback, False
-        raise RepositoryError("Discovery insert returned no row")
+    async def upsert_discovery_records(
+        self, payloads: list[dict[str, Any]]
+    ) -> list[tuple[dict[str, Any], bool]]:
+        """Atomically upsert discoveries in bounded chunks.
 
-    def _get_discovery_by_url_sync(self, normalized_url: str) -> dict[str, Any] | None:
-        rows = self._rows(
-            self._client()
-            .table("discoveries")
-            .select("*")
-            .eq("normalized_url", normalized_url)
-            .limit(1)
+        Returns one ``(row, created)`` pair per input in input order. Duplicate
+        normalized URLs within the same call share the first occurrence's row;
+        only the first occurrence can report ``created=True``.
+        """
+        if not payloads:
+            return []
+        return await self._run(
+            self._upsert_discovery_records_sync,
+            [dict(payload) for payload in payloads],
+            retry=True,
+        )
+
+    def _upsert_discovery_records_sync(
+        self, payloads: list[dict[str, Any]]
+    ) -> list[tuple[dict[str, Any], bool]]:
+        prepared: list[tuple[str, dict[str, Any]]] = []
+        for payload in payloads:
+            enriched = self._with_domain_identity(dict(payload))
+            normalized_url = enriched.get("normalized_url")
+            if not isinstance(normalized_url, str) or not normalized_url:
+                raise RepositoryError("Discovery payload requires normalized_url")
+            prepared.append((normalized_url, enriched))
+
+        unique: dict[str, dict[str, Any]] = {}
+        for normalized_url, payload in prepared:
+            unique.setdefault(normalized_url, payload)
+
+        resolved: dict[str, dict[str, Any]] = {}
+        created_urls: set[str] = set()
+        items = list(unique.items())
+        for offset in range(0, len(items), self._discovery_batch_size):
+            chunk = items[offset : offset + self._discovery_batch_size]
+            chunk_rows, chunk_created = self._upsert_discovery_chunk_sync(chunk)
+            resolved.update(chunk_rows)
+            created_urls.update(chunk_created)
+
+        results: list[tuple[dict[str, Any], bool]] = []
+        seen: set[str] = set()
+        for normalized_url, _payload in prepared:
+            row = resolved[normalized_url]
+            created = normalized_url in created_urls and normalized_url not in seen
+            results.append((row, created))
+            seen.add(normalized_url)
+
+        self._bump_metrics(
+            discovery_batch_calls=1,
+            discovery_batch_rows=len(payloads),
+            discovery_batch_unique_rows=len(unique),
+            discovery_batch_deduped=len(payloads) - len(unique),
+            discovery_batch_created=sum(1 for _row, created in results if created),
+            discovery_batch_existing=sum(1 for _row, created in results if not created),
+        )
+        return results
+
+    def _upsert_discovery_chunk_sync(
+        self, items: list[tuple[str, dict[str, Any]]]
+    ) -> tuple[dict[str, dict[str, Any]], set[str]]:
+        client = self._client()
+        response = (
+            client.table("discoveries")
+            .upsert(
+                [payload for _normalized_url, payload in items],
+                on_conflict="normalized_url",
+                ignore_duplicates=True,
+            )
             .execute()
         )
-        return rows[0] if rows else None
+        inserted: dict[str, dict[str, Any]] = {}
+        for row in self._rows(response):
+            normalized_url = row.get("normalized_url")
+            if isinstance(normalized_url, str):
+                inserted[normalized_url] = row
+
+        # ``ignore_duplicates`` returns only newly inserted rows. Resolve every
+        # other ID with one bounded lookup for this chunk instead of one GET per
+        # URL.
+        missing = [
+            normalized_url for normalized_url, _payload in items if normalized_url not in inserted
+        ]
+        existing: dict[str, dict[str, Any]] = {}
+        if missing:
+            rows = self._rows(
+                client.table("discoveries").select("*").in_("normalized_url", missing).execute()
+            )
+            for row in rows:
+                normalized_url = row.get("normalized_url")
+                if isinstance(normalized_url, str):
+                    existing[normalized_url] = row
+
+        resolved = {**existing, **inserted}
+        unresolved = [
+            normalized_url for normalized_url, _payload in items if normalized_url not in resolved
+        ]
+        if unresolved:
+            raise RepositoryError(
+                "Discovery upsert did not resolve all normalized URLs in the batch"
+            )
+
+        self._bump_metrics(
+            discovery_batch_chunks=1,
+            discovery_upsert_rows=len(items),
+            discovery_inserted=len(inserted),
+            discovery_reused=len(existing),
+            discovery_batch_lookup_queries=1 if missing else 0,
+        )
+        return resolved, set(inserted)
 
     async def get_discovery(self, discovery_id: str) -> dict[str, Any] | None:
         return await self._run(self._get_discovery_sync, discovery_id, retry=True)
@@ -540,44 +901,66 @@ class MediaRepository:
         *,
         limit: int,
         max_depth: int,
+        per_domain_limit: int = 2,
+        new_domain_share: float = 0.8,
     ) -> list[dict[str, Any]]:
         """Atomically claim up to ``limit`` due queued discoveries."""
         # Repeating the whole select-and-claim could exceed the requested batch
         # after a partially committed attempt, so leave this operation unretried.
-        return await self._run(self._claim_discoveries_sync, limit, max_depth, retry=False)
+        return await self._run(
+            self._claim_discoveries_sync,
+            limit,
+            max_depth,
+            per_domain_limit,
+            new_domain_share,
+            retry=False,
+        )
 
-    def _claim_discoveries_sync(self, limit: int, max_depth: int) -> list[dict[str, Any]]:
+    def _claim_discoveries_sync(
+        self, limit: int, max_depth: int, per_domain_limit: int, new_domain_share: float
+    ) -> list[dict[str, Any]]:
         if limit < 1:
             return []
-        now = datetime.now(tz=UTC).isoformat()
-        rows = self._rows(
+        result = (
             self._client()
-            .table("discoveries")
-            .select("*")
-            .eq("status", "queued")
-            .lte("depth", max_depth)
-            .or_(f"next_attempt_at.is.null,next_attempt_at.lte.{now}")
-            .order("discovered_at")
-            .limit(limit)
+            .rpc(
+                "claim_crawl_discoveries",
+                {
+                    "p_limit": limit,
+                    "p_max_depth": max_depth,
+                    "p_per_domain_limit": max(1, min(10, per_domain_limit)),
+                    "p_new_domain_share": max(0.5, min(0.95, float(new_domain_share))),
+                },
+            )
             .execute()
         )
-        claimed: list[dict[str, Any]] = []
-        for row in rows:
-            discovery_id = row.get("id")
-            if discovery_id is None:
-                continue
-            response = (
-                self._client()
-                .table("discoveries")
-                .update({"status": "processing", "next_attempt_at": None})
-                .eq("id", discovery_id)
-                .eq("status", "queued")
-                .execute()
+        return self._rows(result)
+
+    @staticmethod
+    def _with_domain_identity(payload: dict[str, Any]) -> dict[str, Any]:
+        value = payload.get("normalized_url") or payload.get("url")
+        if not isinstance(value, str):
+            return payload
+        try:
+            identity = domain_identity(value)
+        except ValueError:
+            return payload
+        metadata = payload.get("metadata_json")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        try:
+            priority = int(
+                metadata.get("crawl_priority")
+                or metadata.get("admission_score")
+                or payload.get("crawl_priority")
+                or 0
             )
-            updated = self._rows(response)
-            if updated:
-                claimed.append({**row, **updated[0]})
-        return claimed
+        except (TypeError, ValueError):
+            priority = 0
+        payload["hostname"] = identity.hostname
+        payload["registrable_domain"] = identity.registrable_domain
+        payload["domain"] = payload.get("domain") or identity.hostname
+        payload["crawl_priority"] = max(0, min(100, priority))
+        return payload
 
     async def update_discovery(self, discovery_id: str, fields: dict[str, Any]) -> dict[str, Any]:
         return await self._run(self._update_discovery_sync, discovery_id, dict(fields), retry=True)
@@ -586,6 +969,8 @@ class MediaRepository:
         payload = {key: value for key, value in fields.items() if key in _DISCOVERY_UPDATE_FIELDS}
         if "status" in payload and payload["status"] not in _DISCOVERY_STATUSES:
             raise RepositoryError("Unsupported discovery status")
+        if payload.get("status") != "processing" and "status" in payload:
+            payload["claimed_at"] = None
         if not payload:
             return {"id": discovery_id}
         response = (
@@ -605,15 +990,66 @@ class MediaRepository:
         *,
         reason: str | None = None,
         next_attempt_at: str | None = None,
+        expected_claimed_at: str | None = None,
     ) -> dict[str, Any]:
-        return await self.update_discovery(
+        return await self._run(
+            self._requeue_discovery_sync,
             discovery_id,
-            {
-                "status": "queued",
-                "last_error": reason,
-                "next_attempt_at": next_attempt_at,
-            },
+            reason,
+            next_attempt_at,
+            expected_claimed_at,
+            retry=True,
         )
+
+    def _requeue_discovery_sync(
+        self,
+        discovery_id: str,
+        reason: str | None,
+        next_attempt_at: str | None,
+        expected_claimed_at: str | None,
+    ) -> dict[str, Any]:
+        client = self._client()
+        update = (
+            client.table("discoveries")
+            .update(
+                {
+                    "status": "queued",
+                    "claimed_at": None,
+                    "last_error": reason,
+                    "next_attempt_at": next_attempt_at,
+                }
+            )
+            .eq("id", discovery_id)
+            .eq("status", "processing")
+        )
+        if expected_claimed_at is not None:
+            update = update.eq("claimed_at", expected_claimed_at)
+        rows = self._rows(
+            update.select("id,status,claimed_at,last_error,next_attempt_at").execute()
+        )
+        if rows:
+            if rows[0].get("status") == "queued":
+                return rows[0]
+            raise RepositoryError(f"Requeue was not confirmed for discovery {discovery_id}")
+
+        # A transient response loss can occur after the update committed. Confirm
+        # that exact retry outcome without disturbing a newer processing claim.
+        current_rows = self._rows(
+            client.table("discoveries")
+            .select("id,status,claimed_at,last_error,next_attempt_at")
+            .eq("id", discovery_id)
+            .limit(1)
+            .execute()
+        )
+        if current_rows:
+            current = current_rows[0]
+            if (
+                current.get("status") == "queued"
+                and current.get("claimed_at") is None
+                and current.get("last_error") == reason
+            ):
+                return current
+        raise RepositoryError(f"Requeue was not confirmed for discovery {discovery_id}")
 
     async def record_discovery_edge(
         self,
@@ -623,60 +1059,198 @@ class MediaRepository:
         child_normalized_url: str,
         discovered_from_url: str,
         depth: int,
+        original_url: str | None = None,
+        link_text: str | None = None,
+        source_domain: str | None = None,
+        destination_domain: str | None = None,
+        admission_score: int | None = None,
+        admission_reason: str | None = None,
+        discovery_mechanism: str | None = None,
     ) -> dict[str, Any]:
-        return await self._run(
-            self._record_discovery_edge_sync,
-            parent_discovery_id,
-            child_discovery_id,
-            child_normalized_url,
-            discovered_from_url,
-            depth,
-            retry=True,
+        rows = await self.record_discovery_edges(
+            [
+                {
+                    "parent_discovery_id": parent_discovery_id,
+                    "child_discovery_id": child_discovery_id,
+                    "child_normalized_url": child_normalized_url,
+                    "discovered_from_url": discovered_from_url,
+                    "depth": depth,
+                    "original_url": original_url,
+                    "link_text": link_text,
+                    "source_domain": source_domain,
+                    "destination_domain": destination_domain,
+                    "admission_score": admission_score,
+                    "admission_reason": admission_reason,
+                    "discovery_mechanism": discovery_mechanism,
+                }
+            ]
+        )
+        return rows[0]
+
+    async def record_discovery_edges(self, edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Record edges atomically through PostgreSQL in bounded chunks.
+
+        Returns one row per input in input order. Duplicate relationships within
+        the same call share the first occurrence's row.
+        """
+        if not edges:
+            return []
+        progress: dict[str, Any] = {"confirmed_keys": set()}
+        try:
+            return await self._run(
+                self._record_discovery_edges_sync,
+                [dict(edge) for edge in edges],
+                progress,
+                retry=True,
+            )
+        except Exception as exc:
+            if "failed_count" not in progress:
+                raise
+            raise DiscoveryEdgePersistenceError(
+                progress.get("confirmed_count", 0), progress["failed_count"], exc
+            ) from exc
+
+    @staticmethod
+    def _edge_key(edge: dict[str, Any]) -> tuple[str | None, str]:
+        parent = edge.get("parent_discovery_id")
+        return (
+            str(parent) if parent not in (None, "") else None,
+            str(edge["child_normalized_url"]),
         )
 
-    def _edge_query(self, parent_discovery_id: str | None, child_normalized_url: str) -> Any:
-        query = (
-            self._client()
-            .table("discovery_edges")
-            .select("id")
-            .eq("child_normalized_url", child_normalized_url)
-        )
-        if parent_discovery_id is None:
-            query = query.is_("parent_discovery_id", "null")
-        else:
-            query = query.eq("parent_discovery_id", parent_discovery_id)
-        return query.limit(1)
-
-    def _record_discovery_edge_sync(
-        self,
-        parent_discovery_id: str | None,
-        child_discovery_id: str | None,
-        child_normalized_url: str,
-        discovered_from_url: str,
-        depth: int,
-    ) -> dict[str, Any]:
-        existing = self._rows(self._edge_query(parent_discovery_id, child_normalized_url).execute())
-        if existing:
-            return existing[0]
-        payload = {
-            "parent_discovery_id": parent_discovery_id,
-            "child_discovery_id": child_discovery_id,
+    def _prepare_discovery_edge(self, edge: dict[str, Any]) -> dict[str, Any]:
+        child_normalized_url = edge.get("child_normalized_url")
+        if not isinstance(child_normalized_url, str) or not child_normalized_url:
+            raise RepositoryError("Discovery edge requires child_normalized_url")
+        discovered_from_url = edge.get("discovered_from_url")
+        if not isinstance(discovered_from_url, str) or not discovered_from_url:
+            raise RepositoryError("Discovery edge requires discovered_from_url")
+        parent = edge.get("parent_discovery_id")
+        child = edge.get("child_discovery_id")
+        try:
+            depth = int(edge.get("depth") or 0)
+        except (TypeError, ValueError):
+            raise RepositoryError("Discovery edge depth must be an integer") from None
+        if not 0 <= depth <= 6:
+            raise RepositoryError("Discovery edge depth must be between 0 and 6")
+        admission_score = edge.get("admission_score")
+        if admission_score is not None:
+            try:
+                admission_score = max(0, min(100, int(admission_score)))
+            except (TypeError, ValueError):
+                raise RepositoryError("Discovery edge admission_score must be an integer") from None
+        return {
+            "parent_discovery_id": str(parent) if parent not in (None, "") else None,
+            "child_discovery_id": str(child) if child not in (None, "") else None,
             "child_normalized_url": child_normalized_url,
             "discovered_from_url": discovered_from_url,
             "depth": depth,
+            "original_url": edge.get("original_url") or None,
+            "link_text": (str(edge.get("link_text") or "")[:300]) or None,
+            "source_domain": edge.get("source_domain") or None,
+            "destination_domain": edge.get("destination_domain") or None,
+            "admission_score": admission_score,
+            "admission_reason": (str(edge.get("admission_reason") or "")[:500]) or None,
+            "discovery_mechanism": edge.get("discovery_mechanism") or None,
         }
-        try:
-            response = self._client().table("discovery_edges").insert(payload).execute()
-        except Exception as exc:
-            if _is_unique_violation(exc):
-                existing = self._rows(
-                    self._edge_query(parent_discovery_id, child_normalized_url).execute()
+
+    def _record_discovery_edges_sync(
+        self, edges: list[dict[str, Any]], progress: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        confirmed_keys: set[tuple[str | None, str]] = set()
+        if progress is not None:
+            confirmed_keys = progress.setdefault("confirmed_keys", set())
+            progress.setdefault("confirmed_count", 0)
+            progress.setdefault("failed_count", len(edges))
+        prepared = [self._prepare_discovery_edge(edge) for edge in edges]
+        unique: dict[tuple[str | None, str], dict[str, Any]] = {}
+        for edge in prepared:
+            unique.setdefault(self._edge_key(edge), edge)
+        if progress is not None:
+            progress["unique_count"] = len(unique)
+            progress["confirmed_count"] = len(confirmed_keys)
+            progress["failed_count"] = len(unique) - len(confirmed_keys)
+
+        resolved: dict[tuple[str | None, str], dict[str, Any]] = {}
+        created = 0
+        items = list(unique.items())
+        for offset in range(0, len(items), self._discovery_edge_batch_size):
+            chunk = items[offset : offset + self._discovery_edge_batch_size]
+            try:
+                chunk_rows, chunk_created = self._record_discovery_edges_chunk_sync(
+                    [edge for _key, edge in chunk]
                 )
-                if existing:
-                    return existing[0]
-            raise
-        rows = self._rows(response)
-        return rows[0] if rows else payload
+            except Exception:
+                if progress is not None:
+                    progress["confirmed_count"] = len(confirmed_keys)
+                    progress["failed_count"] = len(unique) - len(confirmed_keys)
+                raise
+            for (key, _edge), row in zip(chunk, chunk_rows, strict=True):
+                resolved[key] = row
+            created += chunk_created
+            if progress is not None:
+                confirmed_keys.update(key for key, _edge in chunk)
+                progress["confirmed_count"] = len(confirmed_keys)
+                progress["failed_count"] = len(unique) - len(confirmed_keys)
+
+        results = [dict(resolved[self._edge_key(edge)]) for edge in prepared]
+        self._bump_metrics(
+            edge_batch_calls=1,
+            edge_batch_rows=len(edges),
+            edge_batch_unique_rows=len(unique),
+            edge_batch_deduped=len(edges) - len(unique),
+            edge_batch_created=created,
+            edge_batch_existing=len(edges) - created,
+        )
+        if progress is not None:
+            confirmed_keys.update(unique)
+            progress["confirmed_count"] = len(confirmed_keys)
+            progress["failed_count"] = 0
+        return results
+
+    def _record_discovery_edges_chunk_sync(
+        self, edges: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], int]:
+        response = self._client().rpc(_DISCOVERY_EDGE_RPC, {"p_edges": edges}).execute()
+        data = getattr(response, "data", None)
+        if isinstance(data, list):
+            data = data[0] if len(data) == 1 else None
+        if not isinstance(data, dict):
+            raise RepositoryError("record_discovery_edges returned an invalid response")
+        rows = data.get("edges")
+        if not isinstance(rows, list):
+            raise RepositoryError("record_discovery_edges response is missing edges")
+        inserted_count = max(0, min(len(edges), int(data.get("inserted_count") or 0)))
+
+        by_key: dict[tuple[str | None, str], dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            child_normalized_url = row.get("child_normalized_url")
+            if not isinstance(child_normalized_url, str):
+                continue
+            parent = row.get("parent_discovery_id")
+            key = (
+                str(parent) if parent not in (None, "") else None,
+                child_normalized_url,
+            )
+            by_key[key] = row
+
+        expected = [self._edge_key(edge) for edge in edges]
+        missing = [key for key in expected if key not in by_key]
+        if missing:
+            raise RepositoryError(
+                "record_discovery_edges did not return every requested relationship"
+            )
+
+        self._bump_metrics(
+            edge_batch_chunks=1,
+            edge_rpc_rows=len(edges),
+            edge_rpc_inserted=inserted_count,
+            edge_rpc_duplicates=len(edges) - inserted_count,
+            edge_rpc_lookup_queries=0,
+        )
+        return [dict(by_key[key]) for key in expected], inserted_count
 
     async def upsert_discovery(self, candidate: RedditCandidate) -> dict[str, Any]:
         return await self._run(self._upsert_discovery_sync, candidate, retry=True)
@@ -713,6 +1287,7 @@ class MediaRepository:
             "verified_at": now,
             "metadata_json": metadata,
         }
+        payload = self._with_domain_identity(payload)
         response = (
             self._client()
             .table("discoveries")
@@ -1529,6 +2104,7 @@ class MediaRepository:
 
     async def mark_digest_success(self) -> None:
         await self._run(self._mark_digest_success_sync, retry=True)
+        self._invalidate_runtime_state_cache()
 
     def _mark_digest_success_sync(self) -> None:
         self._client().table("runtime_state").update(

@@ -11,3 +11,5 @@ ImageHash>=4.3,<5
 yt-dlp>=2024.1,<2027
 beautifulsoup4>=4.12,<5
 lxml>=5.2,<6
+tldextract>=5.3,<6
+defusedxml>=0.7.1,<0.8

@@ -36,6 +36,50 @@ def test_defaults_do_not_require_credentials() -> None:
     assert settings.bing_search_interval_hours == 8
     assert settings.bing_search_max_pages_per_phrase == 2
     assert settings.perceptual_hash_enabled is False
+    assert settings.discovery_batch_size == 25
+    assert settings.discovery_edge_batch_size == 50
+    assert settings.runtime_state_cache_ttl_seconds == 3.0
+
+
+def test_batch_and_runtime_cache_settings_are_configurable() -> None:
+    settings = Settings.from_env(
+        env={
+            "DISCORD_TOKEN": "token",
+            "DISCOVERY_BATCH_SIZE": "40",
+            "DISCOVERY_EDGE_BATCH_SIZE": "80",
+            "RUNTIME_STATE_CACHE_TTL_SECONDS": "1.5",
+        },
+        load_env_file=False,
+    )
+
+    settings.validate_runtime()
+
+    assert settings.discovery_batch_size == 40
+    assert settings.discovery_edge_batch_size == 80
+    assert settings.runtime_state_cache_ttl_seconds == 1.5
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        ({"DISCOVERY_BATCH_SIZE": "0"}, "DISCOVERY_BATCH_SIZE"),
+        ({"DISCOVERY_BATCH_SIZE": "201"}, "DISCOVERY_BATCH_SIZE"),
+        ({"DISCOVERY_EDGE_BATCH_SIZE": "0"}, "DISCOVERY_EDGE_BATCH_SIZE"),
+        ({"DISCOVERY_EDGE_BATCH_SIZE": "201"}, "DISCOVERY_EDGE_BATCH_SIZE"),
+        ({"RUNTIME_STATE_CACHE_TTL_SECONDS": "0.1"}, "RUNTIME_STATE_CACHE_TTL_SECONDS"),
+        ({"RUNTIME_STATE_CACHE_TTL_SECONDS": "11"}, "RUNTIME_STATE_CACHE_TTL_SECONDS"),
+    ],
+)
+def test_invalid_batch_and_runtime_cache_settings_are_rejected(
+    env: dict[str, str], message: str
+) -> None:
+    settings = Settings.from_env(
+        env={"DISCORD_TOKEN": "token", **env},
+        load_env_file=False,
+    )
+
+    with pytest.raises(ConfigurationError, match=message):
+        settings.validate_runtime()
 
 
 def test_bing_settings_are_independently_configurable() -> None:

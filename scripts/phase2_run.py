@@ -80,7 +80,12 @@ async def _run(submission: str) -> int:
                 settings=settings,
                 connector=RedditConnector(settings),
                 fetcher=fetcher,
-                repository=MediaRepository(database),
+                repository=MediaRepository(
+                    database,
+                    discovery_batch_size=settings.discovery_batch_size,
+                    discovery_edge_batch_size=settings.discovery_edge_batch_size,
+                    runtime_state_cache_ttl_seconds=settings.runtime_state_cache_ttl_seconds,
+                ),
                 storage=storage,
                 publisher=DiscordPublisher(bot, settings.discoveries_channel_id),
             )
