@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import logging
@@ -13,11 +14,28 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from app.bot.publisher import PublicationContext, build_publication_message
+from app.async_safety import await_cancellation_safe
+from app.bot.publisher import (
+    DiscordPublicationError,
+    DiscordPublicationMessageError,
+    DiscordPublicationRejectedError,
+    DiscordPublisher,
+    PublicationContext,
+    build_publication_message,
+    publication_error_from_discord_exception,
+)
 from app.config import Settings
+from app.db.repository import RepositoryError
 from app.health.status import StatusReport
 from app.jobs.digest import DEFAULT_DIGEST_ATTEMPT_LIMIT, digest_window_incomplete
 from app.reddit.connector import parse_submission_id
+from app.storage.base import (
+    StorageAccessDeniedError,
+    StorageError,
+    StorageObjectNotFoundError,
+    StorageObjectTooLargeError,
+    StorageTimeoutError,
+)
 
 if TYPE_CHECKING:
     from app.bot.client import TifaBot
@@ -26,6 +44,35 @@ log = logging.getLogger(__name__)
 
 EMBED_COLOR = 0x8B1E3F
 ABOUT_PURPOSE = "Responsible discovery and preservation of Tifa Lockhart-related public media."
+RANDOM_ARCHIVE_MAX_BYTES = 10_000_000
+_RANDOM_MARKER_PREFIX = "tifa-random-publication:"
+_RANDOM_CANCELLATION_CLEANUP_TIMEOUT_SECONDS = 5.0
+
+
+class _RandomDeliveryFailure(RuntimeError):
+    """A stage-specific, user-safe failure from the /random pipeline."""
+
+    def __init__(self, code: str, user_message: str, *, detail: str | None = None) -> None:
+        super().__init__(detail or code)
+        self.code = code
+        self.user_message = user_message
+        self.detail = detail
+
+
+def _random_publication_marker(publication_id: str) -> str:
+    return f"{_RANDOM_MARKER_PREFIX}{publication_id}"
+
+
+def _safe_stage_detail(exc: BaseException) -> str:
+    """Return a bounded diagnostic that cannot expose credentials or raw traces."""
+    if isinstance(exc, (DiscordPublicationError, StorageError, RepositoryError)):
+        text = " ".join(str(exc).split())[:240]
+        return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+    return type(exc).__name__
+
+
+def _failure_record(code: str, detail: str | None) -> str:
+    return (f"{code}: {detail}" if detail else code)[:500]
 
 
 def _is_reddit_reference(value: str) -> bool:
@@ -170,52 +217,437 @@ class PhaseFourCommands(commands.Cog):
                 ephemeral=True,
             )
 
+    async def _record_random_failure(
+        self,
+        publication_id: str,
+        code: str,
+        detail: str | None,
+    ) -> None:
+        last_error = _failure_record(code, detail)
+        try:
+            await self.bot.repository.update_publication(
+                publication_id, status="failed", last_error=last_error
+            )
+        except Exception as exc:
+            # Preserve the original stage and reason in logs; a secondary
+            # database failure must not erase the only evidence of the cause.
+            log.error(
+                "Random publication failure could not be recorded "
+                "publication_id=%s failure_code=%s reason=%s update_exception=%s",
+                publication_id,
+                code,
+                detail or "none",
+                type(exc).__name__,
+            )
+
+    async def _record_random_pending(
+        self,
+        publication_id: str,
+        code: str,
+        detail: str | None,
+    ) -> None:
+        try:
+            await self.bot.repository.update_publication(
+                publication_id,
+                status="pending",
+                last_error=_failure_record(code, detail),
+            )
+        except Exception as exc:
+            log.error(
+                "Random publication uncertain state could not be recorded "
+                "publication_id=%s failure_code=%s update_exception=%s",
+                publication_id,
+                code,
+                type(exc).__name__,
+            )
+
+    async def _persist_random_published(self, publication_id: str, message_id: int) -> bool:
+        try:
+            await self.bot.repository.update_publication(
+                publication_id,
+                status="published",
+                message_id=int(message_id),
+                last_error="",
+            )
+        except Exception as exc:
+            log.error(
+                "Random image was delivered but publication persistence failed "
+                "publication_id=%s message_id=%s exception=%s",
+                publication_id,
+                message_id,
+                type(exc).__name__,
+            )
+            return False
+        return True
+
+    async def _send_random_error(self, interaction: discord.Interaction, message: str) -> None:
+        try:
+            await interaction.followup.send(message)
+        except Exception as exc:
+            log.warning("Random error response could not be delivered (%s)", type(exc).__name__)
+
+    async def _handle_ambiguous_random_publication(
+        self,
+        *,
+        interaction: discord.Interaction,
+        publication_id: str,
+        channel_id: int,
+        marker: str,
+        detail: str | None,
+    ) -> None:
+        """Reconcile an uncertain send against channel history before deciding.
+
+        A successful marker match proves delivery and is persisted. A conclusive
+        miss is a real non-delivery. Anything else remains pending and is never
+        automatically retried, preventing duplicate Discord messages.
+        """
+        publisher = DiscordPublisher(self.bot, channel_id)
+        try:
+            lookup = await publisher.find_publication_marker(
+                channel_id=channel_id,
+                marker=marker,
+            )
+        except Exception as exc:
+            log.warning(
+                "Random publication reconciliation unavailable "
+                "publication_id=%s channel_id=%s exception=%s",
+                publication_id,
+                channel_id,
+                type(exc).__name__,
+            )
+            await self._record_random_pending(
+                publication_id,
+                "discord_publication_ambiguous",
+                detail or "delivery outcome could not be reconciled",
+            )
+            await self._send_random_error(
+                interaction,
+                "The delivery outcome is uncertain. The image may already have been posted, "
+                "and it will not be resent automatically.",
+            )
+            return
+
+        if lookup.message_id is not None:
+            if await self._persist_random_published(publication_id, lookup.message_id):
+                log.info(
+                    "Random publication reconciled from channel history "
+                    "publication_id=%s message_id=%s channel_id=%s",
+                    publication_id,
+                    lookup.message_id,
+                    channel_id,
+                )
+            else:
+                await self._record_random_pending(
+                    publication_id,
+                    "publication_persistence_failed",
+                    detail or "delivered message could not be persisted",
+                )
+            return
+
+        if lookup.conclusive:
+            await self._record_random_failure(
+                publication_id,
+                "discord_publication_not_delivered",
+                detail or "Discord did not accept the attachment",
+            )
+            await self._send_random_error(
+                interaction, "The image could not be published to Discord."
+            )
+            return
+
+        await self._record_random_pending(
+            publication_id,
+            "discord_publication_ambiguous",
+            detail or "delivery outcome could not be confirmed",
+        )
+        await self._send_random_error(
+            interaction,
+            "The delivery outcome is uncertain. The image may already have been posted, "
+            "and it will not be resent automatically.",
+        )
+
+    async def _handle_random_cancellation(
+        self, publication_id: str | None, *, send_started: bool
+    ) -> None:
+        if not publication_id:
+            return
+        if send_started:
+            completed, _result, error = await await_cancellation_safe(
+                self._record_random_pending(
+                    publication_id,
+                    "discord_publication_ambiguous",
+                    "command cancelled before delivery confirmation",
+                ),
+                timeout=_RANDOM_CANCELLATION_CLEANUP_TIMEOUT_SECONDS,
+            )
+            if not completed:
+                log.warning(
+                    "Random publication cancellation state was not persisted "
+                    "publication_id=%s (%s)",
+                    publication_id,
+                    type(error).__name__ if error else "timeout",
+                )
+            return
+        completed, _result, error = await await_cancellation_safe(
+            self._record_random_failure(
+                publication_id,
+                "command_cancelled_before_delivery",
+                "command was cancelled before the Discord send began",
+            ),
+            timeout=_RANDOM_CANCELLATION_CLEANUP_TIMEOUT_SECONDS,
+        )
+        if not completed:
+            log.warning(
+                "Random publication cancellation state was not persisted publication_id=%s (%s)",
+                publication_id,
+                type(error).__name__ if error else "timeout",
+            )
+
     @app_commands.command(name="random", description="Deliver a random verified archived asset.")
     async def random_asset(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(thinking=True)
         publication_id: str | None = None
+        media_id: str | None = None
+        channel_id = 0
+        source_count = 0
+        message_chars: int | None = None
+        send_started = False
+        delivery_confirmed = False
         try:
             repo, storage = self.bot.repository, self.bot.storage
-            row = await repo.random_asset()
+            try:
+                row = await repo.random_asset()
+            except Exception as exc:
+                raise _RandomDeliveryFailure(
+                    "media_selection_failed",
+                    "Could not select archived media right now.",
+                    detail=_safe_stage_detail(exc),
+                ) from exc
             if not row:
+                log.info("Random command skipped stage=no_eligible_media")
                 await interaction.followup.send("No verified archived media is available yet.")
                 return
-            data = await storage.download_bytes(row["storage_object_key"], max_bytes=10_000_000)
-            if hashlib.sha256(data).hexdigest() != row["sha256"]:
-                await interaction.followup.send("The archived file failed integrity verification.")
-                return
-            list_sources = getattr(repo, "sources_for_media", None)
-            if callable(list_sources):
-                sources = await list_sources(row["id"])
-            else:
-                source = await repo.source_for_media(row["id"])
-                sources = [source] if source else []
+
+            media_id = str(row["id"])
             channel_id = interaction.channel_id or self.bot.settings.saves_channel_id or 0
-            publication = await repo.create_publication(str(row["id"]), channel_id, "random")
+            try:
+                publication = await repo.create_publication(media_id, channel_id, "random")
+            except Exception as exc:
+                raise _RandomDeliveryFailure(
+                    "publication_record_creation_failed",
+                    "The publication record could not be created.",
+                    detail=_safe_stage_detail(exc),
+                ) from exc
             publication_id = str(publication["id"])
+
+            try:
+                data = await storage.download_bytes(
+                    row["storage_object_key"], max_bytes=RANDOM_ARCHIVE_MAX_BYTES
+                )
+            except StorageObjectNotFoundError as exc:
+                raise _RandomDeliveryFailure(
+                    "archive_object_not_found",
+                    "The archived file is missing from storage.",
+                    detail=_safe_stage_detail(exc),
+                ) from exc
+            except StorageObjectTooLargeError as exc:
+                raise _RandomDeliveryFailure(
+                    "archive_object_too_large",
+                    "The archived file is too large to deliver.",
+                    detail=_safe_stage_detail(exc),
+                ) from exc
+            except StorageTimeoutError as exc:
+                raise _RandomDeliveryFailure(
+                    "archive_download_failed",
+                    "The archived image could not be retrieved right now.",
+                    detail=_safe_stage_detail(exc),
+                ) from exc
+            except StorageAccessDeniedError as exc:
+                raise _RandomDeliveryFailure(
+                    "archive_download_failed",
+                    "The archived image could not be retrieved right now.",
+                    detail=_safe_stage_detail(exc),
+                ) from exc
+            except StorageError as exc:
+                raise _RandomDeliveryFailure(
+                    "archive_download_failed",
+                    "The archived image could not be retrieved right now.",
+                    detail=_safe_stage_detail(exc),
+                ) from exc
+            except Exception as exc:
+                raise _RandomDeliveryFailure(
+                    "archive_download_failed",
+                    "The archived image could not be retrieved right now.",
+                    detail=_safe_stage_detail(exc),
+                ) from exc
+
+            if hashlib.sha256(data).hexdigest() != row["sha256"]:
+                raise _RandomDeliveryFailure(
+                    "integrity_verification_failed",
+                    "The archived file failed integrity verification.",
+                    detail="SHA-256 mismatch",
+                )
+
+            try:
+                list_sources = getattr(repo, "sources_for_media", None)
+                if callable(list_sources):
+                    sources = await list_sources(media_id)
+                else:
+                    source = await repo.source_for_media(media_id)
+                    sources = [source] if source else []
+            except Exception as exc:
+                raise _RandomDeliveryFailure(
+                    "source_metadata_retrieval_failed",
+                    "The archived image's source details could not be loaded.",
+                    detail=_safe_stage_detail(exc),
+                ) from exc
+            source_count = len(sources)
+
+            marker = _random_publication_marker(publication_id)
+            context = PublicationContext.from_media_record(row, sources, publication_marker=marker)
+            try:
+                message_text = build_publication_message(context)
+            except DiscordPublicationMessageError as exc:
+                raise _RandomDeliveryFailure(
+                    "message_construction_failed",
+                    "The archived image could not be formatted for Discord.",
+                    detail=_safe_stage_detail(exc),
+                ) from exc
+            except Exception as exc:
+                raise _RandomDeliveryFailure(
+                    "message_construction_failed",
+                    "The archived image could not be formatted for Discord.",
+                    detail=_safe_stage_detail(exc),
+                ) from exc
+            message_chars = len(message_text)
+
             filename = row.get("filename") or f"archive.{row.get('extension', 'bin')}"
-            file = discord.File(io.BytesIO(data), filename=filename)
-            context = PublicationContext.from_media_record(row, sources)
-            message = await interaction.followup.send(
-                build_publication_message(context),
-                file=file,
-                suppress_embeds=True,
-                wait=True,
-            )
-            await repo.update_publication(publication_id, status="published", message_id=message.id)
-        except Exception as exc:
-            log.warning("Random command failed (%s)", type(exc).__name__)
-            if publication_id:
+            buffer = io.BytesIO(data)
+            file: discord.File | None = None
+            try:
+                file = discord.File(buffer, filename=filename)
+                send_started = True
                 try:
-                    await self.bot.repository.update_publication(
-                        publication_id, status="failed", last_error="random_delivery_failed"
+                    message = await interaction.followup.send(
+                        message_text,
+                        file=file,
+                        suppress_embeds=True,
+                        wait=True,
                     )
-                except Exception as update_exc:
+                    delivery_confirmed = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    publication_error = publication_error_from_discord_exception(exc)
+                    if isinstance(publication_error, DiscordPublicationRejectedError):
+                        raise _RandomDeliveryFailure(
+                            "discord_publication_rejected",
+                            "The image could not be published to Discord.",
+                            detail=_safe_stage_detail(publication_error),
+                        ) from exc
                     log.warning(
-                        "Random delivery failure could not be recorded (%s)",
-                        type(update_exc).__name__,
+                        "Random Discord delivery outcome uncertain "
+                        "publication_id=%s media_id=%s channel_id=%s message_chars=%s "
+                        "sources=%s exception=%s",
+                        publication_id,
+                        media_id,
+                        channel_id,
+                        message_chars,
+                        source_count,
+                        type(exc).__name__,
                     )
-            await interaction.followup.send("Could not retrieve or deliver an archived file.")
+                    await self._handle_ambiguous_random_publication(
+                        interaction=interaction,
+                        publication_id=publication_id,
+                        channel_id=channel_id,
+                        marker=marker,
+                        detail=_safe_stage_detail(publication_error),
+                    )
+                    return
+            finally:
+                # discord.File does not close a caller-owned buffer. Guard the
+                # constructor too so a failed upload allocation cannot leak it.
+                if file is not None:
+                    file.close()
+                buffer.close()
+
+            delivered_message_id = getattr(message, "id", None)
+            if delivered_message_id is None:
+                await self._handle_ambiguous_random_publication(
+                    interaction=interaction,
+                    publication_id=publication_id,
+                    channel_id=channel_id,
+                    marker=marker,
+                    detail="Discord did not return a message ID",
+                )
+                return
+
+            if await self._persist_random_published(publication_id, int(delivered_message_id)):
+                log.info(
+                    "Random publication delivered publication_id=%s media_id=%s "
+                    "message_id=%s channel_id=%s message_chars=%s sources=%s",
+                    publication_id,
+                    media_id,
+                    delivered_message_id,
+                    channel_id,
+                    message_chars,
+                    source_count,
+                )
+            else:
+                # Delivery definitely happened. Never flip this row to failed
+                # merely because the follow-up database update failed.
+                await self._record_random_pending(
+                    publication_id,
+                    "publication_persistence_failed",
+                    f"delivered message {delivered_message_id} could not be recorded",
+                )
+        except asyncio.CancelledError:
+            await self._handle_random_cancellation(publication_id, send_started=send_started)
+            raise
+        except _RandomDeliveryFailure as exc:
+            log.warning(
+                "Random command failed stage=%s media_id=%s publication_id=%s "
+                "channel_id=%s sources=%s message_chars=%s exception=%s detail=%s",
+                exc.code,
+                media_id or "unknown",
+                publication_id or "none",
+                channel_id,
+                source_count,
+                message_chars,
+                type(exc.__cause__).__name__ if exc.__cause__ else "none",
+                exc.detail or "none",
+            )
+            if publication_id:
+                await self._record_random_failure(publication_id, exc.code, exc.detail)
+            await self._send_random_error(interaction, exc.user_message)
+        except Exception as exc:
+            detail = _safe_stage_detail(exc)
+            log.warning(
+                "Random command failed stage=unexpected media_id=%s publication_id=%s "
+                "channel_id=%s exception=%s detail=%s",
+                media_id or "unknown",
+                publication_id or "none",
+                channel_id,
+                type(exc).__name__,
+                detail,
+            )
+            if publication_id:
+                if delivery_confirmed:
+                    # The attachment already reached Discord. Any later local
+                    # failure is a reconciliation problem, not a delivery
+                    # failure, and must never produce a duplicate-send retry.
+                    await self._record_random_pending(
+                        publication_id,
+                        "publication_persistence_failed",
+                        detail,
+                    )
+                else:
+                    await self._record_random_failure(
+                        publication_id, "random_delivery_failed", detail
+                    )
+            if delivery_confirmed:
+                return
+            await self._send_random_error(interaction, "Could not deliver the archived image.")
 
     @app_commands.command(name="stats", description="Show archived asset and delivery counts.")
     @app_commands.choices(

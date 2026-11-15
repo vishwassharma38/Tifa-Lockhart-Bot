@@ -7,11 +7,14 @@ import pytest
 
 from app.bot.publisher import (
     DiscordPublicationError,
+    DiscordPublicationMessageError,
     DiscordPublicationRejectedError,
+    DiscordPublicationUncertainError,
     DiscordPublisher,
     MarkerLookup,
     PublicationContext,
     build_publication_message,
+    publication_error_from_discord_exception,
 )
 from app.reddit.models import RedditCandidate
 
@@ -263,11 +266,175 @@ def test_malformed_and_dangerous_urls_are_omitted() -> None:
     assert "Creator: Artist (profile not provided by source)" in message
 
 
-def test_oversized_attribution_fails_before_discord_send() -> None:
+@pytest.mark.parametrize("association_count", [21, 29, 30, 31, 34])
+def test_production_source_association_counts_stay_publishable(
+    association_count: int,
+) -> None:
+    sources = [
+        {
+            "source_url": (
+                f"https://www.zerochan.net/Tifa+Lockhart?d=large&lang=en&p={index}&sort=latest"
+            ),
+            "creator_name": "Zerochan artist",
+        }
+        for index in range(association_count - 1)
+    ]
+    sources.insert(
+        0,
+        {
+            "source_url": "https://www.zerochan.net/4567890",
+            "creator_name": "Zerochan artist",
+        },
+    )
+    context = PublicationContext.from_media_record({"media_type": "image"}, sources)
+
+    message = build_publication_message(context)
+
+    assert len(message) <= 1800
+    assert "[Original source](https://www.zerochan.net/4567890)" in message
+    assert "more archived reference" in message
+    assert "Creator: Zerochan artist" in message
+
+
+def test_oversized_attribution_is_bounded_instead_of_rejected() -> None:
     sources = [{"source_url": f"https://example.com/{index}/" + "x" * 100} for index in range(30)]
     context = PublicationContext.from_media_record({"media_type": "image"}, sources)
-    with pytest.raises(DiscordPublicationRejectedError, match="message length"):
-        build_publication_message(context)
+
+    message = build_publication_message(context)
+
+    assert len(message) <= 1800
+    assert "TIFA ARCHIVE" in message
+    assert "more archived reference" in message
+    assert sum(message.count(f"https://example.com/{index}/") for index in range(30)) <= 3
+
+
+def test_message_budget_is_bounded_for_many_short_sources() -> None:
+    sources = [
+        {"source_url": f"https://example.com/post/{index}", "title": f"Tifa {index}"}
+        for index in range(500)
+    ]
+    context = PublicationContext.from_media_record({"media_type": "image"}, sources)
+
+    message = build_publication_message(context)
+
+    assert len(message) <= 1800
+    assert message.count("[Original source") == 1
+    assert "more archived reference" in message
+
+
+def test_specific_media_source_is_ranked_before_gallery_listing() -> None:
+    context = PublicationContext.from_media_record(
+        {"title": "Tifa", "media_type": "image"},
+        [
+            {"source_url": "https://example.com/gallery?page=2&sort=latest"},
+            {"source_url": "https://example.com/gallery/tifa-artwork-12345"},
+            {"source_url": "https://example.com/gallery"},
+        ],
+    )
+
+    message = build_publication_message(context)
+
+    assert "[Original source](https://example.com/gallery/tifa-artwork-12345)" in message
+    assert message.index("tifa-artwork-12345") < message.index("gallery?page=2")
+
+
+def test_php_listing_endpoints_do_not_outrank_direct_media_pages() -> None:
+    context = PublicationContext.from_media_record(
+        {"title": "Tifa", "media_type": "image"},
+        [
+            {"source_url": "https://example.com/search.php?q=tifa"},
+            {"source_url": "https://example.com/gallery.php?page=2"},
+            {"source_url": "https://example.com/post/tifa-artwork-12345"},
+        ],
+    )
+
+    message = build_publication_message(context)
+
+    assert "[Original source](https://example.com/post/tifa-artwork-12345)" in message
+    assert message.index("tifa-artwork-12345") < message.index("search.php")
+
+
+def test_primary_source_link_is_kept_when_it_is_also_the_creator_profile() -> None:
+    context = PublicationContext(
+        title="Tifa",
+        creator_name="Artist",
+        creator_profile_url="https://example.com/artist/12345",
+        source_url="https://example.com/artist/12345",
+    )
+
+    message = build_publication_message(context)
+
+    assert "[Original source](https://example.com/artist/12345)" in message
+    assert "link too long" not in message
+
+
+def test_publication_marker_stays_machine_matchable() -> None:
+    marker = "tifa-random-publication:0f8fad5b-d9cb-469f-a165-70867728950e"
+    message = build_publication_message(
+        PublicationContext(
+            title="Tifa",
+            source_url="https://example.com/post",
+            publication_marker=marker,
+        )
+    )
+
+    assert marker in message
+    assert "\\-" not in message
+
+
+def test_publication_marker_is_sanitized_without_markdown_escaping() -> None:
+    message = build_publication_message(
+        PublicationContext(
+            title="Tifa",
+            publication_marker="tifa-random-publication:***abc-123***\n[link](javascript:1)",
+        )
+    )
+
+    assert "Publication: tifa-random-publication:abc-123linkjavascript:1" in message
+    assert "***" not in message
+
+
+def test_message_construction_failure_is_a_distinct_local_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.bot.publisher as publisher_module
+
+    message = build_publication_message(PublicationContext(publication_marker="x" * 400))
+    assert len(message) <= 1800
+
+    monkeypatch.setattr(publisher_module, "_SAFE_MESSAGE_BUDGET", 5)
+    monkeypatch.setattr(publisher_module, "_MAX_MESSAGE_LENGTH", 10)
+    with pytest.raises(DiscordPublicationMessageError):
+        build_publication_message(PublicationContext(title="Tifa"))
+
+
+def test_discord_exceptions_are_classified_precisely() -> None:
+    response = FakeDiscordResponse(status=400)
+    rejected = publication_error_from_discord_exception(
+        discord.HTTPException(response, message="bad")
+    )
+    assert isinstance(rejected, DiscordPublicationRejectedError)
+    assert "400" in str(rejected)
+
+    rate_limited = publication_error_from_discord_exception(
+        discord.HTTPException(FakeDiscordResponse(status=429), message="slow down")
+    )
+    assert isinstance(rate_limited, DiscordPublicationUncertainError)
+
+    server_error = publication_error_from_discord_exception(
+        discord.HTTPException(FakeDiscordResponse(status=503), message="unavailable")
+    )
+    assert isinstance(server_error, DiscordPublicationUncertainError)
+
+    transport_error = publication_error_from_discord_exception(RuntimeError("socket reset"))
+    assert isinstance(transport_error, DiscordPublicationUncertainError)
+    assert "RuntimeError" in str(transport_error)
+
+
+class FakeDiscordResponse:
+    def __init__(self, *, status: int) -> None:
+        self.status = status
+        self.reason = "test"
 
 
 async def test_publisher_uses_per_call_channel_override() -> None:

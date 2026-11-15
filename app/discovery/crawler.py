@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
+from app.async_safety import await_cancellation_safe
 from app.config import Settings
 from app.discovery.challenges import detect_challenge
 from app.discovery.classifier import DUMPSTER, VERIFIED, Classification, classify_page
@@ -78,6 +79,7 @@ _PERMANENT_HTTP_CATEGORIES = frozenset({HTTP_ERROR, INVALID_REDIRECT, TOO_MANY_R
 _CRAWLER_STATUSES = frozenset(
     {"queued", "processing", "verified", "dumpster", "rejected", "blocked", "failed", "oversize"}
 )
+_CLAIM_CLEANUP_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -597,7 +599,7 @@ class DiscoveryCrawler:
                     try:
                         recovered = await recover_processing()
                         if recovered:
-                            log.info("Recovered %s expired crawl claim(s)", recovered)
+                            log.info("expired_claims_recovered count=%s", recovered)
                     except Exception:
                         errors["processing_claim_recovery_failed"] += 1
                         log.exception("Expired crawl claim recovery failed")
@@ -607,86 +609,151 @@ class DiscoveryCrawler:
                     per_domain_limit=self._settings.crawl_domain_batch_limit,
                     new_domain_share=self._settings.crawl_new_domain_share,
                 )
-                for row in claimed:
-                    if scheduled and not paused_for_collection:
-                        if not await self._automation_enabled():
-                            paused_for_collection = True
-                    if paused_for_collection:
-                        if not await self._safe_requeue(row, "collection_paused"):
-                            counters["failed_count"] += 1
-                            errors["discovery_requeue_failed"] += 1
-                        counters["skipped_count"] += 1
-                        continue
-                    try:
-                        outcome = await self._process_discovery(
-                            row,
-                            budget=budget,
-                            throttle=throttle,
-                            robots=robots,
-                            admission=admission,
-                            seen_edges=seen_edges,
-                            sitemap_scan_domains=sitemap_scan_domains,
-                            edge_write_stats=edge_write_stats,
-                            scheduled=scheduled,
-                        )
-                    except asyncio.CancelledError:
-                        await self._safe_requeue(row, "interrupted_by_shutdown")
-                        raise
-                    except Exception as exc:
-                        counters["failed_count"] += 1
-                        if isinstance(exc, DiscoveryEdgeWriteError):
-                            errors["discovery_edge_persistence_failed"] += exc.failed_count
-                            log.error(
-                                "Required discovery edges were not confirmed discovery_id=%s "
-                                "parent_id=%s persisted=%s failed=%s cause=%s",
-                                row.get("id"),
-                                exc.parent_discovery_id,
-                                exc.persisted_count,
-                                exc.failed_count,
-                                str(exc.__cause__)[:300] if exc.__cause__ else "unknown",
-                            )
-                            if not await self._safe_requeue(
-                                row, "discovery_edge_persistence_failed"
-                            ):
+                outstanding_claims: dict[str, dict[str, Any]] = {
+                    str(row["id"]): row
+                    for row in claimed
+                    if isinstance(row, dict) and row.get("id")
+                }
+                if outstanding_claims:
+                    log.info(
+                        "crawl_batch_claimed job_id=%s batch_size=%s",
+                        job_id,
+                        len(outstanding_claims),
+                    )
+                try:
+                    for row in claimed:
+                        claim_id = str(row.get("id") or "")
+                        if scheduled and not paused_for_collection:
+                            if not await self._automation_enabled():
+                                paused_for_collection = True
+                        if paused_for_collection:
+                            if not await self._safe_requeue(row, "collection_paused"):
+                                counters["failed_count"] += 1
                                 errors["discovery_requeue_failed"] += 1
-                        else:
-                            errors[f"discovery_processing_failed:{type(exc).__name__}"] += 1
-                            log.warning(
-                                "Discovery processing failed discovery_id=%s (%s)",
-                                row.get("id"),
-                                type(exc).__name__,
+                            else:
+                                outstanding_claims.pop(claim_id, None)
+                            counters["skipped_count"] += 1
+                            continue
+                        log.debug(
+                            "crawl_item_processing_started job_id=%s discovery_id=%s",
+                            job_id,
+                            claim_id or "missing",
+                        )
+                        try:
+                            outcome = await self._process_discovery(
+                                row,
+                                budget=budget,
+                                throttle=throttle,
+                                robots=robots,
+                                admission=admission,
+                                seen_edges=seen_edges,
+                                sitemap_scan_domains=sitemap_scan_domains,
+                                edge_write_stats=edge_write_stats,
+                                scheduled=scheduled,
                             )
-                            await self._safe_fail(row, f"processing_failed:{type(exc).__name__}")
-                        continue
-                    counters["discovered_count"] += outcome.get("discovered", 0)
-                    counters["examined_count"] += outcome.get("examined", 0)
-                    counters["duplicate_count"] += outcome.get("duplicate", 0)
-                    counters["processed_count"] += outcome.get("processed", 0)
-                    counters["stored_count"] += outcome.get("stored", 0)
-                    counters["skipped_count"] += outcome.get("skipped", 0)
-                    counters["failed_count"] += outcome.get("failed", 0)
-                    for key in (
-                        "external_links_admitted_count",
-                        "internal_links_admitted_count",
-                        "skipped_url_count",
-                    ):
-                        counters[key] += int(outcome.get(key, 0) or 0)
-                    linked_external_domains.update(
-                        value
-                        for value in outcome.get("new_domain_sites", ())
-                        if isinstance(value, str)
+                        except asyncio.CancelledError:
+                            # The batch-level handler requeues this row together
+                            # with every other unfinished claim.
+                            raise
+                        except Exception as exc:
+                            counters["failed_count"] += 1
+                            if isinstance(exc, DiscoveryEdgeWriteError):
+                                errors["discovery_edge_persistence_failed"] += exc.failed_count
+                                log.error(
+                                    "Required discovery edges were not confirmed discovery_id=%s "
+                                    "parent_id=%s persisted=%s failed=%s cause=%s",
+                                    row.get("id"),
+                                    exc.parent_discovery_id,
+                                    exc.persisted_count,
+                                    exc.failed_count,
+                                    str(exc.__cause__)[:300] if exc.__cause__ else "unknown",
+                                )
+                                if not await self._safe_requeue(
+                                    row, "discovery_edge_persistence_failed"
+                                ):
+                                    errors["discovery_requeue_failed"] += 1
+                                else:
+                                    outstanding_claims.pop(claim_id, None)
+                            else:
+                                errors[f"discovery_processing_failed:{type(exc).__name__}"] += 1
+                                log.warning(
+                                    "Discovery processing failed discovery_id=%s (%s)",
+                                    row.get("id"),
+                                    type(exc).__name__,
+                                )
+                                if await self._safe_fail(
+                                    row, f"processing_failed:{type(exc).__name__}"
+                                ):
+                                    outstanding_claims.pop(claim_id, None)
+                                else:
+                                    errors["discovery_failure_persist_failed"] += 1
+                            continue
+                        counters["discovered_count"] += outcome.get("discovered", 0)
+                        counters["examined_count"] += outcome.get("examined", 0)
+                        counters["duplicate_count"] += outcome.get("duplicate", 0)
+                        counters["processed_count"] += outcome.get("processed", 0)
+                        counters["stored_count"] += outcome.get("stored", 0)
+                        counters["skipped_count"] += outcome.get("skipped", 0)
+                        counters["failed_count"] += outcome.get("failed", 0)
+                        for key in (
+                            "external_links_admitted_count",
+                            "internal_links_admitted_count",
+                            "skipped_url_count",
+                        ):
+                            counters[key] += int(outcome.get(key, 0) or 0)
+                        linked_external_domains.update(
+                            value
+                            for value in outcome.get("new_domain_sites", ())
+                            if isinstance(value, str)
+                        )
+                        counters["new_domains_discovered_count"] = len(linked_external_domains)
+                        domain_visited = outcome.get("visited_domain")
+                        if (
+                            isinstance(domain_visited, str)
+                            and domain_visited not in visited_domains
+                        ):
+                            visited_domains.add(domain_visited)
+                            counters["domains_visited_count"] = len(visited_domains)
+                        counters["resource_budget_limited"] = bool(
+                            counters["resource_budget_limited"]
+                            or outcome.get("resource_budget_limited")
+                        )
+                        for category, count in outcome.get("errors", {}).items():
+                            errors[category] += count
+                        if outcome.get("claim_unfinalized"):
+                            errors["discovery_outcome_unfinalized"] += 1
+                        else:
+                            outstanding_claims.pop(claim_id, None)
+                        log.debug(
+                            "crawl_item_completed job_id=%s discovery_id=%s processed=%s failed=%s",
+                            job_id,
+                            claim_id or "missing",
+                            outcome.get("processed", 0),
+                            outcome.get("failed", 0),
+                        )
+                except asyncio.CancelledError:
+                    await self._cleanup_outstanding_claims(
+                        outstanding_claims,
+                        job_id=job_id,
+                        reason="interrupted_by_shutdown",
+                        cancellation=True,
                     )
-                    counters["new_domains_discovered_count"] = len(linked_external_domains)
-                    domain_visited = outcome.get("visited_domain")
-                    if isinstance(domain_visited, str) and domain_visited not in visited_domains:
-                        visited_domains.add(domain_visited)
-                        counters["domains_visited_count"] = len(visited_domains)
-                    counters["resource_budget_limited"] = bool(
-                        counters["resource_budget_limited"]
-                        or outcome.get("resource_budget_limited")
+                    raise
+                except Exception:
+                    await self._cleanup_outstanding_claims(
+                        outstanding_claims,
+                        job_id=job_id,
+                        reason="crawl_batch_interrupted",
+                        cancellation=False,
                     )
-                    for category, count in outcome.get("errors", {}).items():
-                        errors[category] += count
+                    raise
+                if outstanding_claims:
+                    await self._cleanup_outstanding_claims(
+                        outstanding_claims,
+                        job_id=job_id,
+                        reason="crawl_batch_unfinalized",
+                        cancellation=False,
+                    )
 
                 outcome = (
                     "failed"
@@ -972,7 +1039,11 @@ class DiscoveryCrawler:
 
         page = inspection.extracted
         if page is None:
-            return {"failed": 1, "errors": {"missing_extraction": 1}}
+            finalized = await self._safe_fail(row, "missing_extraction")
+            result: dict[str, Any] = {"failed": 1, "errors": {"missing_extraction": 1}}
+            if not finalized:
+                result["claim_unfinalized"] = True
+            return result
         header_links = extract_http_link_header(
             inspection.response_headers.get("Link"), page.final_url
         )
@@ -1672,6 +1743,104 @@ class DiscoveryCrawler:
             next_attempt_at=until.astimezone(UTC).isoformat() if until else None,
         )
 
+    async def _cleanup_outstanding_claims(
+        self,
+        claims: dict[str, dict[str, Any]],
+        *,
+        job_id: str | None,
+        reason: str,
+        cancellation: bool,
+    ) -> None:
+        """Requeue every claim whose terminal outcome was not confirmed.
+
+        Cleanup is bounded and survives repeated cancellation of the worker
+        task. The batch RPC is preferred because it checks claim ownership and
+        leaves completed or reassigned discoveries untouched. Per-claim requeue
+        is the fallback when the repository does not expose the batch helper or
+        the batch call itself fails.
+        """
+        if not claims:
+            if cancellation:
+                log.info(
+                    "crawl_batch_cleanup_completed job_id=%s recovered_count=0 "
+                    "outstanding_count=0 reason=%s",
+                    job_id,
+                    reason,
+                )
+            return
+        pending = [dict(row) for row in claims.values()]
+        outstanding_count = len(pending)
+        recovered_count = 0
+        failure_category: str | None = None
+        batch_confirmed = False
+        requeue_batch = getattr(self._repository, "requeue_discoveries", None)
+
+        async def requeue_all() -> None:
+            nonlocal recovered_count, failure_category, batch_confirmed
+            if callable(requeue_batch):
+                try:
+                    result = await requeue_batch(pending, reason=reason)
+                except Exception as exc:
+                    failure_category = f"batch_{type(exc).__name__}"
+                    log.warning(
+                        "crawl_batch_cleanup_failed job_id=%s stage=batch "
+                        "outstanding_count=%s failure_category=%s",
+                        job_id,
+                        outstanding_count,
+                        failure_category,
+                    )
+                else:
+                    recovered_count = max(0, int(result or 0))
+                    batch_confirmed = True
+                    return
+            for row in pending:
+                if await self._safe_requeue(row, reason):
+                    recovered_count += 1
+                elif failure_category is None:
+                    failure_category = "per_claim_requeue_unconfirmed"
+
+        completed, _result, error = await await_cancellation_safe(
+            requeue_all(),
+            timeout=_CLAIM_CLEANUP_TIMEOUT_SECONDS,
+        )
+        if not completed:
+            failure_category = failure_category or (
+                type(error).__name__ if error else "cleanup_timeout"
+            )
+            log.warning(
+                "crawl_batch_cleanup_failed job_id=%s stage=timeout "
+                "unrecovered_count=%s failure_category=%s reason=%s",
+                job_id,
+                outstanding_count,
+                failure_category,
+                reason,
+            )
+            return
+        if batch_confirmed or recovered_count >= outstanding_count:
+            if cancellation:
+                log.info(
+                    "crawl_item_requeued_on_cancellation job_id=%s recovered_count=%s",
+                    job_id,
+                    recovered_count,
+                )
+            log.info(
+                "crawl_batch_cleanup_completed job_id=%s recovered_count=%s "
+                "outstanding_count=%s reason=%s",
+                job_id,
+                recovered_count,
+                outstanding_count,
+                reason,
+            )
+            return
+        log.warning(
+            "crawl_batch_cleanup_failed job_id=%s unrecovered_count=%s "
+            "failure_category=%s reason=%s",
+            job_id,
+            max(0, outstanding_count - recovered_count),
+            failure_category or "requeue_unconfirmed",
+            reason,
+        )
+
     async def _safe_requeue(
         self,
         row: dict[str, Any],
@@ -1708,10 +1877,10 @@ class DiscoveryCrawler:
             return False
         return True
 
-    async def _safe_fail(self, row: dict[str, Any], reason: str) -> None:
+    async def _safe_fail(self, row: dict[str, Any], reason: str) -> bool:
         discovery_id = row.get("id")
         if not discovery_id:
-            return
+            return False
         try:
             await self._repository.update_discovery(
                 str(discovery_id),
@@ -1719,6 +1888,8 @@ class DiscoveryCrawler:
             )
         except Exception as exc:
             log.warning("Discovery failure update failed (%s)", type(exc).__name__)
+            return False
+        return True
 
 
 class WebSaveService:

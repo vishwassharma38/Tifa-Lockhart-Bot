@@ -104,11 +104,15 @@ class FakeQuery:
         error = self.table.errors.get(self.operation)
         if error is not None:
             raise error
-        queued = self.table.queued_results.get(self.operation)
-        if queued:
-            data = queued.pop(0)
-        else:
+        if self.count is not None:
+            # A count-only query does not consume queued row payloads.
             data = self.table.results.get(self.operation, [])
+        else:
+            queued = self.table.queued_results.get(self.operation)
+            if queued:
+                data = queued.pop(0)
+            else:
+                data = self.table.results.get(self.operation, [])
         count = self.table.counts.get(self.operation)
         queued_counts = self.table.queued_counts.get(self.operation)
         if self.count is not None:
@@ -1314,6 +1318,113 @@ async def test_requeue_discovery_confirms_ambiguous_commit_on_retry() -> None:
 
     assert result == queued
     assert thread.calls == 2
+
+
+async def test_random_asset_uses_full_eligible_count_and_injected_offset() -> None:
+    client = FakeClient()
+    media = client.table("media_items")
+    media.queued_counts["select"] = [1000]
+    media.queued_results["select"] = [[{"id": "media-777", "filename": "tifa.png"}]]
+    offsets: list[int] = []
+
+    def choose_offset(count: int) -> int:
+        offsets.append(count)
+        return 777
+
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=immediate_thread,
+        random_offset=choose_offset,
+    )
+
+    row = await repository.random_asset()
+
+    assert row == {"id": "media-777", "filename": "tifa.png"}
+    assert offsets == [1000]
+    count_query, row_query = media.queries[:2]
+    assert count_query.count == "exact"
+    assert count_query.filters == [
+        ("verification_status", "verified"),
+        ("download_status", "stored"),
+    ]
+    assert row_query.order_value == ("id", False)
+    assert row_query.range_value == (777, 777)
+    assert row_query.filters == count_query.filters
+
+
+async def test_random_asset_returns_none_for_empty_archive() -> None:
+    client = FakeClient()
+    media = client.table("media_items")
+    media.queued_counts["select"] = [0]
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=immediate_thread,
+        random_offset=pytest.fail,
+    )
+
+    assert await repository.random_asset() is None
+    assert len(media.queries) == 1
+
+
+async def test_random_asset_retries_once_when_offset_races_a_delete() -> None:
+    client = FakeClient()
+    media = client.table("media_items")
+    media.queued_counts["select"] = [1000, 999]
+    media.queued_results["select"] = [[], [{"id": "media-500"}]]
+    offsets: list[int] = []
+
+    def choose_offset(count: int) -> int:
+        offsets.append(count)
+        return 999 if count == 1000 else 500
+
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=immediate_thread,
+        random_offset=choose_offset,
+    )
+
+    row = await repository.random_asset()
+
+    assert row == {"id": "media-500"}
+    assert offsets == [1000, 999]
+
+
+async def test_requeue_discoveries_batches_owned_claims_atomically() -> None:
+    client = FakeClient()
+    client.rpc_data = 2
+    repository = make_repository(client)
+
+    recovered = await repository.requeue_discoveries(
+        [
+            {"id": "discovery-1", "claimed_at": "2026-11-13T10:00:00+00:00"},
+            {"id": "discovery-2", "claimed_at": None},
+            {"id": "", "claimed_at": None},
+        ],
+        reason="interrupted_by_shutdown",
+    )
+
+    assert recovered == 2
+    assert client.rpc_calls == [
+        (
+            "requeue_crawl_claims",
+            {
+                "p_claims": [
+                    {"id": "discovery-1", "claimed_at": "2026-11-13T10:00:00+00:00"},
+                    {"id": "discovery-2", "claimed_at": None},
+                ],
+                "p_reason": "interrupted_by_shutdown",
+                "p_next_attempt_at": None,
+            },
+        )
+    ]
+
+
+async def test_requeue_discoveries_skips_empty_claim_batch() -> None:
+    client = FakeClient()
+    repository = make_repository(client)
+
+    assert await repository.requeue_discoveries([], reason="interrupted_by_shutdown") == 0
+    assert client.rpc_calls == []
 
 
 async def test_record_discovery_edge_uses_rpc_without_read_before_write() -> None:

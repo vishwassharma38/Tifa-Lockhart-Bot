@@ -124,6 +124,7 @@ class MediaRepository:
         to_thread: Callable[..., Awaitable[Any]] = asyncio.to_thread,
         retry_sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         jitter: Callable[[float, float], float] = random.uniform,
+        random_offset: Callable[[int], int] = random.randrange,
         discovery_batch_size: int = _DEFAULT_DISCOVERY_BATCH_SIZE,
         discovery_edge_batch_size: int = _DEFAULT_DISCOVERY_EDGE_BATCH_SIZE,
         runtime_state_cache_ttl_seconds: float = _DEFAULT_RUNTIME_STATE_CACHE_TTL_SECONDS,
@@ -133,6 +134,7 @@ class MediaRepository:
         self._to_thread = to_thread
         self._retry_sleep = retry_sleep
         self._jitter = jitter
+        self._random_offset = random_offset
         self._discovery_batch_size = max(1, min(_MAX_BATCH_SIZE, int(discovery_batch_size)))
         self._discovery_edge_batch_size = max(
             1, min(_MAX_BATCH_SIZE, int(discovery_edge_batch_size))
@@ -659,18 +661,39 @@ class MediaRepository:
         return await self._run(self._random_asset_sync, retry=True)
 
     def _random_asset_sync(self) -> dict[str, Any] | None:
-        rows = self._rows(
-            self._client()
-            .table("media_items")
-            .select("*")
-            .eq("verification_status", "verified")
-            .eq("download_status", "stored")
-            .limit(500)
-            .execute()
-        )
-        import random
+        """Select uniformly from the entire eligible archive in PostgreSQL.
 
-        return random.choice(rows) if rows else None
+        An exact count plus a random offset over the partial eligibility index
+        avoids both an unbounded result-set read and a full-table random sort.
+        A concurrent insert/delete between the count and offset fetch can make
+        the first offset miss; one bounded retry resolves that race.
+        """
+        client = self._client()
+        for _attempt in range(2):
+            count_response = (
+                client.table("media_items")
+                .select("id", count="exact")
+                .eq("verification_status", "verified")
+                .eq("download_status", "stored")
+                .limit(1)
+                .execute()
+            )
+            eligible_count = int(getattr(count_response, "count", None) or 0)
+            if eligible_count <= 0:
+                return None
+            offset = max(0, min(eligible_count - 1, int(self._random_offset(eligible_count))))
+            rows = self._rows(
+                client.table("media_items")
+                .select("*")
+                .eq("verification_status", "verified")
+                .eq("download_status", "stored")
+                .order("id")
+                .range(offset, offset)
+                .execute()
+            )
+            if rows:
+                return rows[0]
+        return None
 
     async def source_for_media(self, media_item_id: str) -> dict[str, Any] | None:
         return await self._run(self._source_for_media_sync, media_item_id, retry=True)
@@ -1050,6 +1073,68 @@ class MediaRepository:
             ):
                 return current
         raise RepositoryError(f"Requeue was not confirmed for discovery {discovery_id}")
+
+    async def requeue_discoveries(
+        self,
+        claims: list[dict[str, Any]],
+        *,
+        reason: str,
+        next_attempt_at: str | None = None,
+    ) -> int:
+        """Atomically requeue every still-owned processing claim in one batch.
+
+        Ownership is checked with ``claimed_at`` so a claim that was legitimately
+        recovered or reassigned is never overwritten. Completed discoveries are
+        excluded by the ``status = 'processing'`` predicate.
+        """
+        payload = [
+            {
+                "id": str(claim["id"]),
+                "claimed_at": claim.get("claimed_at"),
+            }
+            for claim in claims
+            if isinstance(claim, dict) and claim.get("id")
+        ]
+        if not payload:
+            return 0
+        return await self._run(
+            self._requeue_discoveries_sync,
+            payload,
+            reason,
+            next_attempt_at,
+            retry=True,
+        )
+
+    def _requeue_discoveries_sync(
+        self,
+        claims: list[dict[str, Any]],
+        reason: str,
+        next_attempt_at: str | None,
+    ) -> int:
+        response = (
+            self._client()
+            .rpc(
+                "requeue_crawl_claims",
+                {
+                    "p_claims": claims,
+                    "p_reason": reason[:500],
+                    "p_next_attempt_at": next_attempt_at,
+                },
+            )
+            .execute()
+        )
+        data = getattr(response, "data", None)
+        if isinstance(data, int):
+            return data
+        if isinstance(data, dict):
+            return int(data.get("requeued_count") or data.get("recovered_count") or 0)
+        if isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, dict):
+                return int(first.get("requeued_count") or first.get("recovered_count") or 0)
+            if isinstance(first, int):
+                return first
+        return 0
 
     async def record_discovery_edge(
         self,
