@@ -1124,17 +1124,20 @@ class MediaRepository:
             .execute()
         )
         data = getattr(response, "data", None)
-        if isinstance(data, int):
-            return data
-        if isinstance(data, dict):
-            return int(data.get("requeued_count") or data.get("recovered_count") or 0)
-        if isinstance(data, list) and data:
-            first = data[0]
-            if isinstance(first, dict):
-                return int(first.get("requeued_count") or first.get("recovered_count") or 0)
-            if isinstance(first, int):
-                return first
-        return 0
+        # requeue_crawl_claims is declared as ``returns integer``. A legitimate
+        # zero-row recovery is the integer 0; anything else cannot be trusted as
+        # a confirmed batch result because the crawler may then skip its
+        # ownership-checked per-claim fallback.
+        if isinstance(data, bool) or not isinstance(data, int):
+            raise RepositoryError(
+                "requeue_crawl_claims returned an invalid response "
+                f"(expected integer, got {type(data).__name__})"
+            )
+        if data < 0:
+            raise RepositoryError(
+                f"requeue_crawl_claims returned an invalid negative count ({data})"
+            )
+        return data
 
     async def record_discovery_edge(
         self,
@@ -1573,6 +1576,21 @@ class MediaRepository:
             return rows[0]
         raise RepositoryError("Publication insert returned no row")
 
+    async def get_publication(self, publication_id: str) -> dict[str, Any] | None:
+        """Return one publication row for persistence reconciliation."""
+        return await self._run(self._get_publication_sync, publication_id, retry=True)
+
+    def _get_publication_sync(self, publication_id: str) -> dict[str, Any] | None:
+        rows = self._rows(
+            self._client()
+            .table("publications")
+            .select("*")
+            .eq("id", publication_id)
+            .limit(1)
+            .execute()
+        )
+        return rows[0] if rows else None
+
     async def update_publication(
         self,
         publication_id: str,
@@ -1605,12 +1623,22 @@ class MediaRepository:
         if last_error is not None:
             payload["last_error"] = last_error
 
-        response = (
-            self._client().table("publications").update(payload).eq("id", publication_id).execute()
+        # Publication is terminal. Both a repeated published write and an
+        # ambiguous persistence failure must never mutate an already published
+        # row, including its message ID or publication timestamp.
+        query = (
+            self._client()
+            .table("publications")
+            .update(payload)
+            .eq("id", publication_id)
+            .neq("status", "published")
         )
-        rows = self._rows(response)
+        rows = self._rows(query.execute())
         if rows:
             return rows[0]
+        current = self._get_publication_sync(publication_id)
+        if current is not None:
+            return current
         return {"id": publication_id, **payload}
 
     async def get_digest_publication(

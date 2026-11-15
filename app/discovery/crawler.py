@@ -1790,9 +1790,19 @@ class DiscoveryCrawler:
                         failure_category,
                     )
                 else:
-                    recovered_count = max(0, int(result or 0))
-                    batch_confirmed = True
-                    return
+                    if isinstance(result, bool) or not isinstance(result, int) or result < 0:
+                        failure_category = f"batch_invalid_response_{type(result).__name__}"
+                        log.warning(
+                            "crawl_batch_cleanup_failed job_id=%s stage=batch "
+                            "outstanding_count=%s failure_category=%s",
+                            job_id,
+                            outstanding_count,
+                            failure_category,
+                        )
+                    else:
+                        recovered_count = result
+                        batch_confirmed = True
+                        return
             for row in pending:
                 if await self._safe_requeue(row, reason):
                     recovered_count += 1

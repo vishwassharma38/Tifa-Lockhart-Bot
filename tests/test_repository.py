@@ -64,6 +64,10 @@ class FakeQuery:
         self.filters.append((f"is.{column}", value))
         return self
 
+    def neq(self, column: str, value: object) -> FakeQuery:
+        self.filters.append((f"neq.{column}", value))
+        return self
+
     def gte(self, column: str, value: object) -> FakeQuery:
         self.filters.append((f"gte.{column}", value))
         return self
@@ -696,7 +700,7 @@ async def test_update_publication_records_message_and_published_time() -> None:
     assert payload["message_id"] == 555
     assert "published_at" in payload
     query = client.table("publications").queries[0]
-    assert query.filters == [("id", "publication-1")]
+    assert query.filters == [("id", "publication-1"), ("neq.status", "published")]
 
 
 async def test_update_publication_records_failure_without_published_time() -> None:
@@ -713,6 +717,48 @@ async def test_update_publication_records_failure_without_published_time() -> No
     assert payload["status"] == "failed"
     assert payload["last_error"] == "publication_failed"
     assert "published_at" not in payload
+    query = client.table("publications").queries[0]
+    assert query.filters == [("id", "publication-1"), ("neq.status", "published")]
+
+
+async def test_update_publication_returns_published_row_without_downgrade() -> None:
+    client = FakeClient()
+    published = {
+        "id": "publication-1",
+        "status": "published",
+        "message_id": 555,
+        "published_at": "2026-11-15T00:00:00+00:00",
+    }
+    client.table("publications").queued_results["update"] = [[]]
+    client.table("publications").queued_results["select"] = [[published]]
+    repository = make_repository(client)
+
+    row = await repository.update_publication(
+        "publication-1",
+        status="pending",
+        last_error="publication_persistence_failed",
+    )
+
+    assert row == published
+    query = client.table("publications").queries[0]
+    assert query.filters == [("id", "publication-1"), ("neq.status", "published")]
+    select_query = client.table("publications").queries[1]
+    assert select_query.filters == [("id", "publication-1")]
+
+
+async def test_get_publication_returns_persisted_state() -> None:
+    client = FakeClient()
+    published = {
+        "id": "publication-1",
+        "status": "published",
+        "message_id": 555,
+        "published_at": "2026-11-15T00:00:00+00:00",
+    }
+    client.table("publications").queued_results["select"] = [[published]]
+    repository = make_repository(client)
+
+    assert await repository.get_publication("publication-1") == published
+    assert await repository.get_publication("publication-missing") is None
 
 
 async def test_unconfigured_database_fails_clearly() -> None:
@@ -1417,6 +1463,43 @@ async def test_requeue_discoveries_batches_owned_claims_atomically() -> None:
             },
         )
     ]
+
+
+async def test_requeue_discoveries_accepts_zero_recovery_count() -> None:
+    client = FakeClient()
+    client.rpc_data = 0
+    repository = make_repository(client)
+
+    recovered = await repository.requeue_discoveries(
+        [{"id": "discovery-1", "claimed_at": None}],
+        reason="interrupted_by_shutdown",
+    )
+
+    assert recovered == 0
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        {},
+        [],
+        ["2"],
+        "2",
+        True,
+        -1,
+    ],
+)
+async def test_requeue_discoveries_rejects_invalid_rpc_responses(response: object) -> None:
+    client = FakeClient()
+    client.rpc_data = response
+    repository = make_repository(client)
+
+    with pytest.raises(RepositoryError, match="requeue_crawl_claims returned an invalid"):
+        await repository.requeue_discoveries(
+            [{"id": "discovery-1", "claimed_at": None}],
+            reason="interrupted_by_shutdown",
+        )
 
 
 async def test_requeue_discoveries_skips_empty_claim_batch() -> None:

@@ -396,13 +396,22 @@ class RecordingRandomRepository(FakeOperationalRepository):
         super().__init__()
         self.publication_updates: list[dict[str, object]] = []
         self.media_sources: list[dict[str, object]] | None = None
+        self.publications: dict[str, dict[str, object]] = {}
         self.fail_published_update = False
+        self.fail_published_update_after_commit = False
+        self.fail_publication_reconciliation = False
 
     async def sources_for_media(self, _media_item_id: str) -> list[dict[str, object]]:
         if self.media_sources is not None:
             return [dict(source) for source in self.media_sources]
         source = await self.source_for_media(_media_item_id)
         return [source]
+
+    async def get_publication(self, publication_id: str) -> dict[str, object] | None:
+        if self.fail_publication_reconciliation:
+            raise RuntimeError("publication lookup unavailable")
+        row = self.publications.get(publication_id)
+        return dict(row) if row is not None else None
 
     async def update_publication(
         self,
@@ -422,9 +431,32 @@ class RecordingRandomRepository(FakeOperationalRepository):
         )
         if status == "published" and self.fail_published_update:
             raise RuntimeError("publication update unavailable")
-        return await super().update_publication(
-            publication_id, status=status, message_id=message_id, last_error=last_error
+        row = self.publications.setdefault(
+            publication_id,
+            {
+                "id": publication_id,
+                "status": "pending",
+                "message_id": None,
+                "published_at": None,
+            },
         )
+        if row.get("status") == "published":
+            # Mirror the repository's terminal-state guard.
+            return dict(row)
+        if status == "published":
+            row.update(
+                status="published",
+                message_id=message_id,
+                last_error=last_error,
+                published_at="2026-11-15T00:00:00+00:00",
+            )
+            if self.fail_published_update_after_commit:
+                raise TimeoutError("response lost after commit")
+        else:
+            row.update(status=status, last_error=last_error)
+            if message_id is not None:
+                row["message_id"] = message_id
+        return dict(row)
 
 
 class FailingRandomStorage(FakeRandomStorage):
@@ -1010,6 +1042,78 @@ async def test_random_command_persistence_failure_never_marks_delivery_failed(
     assert str(repository.publication_updates[-1]["last_error"]).startswith(
         "publication_persistence_failed:"
     )
+
+
+async def test_random_command_ambiguous_publish_commit_is_reconciled(
+    make_settings,
+) -> None:
+    repository = RecordingRandomRepository()
+    repository.fail_published_update_after_commit = True
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert len(interaction.followup.attempts) == 1
+    assert len(interaction.followup.messages) == 1
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    publication = repository.publications["publication-random"]
+    assert publication["status"] == "published"
+    assert publication["message_id"] == 999
+    assert publication["published_at"] == "2026-11-15T00:00:00+00:00"
+
+
+async def test_random_command_ambiguous_publish_without_reconciliation_does_not_downgrade(
+    make_settings,
+) -> None:
+    repository = RecordingRandomRepository()
+    repository.fail_published_update_after_commit = True
+    repository.fail_publication_reconciliation = True
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    publication = repository.publications["publication-random"]
+    assert publication["status"] == "published"
+    assert publication["message_id"] == 999
+    assert publication["published_at"] == "2026-11-15T00:00:00+00:00"
+
+
+async def test_random_command_marker_reconciliation_preserves_committed_publish(
+    make_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = RecordingRandomRepository()
+    repository.fail_published_update_after_commit = True
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction(RuntimeError("transport response lost"))
+    mark_publication_lookup(monkeypatch, message_id=321, conclusive=True)
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert len(interaction.followup.attempts) == 1
+    assert interaction.followup.messages == []
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    publication = repository.publications["publication-random"]
+    assert publication["status"] == "published"
+    assert publication["message_id"] == 321
+    assert publication["published_at"] == "2026-11-15T00:00:00+00:00"
 
 
 async def test_random_command_post_delivery_error_never_reports_failure(

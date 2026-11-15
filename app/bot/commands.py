@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import hashlib
 import io
 import logging
@@ -57,6 +58,14 @@ class _RandomDeliveryFailure(RuntimeError):
         self.code = code
         self.user_message = user_message
         self.detail = detail
+
+
+class _PublicationPersistence(enum.Enum):
+    """Outcome of persisting a Discord delivery that already happened."""
+
+    CONFIRMED = "confirmed"
+    NOT_PERSISTED = "not_persisted"
+    UNCONFIRMED = "unconfirmed"
 
 
 def _random_publication_marker(publication_id: str) -> str:
@@ -261,7 +270,9 @@ class PhaseFourCommands(commands.Cog):
                 type(exc).__name__,
             )
 
-    async def _persist_random_published(self, publication_id: str, message_id: int) -> bool:
+    async def _persist_random_published(
+        self, publication_id: str, message_id: int
+    ) -> _PublicationPersistence:
         try:
             await self.bot.repository.update_publication(
                 publication_id,
@@ -271,14 +282,70 @@ class PhaseFourCommands(commands.Cog):
             )
         except Exception as exc:
             log.error(
-                "Random image was delivered but publication persistence failed "
-                "publication_id=%s message_id=%s exception=%s",
+                "Random image was delivered but publication persistence failed; "
+                "reconciling publication_id=%s message_id=%s exception=%s",
                 publication_id,
                 message_id,
                 type(exc).__name__,
             )
-            return False
-        return True
+            return await self._reconcile_random_publication(publication_id, int(message_id), exc)
+        return _PublicationPersistence.CONFIRMED
+
+    async def _reconcile_random_publication(
+        self,
+        publication_id: str,
+        message_id: int,
+        update_exception: Exception,
+    ) -> _PublicationPersistence:
+        """Resolve an ambiguous published update after delivery was confirmed.
+
+        The update may have committed while only its response was lost. Reading
+        the row back prevents a later ``pending`` write from downgrading that
+        committed delivery. If the row cannot be read, the outcome remains
+        unconfirmed so the caller performs no further status write.
+        """
+        try:
+            current = await self.bot.repository.get_publication(publication_id)
+        except Exception as exc:
+            log.error(
+                "Random publication persistence state could not be reconciled; "
+                "leaving it untouched publication_id=%s message_id=%s "
+                "update_exception=%s reconcile_exception=%s",
+                publication_id,
+                message_id,
+                type(update_exception).__name__,
+                type(exc).__name__,
+            )
+            return _PublicationPersistence.UNCONFIRMED
+
+        if isinstance(current, dict) and current.get("status") == "published":
+            persisted_message_id = current.get("message_id")
+            if persisted_message_id == message_id:
+                log.info(
+                    "Random publication update committed before its response was lost "
+                    "publication_id=%s message_id=%s",
+                    publication_id,
+                    message_id,
+                )
+            else:
+                log.warning(
+                    "Random publication is already published; preserving it "
+                    "publication_id=%s expected_message_id=%s persisted_message_id=%s",
+                    publication_id,
+                    message_id,
+                    persisted_message_id,
+                )
+            return _PublicationPersistence.CONFIRMED
+
+        log.warning(
+            "Random publication update was not persisted publication_id=%s message_id=%s "
+            "update_exception=%s persisted_status=%s",
+            publication_id,
+            message_id,
+            type(update_exception).__name__,
+            current.get("status") if isinstance(current, dict) else None,
+        )
+        return _PublicationPersistence.NOT_PERSISTED
 
     async def _send_random_error(self, interaction: discord.Interaction, message: str) -> None:
         try:
@@ -328,7 +395,8 @@ class PhaseFourCommands(commands.Cog):
             return
 
         if lookup.message_id is not None:
-            if await self._persist_random_published(publication_id, lookup.message_id):
+            persistence = await self._persist_random_published(publication_id, lookup.message_id)
+            if persistence is _PublicationPersistence.CONFIRMED:
                 log.info(
                     "Random publication reconciled from channel history "
                     "publication_id=%s message_id=%s channel_id=%s",
@@ -336,11 +404,20 @@ class PhaseFourCommands(commands.Cog):
                     lookup.message_id,
                     channel_id,
                 )
-            else:
+            elif persistence is _PublicationPersistence.NOT_PERSISTED:
                 await self._record_random_pending(
                     publication_id,
                     "publication_persistence_failed",
                     detail or "delivered message could not be persisted",
+                )
+            else:
+                log.error(
+                    "Random publication was found in channel history but its "
+                    "persistence state could not be reconciled publication_id=%s "
+                    "message_id=%s channel_id=%s",
+                    publication_id,
+                    lookup.message_id,
+                    channel_id,
                 )
             return
 
@@ -582,7 +659,10 @@ class PhaseFourCommands(commands.Cog):
                 )
                 return
 
-            if await self._persist_random_published(publication_id, int(delivered_message_id)):
+            persistence = await self._persist_random_published(
+                publication_id, int(delivered_message_id)
+            )
+            if persistence is _PublicationPersistence.CONFIRMED:
                 log.info(
                     "Random publication delivered publication_id=%s media_id=%s "
                     "message_id=%s channel_id=%s message_chars=%s sources=%s",
@@ -593,13 +673,25 @@ class PhaseFourCommands(commands.Cog):
                     message_chars,
                     source_count,
                 )
-            else:
+            elif persistence is _PublicationPersistence.NOT_PERSISTED:
                 # Delivery definitely happened. Never flip this row to failed
                 # merely because the follow-up database update failed.
                 await self._record_random_pending(
                     publication_id,
                     "publication_persistence_failed",
                     f"delivered message {delivered_message_id} could not be recorded",
+                )
+            else:
+                # The update may have committed even though it could not be
+                # read back. Do not issue another status write that could
+                # downgrade an already published record.
+                log.error(
+                    "Random publication delivered but its persistence state remains "
+                    "unconfirmed; no further status write attempted publication_id=%s "
+                    "message_id=%s channel_id=%s",
+                    publication_id,
+                    delivered_message_id,
+                    channel_id,
                 )
         except asyncio.CancelledError:
             await self._handle_random_cancellation(publication_id, send_started=send_started)
