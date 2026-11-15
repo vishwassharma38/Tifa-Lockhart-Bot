@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import Counter
 from contextvars import ContextVar
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from app.db.repository import RepositoryError
 from app.discovery.crawler import (
     DiscoveryCrawler,
     PageInspection,
@@ -1290,6 +1292,414 @@ async def test_crawler_requeues_rows_interrupted_by_shutdown(make_settings) -> N
 
     assert repository.requeues == [("discovery-1", "interrupted_by_shutdown", None)]
     assert repository.finished == []
+
+
+class BatchRequeueRepository(FakeRepository):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.batch_requeues: list[tuple[list[dict[str, Any]], str]] = []
+        self.batch_error: Exception | None = None
+        self.requeue_started: asyncio.Event | None = None
+        self.requeue_release: asyncio.Event | None = None
+
+    async def requeue_discoveries(
+        self,
+        claims: list[dict[str, Any]],
+        *,
+        reason: str,
+        next_attempt_at: str | None = None,
+    ) -> int:
+        del next_attempt_at
+        self.batch_requeues.append(([dict(claim) for claim in claims], reason))
+        if self.requeue_started is not None:
+            self.requeue_started.set()
+        if self.requeue_release is not None:
+            await self.requeue_release.wait()
+        if self.batch_error is not None:
+            raise self.batch_error
+        return len(claims)
+
+
+class SequencedInspector(FakeInspector):
+    def __init__(self, sequence: list[PageInspection | BaseException]) -> None:
+        super().__init__([])
+        self.sequence = list(sequence)
+
+    async def inspect(self, url, *, budget, throttle, robots):
+        del budget, throttle, robots
+        self.calls.append(url)
+        value = self.sequence.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+async def test_crawler_requeues_every_unfinished_claim_on_cancellation(make_settings) -> None:
+    repository = BatchRequeueRepository(
+        rows=[
+            row(discovery_id="one"),
+            row(discovery_id="two"),
+            row(discovery_id="three"),
+        ]
+    )
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector([], error=asyncio.CancelledError()),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await crawler_.run_once(scheduled=False)
+
+    assert len(repository.batch_requeues) == 1
+    claims, reason = repository.batch_requeues[0]
+    assert [claim["id"] for claim in claims] == ["one", "two", "three"]
+    assert reason == "interrupted_by_shutdown"
+    assert repository.requeues == []
+    assert repository.finished == []
+
+
+async def test_crawler_cancellation_excludes_already_completed_claims(make_settings) -> None:
+    page = extracted_page(media=("/full.jpg",))
+    repository = BatchRequeueRepository(
+        rows=[
+            row(discovery_id="one"),
+            row(discovery_id="two"),
+            row(discovery_id="three"),
+        ]
+    )
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        SequencedInspector([ok_inspection(page), asyncio.CancelledError()]),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await crawler_.run_once(scheduled=False)
+
+    assert repository.batch_requeues
+    claims, _reason = repository.batch_requeues[0]
+    assert [claim["id"] for claim in claims] == ["two", "three"]
+    assert ("discovery_update", "verified") in repository.events
+
+
+async def test_crawler_cancellation_between_items_requeues_the_remainder(
+    make_settings,
+) -> None:
+    repository = BatchRequeueRepository(
+        rows=[
+            row(discovery_id="one"),
+            row(discovery_id="two"),
+            row(discovery_id="three"),
+        ]
+    )
+    calls = {"count": 0}
+
+    async def state_sequence():
+        calls["count"] += 1
+        if calls["count"] == 3:
+            raise asyncio.CancelledError()
+        return {"collection_enabled": True}
+
+    repository.get_runtime_state = state_sequence  # type: ignore[method-assign]
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector([ok_inspection(extracted_page(media=("/full.jpg",), links=()))]),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await crawler_.run_once(scheduled=True)
+
+    claims, reason = repository.batch_requeues[0]
+    assert [claim["id"] for claim in claims] == ["two", "three"]
+    assert reason == "interrupted_by_shutdown"
+
+
+async def test_crawler_cancellation_before_first_item_requeues_entire_batch(
+    make_settings,
+) -> None:
+    repository = BatchRequeueRepository(rows=[row(discovery_id="one"), row(discovery_id="two")])
+    calls = {"count": 0}
+
+    async def state_sequence():
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise asyncio.CancelledError()
+        return {"collection_enabled": True}
+
+    repository.get_runtime_state = state_sequence  # type: ignore[method-assign]
+    inspector = FakeInspector([ok_inspection(extracted_page(media=("/full.jpg",)))])
+    crawler_ = crawler(make_settings, repository, FakePipeline(), inspector)
+
+    with pytest.raises(asyncio.CancelledError):
+        await crawler_.run_once(scheduled=True)
+
+    claims, reason = repository.batch_requeues[0]
+    assert [claim["id"] for claim in claims] == ["one", "two"]
+    assert reason == "interrupted_by_shutdown"
+    assert inspector.calls == []
+
+
+async def test_crawler_cancellation_during_persistence_requeues_unfinished_claims(
+    make_settings,
+) -> None:
+    class CancellingPersistenceRepository(BatchRequeueRepository):
+        async def update_discovery(self, discovery_id: str, fields: dict[str, Any]):
+            if fields.get("status") == "verified":
+                raise asyncio.CancelledError()
+            return await super().update_discovery(discovery_id, fields)
+
+    repository = CancellingPersistenceRepository(
+        rows=[row(discovery_id="one"), row(discovery_id="two")]
+    )
+    page = extracted_page(media=("/full.jpg",))
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector([ok_inspection(page)]),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await crawler_.run_once(scheduled=False)
+
+    claims, reason = repository.batch_requeues[0]
+    assert [claim["id"] for claim in claims] == ["one", "two"]
+    assert reason == "interrupted_by_shutdown"
+
+
+async def test_crawler_batch_requeue_failure_falls_back_to_each_claim(
+    make_settings,
+) -> None:
+    repository = BatchRequeueRepository(
+        rows=[row(discovery_id="one"), row(discovery_id="two")],
+    )
+    repository.batch_error = RuntimeError("batch rpc unavailable")
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector([], error=asyncio.CancelledError()),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await crawler_.run_once(scheduled=False)
+
+    assert [entry[0] for entry in repository.requeues] == ["one", "two"]
+    assert all(entry[1] == "interrupted_by_shutdown" for entry in repository.requeues)
+
+
+async def test_crawler_invalid_batch_response_falls_back_to_each_claim(
+    make_settings,
+) -> None:
+    repository = BatchRequeueRepository(
+        rows=[row(discovery_id="one"), row(discovery_id="two")],
+    )
+    repository.batch_error = RepositoryError(
+        "requeue_crawl_claims returned an invalid response (expected integer, got NoneType)"
+    )
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector([], error=asyncio.CancelledError()),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await crawler_.run_once(scheduled=False)
+
+    assert [entry[0] for entry in repository.requeues] == ["one", "two"]
+    assert all(entry[1] == "interrupted_by_shutdown" for entry in repository.requeues)
+
+
+async def test_crawler_non_integer_batch_result_falls_back_to_each_claim(
+    make_settings,
+) -> None:
+    class InvalidBatchRepository(BatchRequeueRepository):
+        async def requeue_discoveries(
+            self,
+            claims: list[dict[str, Any]],
+            *,
+            reason: str,
+            next_attempt_at: str | None = None,
+        ):
+            self.batch_requeues.append(([dict(claim) for claim in claims], reason))
+            return None
+
+    repository = InvalidBatchRepository(
+        rows=[row(discovery_id="one"), row(discovery_id="two")],
+    )
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector([], error=asyncio.CancelledError()),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await crawler_.run_once(scheduled=False)
+
+    assert [entry[0] for entry in repository.requeues] == ["one", "two"]
+    assert all(entry[1] == "interrupted_by_shutdown" for entry in repository.requeues)
+
+
+async def test_crawler_per_claim_fallback_preserves_completed_and_reassigned_claims(
+    make_settings,
+) -> None:
+    class OwnershipAwareRepository(BatchRequeueRepository):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.claim_states: dict[str, dict[str, Any]] = {}
+
+        async def requeue_discovery(
+            self,
+            discovery_id: str,
+            *,
+            reason: str | None = None,
+            next_attempt_at: str | None = None,
+            expected_claimed_at: str | None = None,
+        ):
+            state = self.claim_states[discovery_id]
+            if state["status"] != "processing" or state["claimed_at"] != expected_claimed_at:
+                raise RepositoryError(f"Requeue was not confirmed for discovery {discovery_id}")
+            state["status"] = "queued"
+            state["claimed_at"] = None
+            return {"id": discovery_id, "status": "queued"}
+
+    rows = []
+    for discovery_id in ("one", "two", "three"):
+        claimed = row(discovery_id=discovery_id)
+        claimed["claimed_at"] = f"claim-{discovery_id}"
+        rows.append(claimed)
+    repository = OwnershipAwareRepository(rows=rows)
+    repository.claim_states = {
+        "one": {"status": "verified", "claimed_at": "claim-one"},
+        "two": {"status": "processing", "claimed_at": "reassigned-claim"},
+        "three": {"status": "processing", "claimed_at": "claim-three"},
+    }
+    repository.batch_error = RepositoryError(
+        "requeue_crawl_claims returned an invalid response (expected integer, got NoneType)"
+    )
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector([], error=asyncio.CancelledError()),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await crawler_.run_once(scheduled=False)
+
+    assert repository.claim_states["one"] == {
+        "status": "verified",
+        "claimed_at": "claim-one",
+    }
+    assert repository.claim_states["two"] == {
+        "status": "processing",
+        "claimed_at": "reassigned-claim",
+    }
+    assert repository.claim_states["three"] == {
+        "status": "queued",
+        "claimed_at": None,
+    }
+
+
+async def test_crawler_cleanup_failure_is_bounded_and_logged(
+    make_settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    class UnavailableBatchRepository(BatchRequeueRepository):
+        async def requeue_discovery(self, discovery_id: str, **_kwargs: Any):
+            self.requeues.append((discovery_id, _kwargs.get("reason"), None))
+            raise RuntimeError("requeue unavailable")
+
+    repository = UnavailableBatchRepository(rows=[row(discovery_id="one"), row(discovery_id="two")])
+    repository.batch_error = RuntimeError("batch unavailable")
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector([], error=asyncio.CancelledError()),
+    )
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(asyncio.CancelledError):
+            await crawler_.run_once(scheduled=False)
+
+    assert "crawl_batch_cleanup_failed" in caplog.text
+    assert "unrecovered_count=2" in caplog.text
+    assert repository.finished == []
+
+
+async def test_crawler_cleanup_survives_repeated_task_cancellation(make_settings) -> None:
+    repository = BatchRequeueRepository(rows=[row(discovery_id="one")])
+    repository.requeue_started = asyncio.Event()
+    repository.requeue_release = asyncio.Event()
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector([], error=asyncio.CancelledError()),
+    )
+
+    task = asyncio.create_task(crawler_.run_once(scheduled=False))
+    await asyncio.wait_for(repository.requeue_started.wait(), timeout=2)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    assert not task.done()
+    repository.requeue_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(repository.batch_requeues) == 1
+    assert repository.batch_requeues[0][0][0]["id"] == "one"
+
+
+async def test_crawler_reports_claim_cleanup_diagnostics(
+    make_settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    page = extracted_page(media=("/full.jpg",))
+    repository = BatchRequeueRepository(rows=[row(discovery_id="one"), row(discovery_id="two")])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        SequencedInspector([ok_inspection(page), asyncio.CancelledError()]),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(asyncio.CancelledError):
+            await crawler_.run_once(scheduled=False)
+
+    assert "crawl_batch_claimed" in caplog.text
+    assert "crawl_item_processing_started" in caplog.text
+    assert "crawl_item_completed" in caplog.text
+    assert "crawl_item_requeued_on_cancellation" in caplog.text
+    assert "crawl_batch_cleanup_completed" in caplog.text
+
+
+async def test_crawler_normal_batch_completion_does_not_requeue(make_settings) -> None:
+    page = extracted_page(media=("/full.jpg",))
+    repository = BatchRequeueRepository(rows=[row(discovery_id="one"), row(discovery_id="two")])
+    crawler_ = crawler(
+        make_settings,
+        repository,
+        FakePipeline(),
+        FakeInspector([ok_inspection(page), ok_inspection(page)]),
+    )
+
+    counters = await crawler_.run_once(scheduled=False)
+
+    assert counters["processed_count"] == 2
+    assert counters["failed_count"] == 0
+    assert repository.batch_requeues == []
+    assert repository.requeues == []
+    assert repository.finished[-1][2] == "succeeded"
 
 
 async def test_crawler_marks_unexpected_processing_errors_as_failed(make_settings) -> None:

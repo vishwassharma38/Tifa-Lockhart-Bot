@@ -124,6 +124,7 @@ class MediaRepository:
         to_thread: Callable[..., Awaitable[Any]] = asyncio.to_thread,
         retry_sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         jitter: Callable[[float, float], float] = random.uniform,
+        random_offset: Callable[[int], int] = random.randrange,
         discovery_batch_size: int = _DEFAULT_DISCOVERY_BATCH_SIZE,
         discovery_edge_batch_size: int = _DEFAULT_DISCOVERY_EDGE_BATCH_SIZE,
         runtime_state_cache_ttl_seconds: float = _DEFAULT_RUNTIME_STATE_CACHE_TTL_SECONDS,
@@ -133,6 +134,7 @@ class MediaRepository:
         self._to_thread = to_thread
         self._retry_sleep = retry_sleep
         self._jitter = jitter
+        self._random_offset = random_offset
         self._discovery_batch_size = max(1, min(_MAX_BATCH_SIZE, int(discovery_batch_size)))
         self._discovery_edge_batch_size = max(
             1, min(_MAX_BATCH_SIZE, int(discovery_edge_batch_size))
@@ -659,18 +661,39 @@ class MediaRepository:
         return await self._run(self._random_asset_sync, retry=True)
 
     def _random_asset_sync(self) -> dict[str, Any] | None:
-        rows = self._rows(
-            self._client()
-            .table("media_items")
-            .select("*")
-            .eq("verification_status", "verified")
-            .eq("download_status", "stored")
-            .limit(500)
-            .execute()
-        )
-        import random
+        """Select uniformly from the entire eligible archive in PostgreSQL.
 
-        return random.choice(rows) if rows else None
+        An exact count plus a random offset over the partial eligibility index
+        avoids both an unbounded result-set read and a full-table random sort.
+        A concurrent insert/delete between the count and offset fetch can make
+        the first offset miss; one bounded retry resolves that race.
+        """
+        client = self._client()
+        for _attempt in range(2):
+            count_response = (
+                client.table("media_items")
+                .select("id", count="exact")
+                .eq("verification_status", "verified")
+                .eq("download_status", "stored")
+                .limit(1)
+                .execute()
+            )
+            eligible_count = int(getattr(count_response, "count", None) or 0)
+            if eligible_count <= 0:
+                return None
+            offset = max(0, min(eligible_count - 1, int(self._random_offset(eligible_count))))
+            rows = self._rows(
+                client.table("media_items")
+                .select("*")
+                .eq("verification_status", "verified")
+                .eq("download_status", "stored")
+                .order("id")
+                .range(offset, offset)
+                .execute()
+            )
+            if rows:
+                return rows[0]
+        return None
 
     async def source_for_media(self, media_item_id: str) -> dict[str, Any] | None:
         return await self._run(self._source_for_media_sync, media_item_id, retry=True)
@@ -1050,6 +1073,71 @@ class MediaRepository:
             ):
                 return current
         raise RepositoryError(f"Requeue was not confirmed for discovery {discovery_id}")
+
+    async def requeue_discoveries(
+        self,
+        claims: list[dict[str, Any]],
+        *,
+        reason: str,
+        next_attempt_at: str | None = None,
+    ) -> int:
+        """Atomically requeue every still-owned processing claim in one batch.
+
+        Ownership is checked with ``claimed_at`` so a claim that was legitimately
+        recovered or reassigned is never overwritten. Completed discoveries are
+        excluded by the ``status = 'processing'`` predicate.
+        """
+        payload = [
+            {
+                "id": str(claim["id"]),
+                "claimed_at": claim.get("claimed_at"),
+            }
+            for claim in claims
+            if isinstance(claim, dict) and claim.get("id")
+        ]
+        if not payload:
+            return 0
+        return await self._run(
+            self._requeue_discoveries_sync,
+            payload,
+            reason,
+            next_attempt_at,
+            retry=True,
+        )
+
+    def _requeue_discoveries_sync(
+        self,
+        claims: list[dict[str, Any]],
+        reason: str,
+        next_attempt_at: str | None,
+    ) -> int:
+        response = (
+            self._client()
+            .rpc(
+                "requeue_crawl_claims",
+                {
+                    "p_claims": claims,
+                    "p_reason": reason[:500],
+                    "p_next_attempt_at": next_attempt_at,
+                },
+            )
+            .execute()
+        )
+        data = getattr(response, "data", None)
+        # requeue_crawl_claims is declared as ``returns integer``. A legitimate
+        # zero-row recovery is the integer 0; anything else cannot be trusted as
+        # a confirmed batch result because the crawler may then skip its
+        # ownership-checked per-claim fallback.
+        if isinstance(data, bool) or not isinstance(data, int):
+            raise RepositoryError(
+                "requeue_crawl_claims returned an invalid response "
+                f"(expected integer, got {type(data).__name__})"
+            )
+        if data < 0:
+            raise RepositoryError(
+                f"requeue_crawl_claims returned an invalid negative count ({data})"
+            )
+        return data
 
     async def record_discovery_edge(
         self,
@@ -1488,6 +1576,21 @@ class MediaRepository:
             return rows[0]
         raise RepositoryError("Publication insert returned no row")
 
+    async def get_publication(self, publication_id: str) -> dict[str, Any] | None:
+        """Return one publication row for persistence reconciliation."""
+        return await self._run(self._get_publication_sync, publication_id, retry=True)
+
+    def _get_publication_sync(self, publication_id: str) -> dict[str, Any] | None:
+        rows = self._rows(
+            self._client()
+            .table("publications")
+            .select("*")
+            .eq("id", publication_id)
+            .limit(1)
+            .execute()
+        )
+        return rows[0] if rows else None
+
     async def update_publication(
         self,
         publication_id: str,
@@ -1520,13 +1623,23 @@ class MediaRepository:
         if last_error is not None:
             payload["last_error"] = last_error
 
-        response = (
-            self._client().table("publications").update(payload).eq("id", publication_id).execute()
+        # Publication is terminal. Both a repeated published write and an
+        # ambiguous persistence failure must never mutate an already published
+        # row, including its message ID or publication timestamp.
+        query = (
+            self._client()
+            .table("publications")
+            .update(payload)
+            .eq("id", publication_id)
+            .neq("status", "published")
         )
-        rows = self._rows(response)
+        rows = self._rows(query.execute())
         if rows:
             return rows[0]
-        return {"id": publication_id, **payload}
+        current = self._get_publication_sync(publication_id)
+        if current is not None:
+            return current
+        raise RepositoryError(f"Publication {publication_id} was not found")
 
     async def get_digest_publication(
         self, media_item_id: str, channel_id: int

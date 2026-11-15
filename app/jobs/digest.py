@@ -14,7 +14,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.bot.publisher import DiscordPublicationRejectedError, PublicationContext
+from app.bot.publisher import (
+    DiscordPublicationMessageError,
+    DiscordPublicationRejectedError,
+    PublicationContext,
+)
 from app.config import Settings
 
 log = logging.getLogger(__name__)
@@ -943,8 +947,12 @@ class DigestService:
                 channel_id=channel_id,
             )
         except Exception as exc:
-            definite_rejection = isinstance(exc, DiscordPublicationRejectedError)
-            error_kind = "rejected" if definite_rejection else "ambiguous"
+            if isinstance(exc, DiscordPublicationMessageError):
+                error_kind = "construction"
+            elif isinstance(exc, DiscordPublicationRejectedError):
+                error_kind = "rejected"
+            else:
+                error_kind = "ambiguous"
             await self._record_failure(
                 publication,
                 claim_token,
