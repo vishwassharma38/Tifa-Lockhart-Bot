@@ -705,6 +705,7 @@ async def test_update_publication_records_message_and_published_time() -> None:
 
 async def test_update_publication_records_failure_without_published_time() -> None:
     client = FakeClient()
+    client.table("publications").results["update"] = [{"id": "publication-1", "status": "failed"}]
     repository = make_repository(client)
 
     await repository.update_publication(
@@ -719,6 +720,25 @@ async def test_update_publication_records_failure_without_published_time() -> No
     assert "published_at" not in payload
     query = client.table("publications").queries[0]
     assert query.filters == [("id", "publication-1"), ("neq.status", "published")]
+
+
+async def test_update_publication_missing_record_raises_without_fabricated_success() -> None:
+    client = FakeClient()
+    client.table("publications").queued_results["update"] = [[]]
+    client.table("publications").queued_results["select"] = [[]]
+    repository = make_repository(client)
+
+    with pytest.raises(RepositoryError, match="Publication publication-missing was not found"):
+        await repository.update_publication(
+            "publication-missing",
+            status="published",
+            message_id=555,
+        )
+
+    query = client.table("publications").queries[0]
+    assert query.filters == [("id", "publication-missing"), ("neq.status", "published")]
+    select_query = client.table("publications").queries[1]
+    assert select_query.filters == [("id", "publication-missing")]
 
 
 async def test_update_publication_returns_published_row_without_downgrade() -> None:

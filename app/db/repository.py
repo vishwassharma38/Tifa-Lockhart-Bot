@@ -1639,7 +1639,7 @@ class MediaRepository:
         current = self._get_publication_sync(publication_id)
         if current is not None:
             return current
-        return {"id": publication_id, **payload}
+        raise RepositoryError(f"Publication {publication_id} was not found")
 
     async def get_digest_publication(
         self, media_item_id: str, channel_id: int

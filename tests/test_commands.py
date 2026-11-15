@@ -19,6 +19,7 @@ from app.bot.publisher import (
     DiscordPublicationMessageError,
     MarkerLookup,
 )
+from app.db.repository import RepositoryError
 from app.health.status import (
     DependencyStatus,
     StatusReport,
@@ -397,9 +398,12 @@ class RecordingRandomRepository(FakeOperationalRepository):
         self.publication_updates: list[dict[str, object]] = []
         self.media_sources: list[dict[str, object]] | None = None
         self.publications: dict[str, dict[str, object]] = {}
+        self.publication_reads = 0
         self.fail_published_update = False
         self.fail_published_update_after_commit = False
         self.fail_publication_reconciliation = False
+        self.publication_not_found = False
+        self.return_unpersisted_published_update = False
 
     async def sources_for_media(self, _media_item_id: str) -> list[dict[str, object]]:
         if self.media_sources is not None:
@@ -407,7 +411,21 @@ class RecordingRandomRepository(FakeOperationalRepository):
         source = await self.source_for_media(_media_item_id)
         return [source]
 
+    async def create_publication(
+        self, _media_item_id: str, _channel_id: int, _purpose: str
+    ) -> dict[str, object]:
+        publication = {
+            "id": "publication-random",
+            "status": "pending",
+            "message_id": None,
+            "published_at": None,
+        }
+        if not self.publication_not_found:
+            self.publications.setdefault(str(publication["id"]), publication)
+        return dict(publication)
+
     async def get_publication(self, publication_id: str) -> dict[str, object] | None:
+        self.publication_reads += 1
         if self.fail_publication_reconciliation:
             raise RuntimeError("publication lookup unavailable")
         row = self.publications.get(publication_id)
@@ -429,6 +447,8 @@ class RecordingRandomRepository(FakeOperationalRepository):
                 "last_error": last_error,
             }
         )
+        if self.publication_not_found:
+            raise RepositoryError(f"Publication {publication_id} was not found")
         if status == "published" and self.fail_published_update:
             raise RuntimeError("publication update unavailable")
         row = self.publications.setdefault(
@@ -440,6 +460,8 @@ class RecordingRandomRepository(FakeOperationalRepository):
                 "published_at": None,
             },
         )
+        if status == "published" and self.return_unpersisted_published_update:
+            return dict(row)
         if row.get("status") == "published":
             # Mirror the repository's terminal-state guard.
             return dict(row)
@@ -1089,6 +1111,100 @@ async def test_random_command_ambiguous_publish_without_reconciliation_does_not_
     assert publication["status"] == "published"
     assert publication["message_id"] == 999
     assert publication["published_at"] == "2026-11-15T00:00:00+00:00"
+
+
+async def test_random_command_matching_published_record_is_confirmed(make_settings) -> None:
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    assert repository.publication_reads == 0
+    publication = repository.publications["publication-random"]
+    assert publication["status"] == "published"
+    assert publication["message_id"] == 999
+    assert publication["published_at"] == "2026-11-15T00:00:00+00:00"
+
+
+async def test_random_command_mismatched_published_record_never_downgrades(
+    make_settings,
+) -> None:
+    repository = RecordingRandomRepository()
+    repository.publications["publication-random"] = {
+        "id": "publication-random",
+        "status": "published",
+        "message_id": 111,
+        "published_at": "2026-11-01T00:00:00+00:00",
+    }
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    assert repository.publication_reads == 1
+    assert repository.publications["publication-random"] == {
+        "id": "publication-random",
+        "status": "published",
+        "message_id": 111,
+        "published_at": "2026-11-01T00:00:00+00:00",
+    }
+
+
+async def test_random_command_returned_pending_record_is_not_published(make_settings) -> None:
+    repository = RecordingRandomRepository()
+    repository.return_unpersisted_published_update = True
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert [update["status"] for update in repository.publication_updates] == [
+        "published",
+        "pending",
+    ]
+    assert repository.publication_reads == 1
+    publication = repository.publications["publication-random"]
+    assert publication["status"] == "pending"
+    assert publication["message_id"] is None
+
+
+async def test_random_command_missing_publication_record_does_not_downgrade(
+    make_settings,
+) -> None:
+    repository = RecordingRandomRepository()
+    repository.publication_not_found = True
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    assert repository.publication_reads == 1
+    assert repository.publications == {}
+    assert len(interaction.followup.messages) == 1
 
 
 async def test_random_command_marker_reconciliation_preserves_committed_publish(

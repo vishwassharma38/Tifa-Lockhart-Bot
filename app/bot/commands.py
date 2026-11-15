@@ -270,14 +270,23 @@ class PhaseFourCommands(commands.Cog):
                 type(exc).__name__,
             )
 
+    @staticmethod
+    def _publication_confirms_published(record: object, message_id: int) -> bool:
+        return (
+            isinstance(record, dict)
+            and record.get("status") == "published"
+            and record.get("message_id") == message_id
+        )
+
     async def _persist_random_published(
         self, publication_id: str, message_id: int
     ) -> _PublicationPersistence:
+        expected_message_id = int(message_id)
         try:
-            await self.bot.repository.update_publication(
+            persisted = await self.bot.repository.update_publication(
                 publication_id,
                 status="published",
-                message_id=int(message_id),
+                message_id=expected_message_id,
                 last_error="",
             )
         except Exception as exc:
@@ -288,21 +297,34 @@ class PhaseFourCommands(commands.Cog):
                 message_id,
                 type(exc).__name__,
             )
-            return await self._reconcile_random_publication(publication_id, int(message_id), exc)
-        return _PublicationPersistence.CONFIRMED
+            return await self._reconcile_random_publication(
+                publication_id, expected_message_id, update_exception=exc
+            )
+        if self._publication_confirms_published(persisted, expected_message_id):
+            return _PublicationPersistence.CONFIRMED
+        log.warning(
+            "Random publication update did not confirm the delivered message; "
+            "reconciling publication_id=%s message_id=%s persisted_status=%s "
+            "persisted_message_id=%s",
+            publication_id,
+            expected_message_id,
+            persisted.get("status") if isinstance(persisted, dict) else None,
+            persisted.get("message_id") if isinstance(persisted, dict) else None,
+        )
+        return await self._reconcile_random_publication(publication_id, expected_message_id)
 
     async def _reconcile_random_publication(
         self,
         publication_id: str,
         message_id: int,
-        update_exception: Exception,
+        update_exception: Exception | None = None,
     ) -> _PublicationPersistence:
         """Resolve an ambiguous published update after delivery was confirmed.
 
         The update may have committed while only its response was lost. Reading
         the row back prevents a later ``pending`` write from downgrading that
-        committed delivery. If the row cannot be read, the outcome remains
-        unconfirmed so the caller performs no further status write.
+        committed delivery. A missing or unreadable record remains unconfirmed
+        so the caller performs no further status write.
         """
         try:
             current = await self.bot.repository.get_publication(publication_id)
@@ -313,28 +335,40 @@ class PhaseFourCommands(commands.Cog):
                 "update_exception=%s reconcile_exception=%s",
                 publication_id,
                 message_id,
-                type(update_exception).__name__,
+                type(update_exception).__name__ if update_exception else "none",
                 type(exc).__name__,
             )
             return _PublicationPersistence.UNCONFIRMED
 
-        if isinstance(current, dict) and current.get("status") == "published":
+        if not isinstance(current, dict):
+            log.error(
+                "Random publication record was not found during reconciliation; "
+                "leaving state unconfirmed publication_id=%s message_id=%s "
+                "update_exception=%s",
+                publication_id,
+                message_id,
+                type(update_exception).__name__ if update_exception else "none",
+            )
+            return _PublicationPersistence.UNCONFIRMED
+
+        if current.get("status") == "published":
             persisted_message_id = current.get("message_id")
-            if persisted_message_id == message_id:
-                log.info(
-                    "Random publication update committed before its response was lost "
-                    "publication_id=%s message_id=%s",
-                    publication_id,
-                    message_id,
-                )
-            else:
+            if persisted_message_id != message_id:
                 log.warning(
-                    "Random publication is already published; preserving it "
-                    "publication_id=%s expected_message_id=%s persisted_message_id=%s",
+                    "Random publication is already published with a different message ID; "
+                    "never overwriting it publication_id=%s expected_message_id=%s "
+                    "persisted_message_id=%s",
                     publication_id,
                     message_id,
                     persisted_message_id,
                 )
+                return _PublicationPersistence.UNCONFIRMED
+            log.info(
+                "Random publication update committed before its response was lost "
+                "publication_id=%s message_id=%s",
+                publication_id,
+                message_id,
+            )
             return _PublicationPersistence.CONFIRMED
 
         log.warning(
@@ -342,8 +376,8 @@ class PhaseFourCommands(commands.Cog):
             "update_exception=%s persisted_status=%s",
             publication_id,
             message_id,
-            type(update_exception).__name__,
-            current.get("status") if isinstance(current, dict) else None,
+            type(update_exception).__name__ if update_exception else "none",
+            current.get("status"),
         )
         return _PublicationPersistence.NOT_PERSISTED
 
