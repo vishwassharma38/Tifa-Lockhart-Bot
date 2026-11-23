@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import types
 
 import discord
+import pytest
 from discord import app_commands
 
 from app.bot.client import sync_application_commands
@@ -13,9 +15,21 @@ from app.bot.commands import (
     build_about_embed,
     build_status_embed,
 )
+from app.bot.publisher import (
+    DiscordPublicationMessageError,
+    MarkerLookup,
+)
+from app.db.repository import RepositoryError
 from app.health.status import (
     DependencyStatus,
     StatusReport,
+)
+from app.storage.base import (
+    StorageAccessDeniedError,
+    StorageObjectNotFoundError,
+    StorageObjectTooLargeError,
+    StorageOperationError,
+    StorageTimeoutError,
 )
 
 
@@ -378,6 +392,165 @@ class FakeRandomStorage:
         return b"random-media"
 
 
+class RecordingRandomRepository(FakeOperationalRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.publication_updates: list[dict[str, object]] = []
+        self.media_sources: list[dict[str, object]] | None = None
+        self.publications: dict[str, dict[str, object]] = {}
+        self.publication_reads = 0
+        self.fail_published_update = False
+        self.fail_published_update_after_commit = False
+        self.fail_publication_reconciliation = False
+        self.publication_not_found = False
+        self.return_unpersisted_published_update = False
+
+    async def sources_for_media(self, _media_item_id: str) -> list[dict[str, object]]:
+        if self.media_sources is not None:
+            return [dict(source) for source in self.media_sources]
+        source = await self.source_for_media(_media_item_id)
+        return [source]
+
+    async def create_publication(
+        self, _media_item_id: str, _channel_id: int, _purpose: str
+    ) -> dict[str, object]:
+        publication = {
+            "id": "publication-random",
+            "status": "pending",
+            "message_id": None,
+            "published_at": None,
+        }
+        if not self.publication_not_found:
+            self.publications.setdefault(str(publication["id"]), publication)
+        return dict(publication)
+
+    async def get_publication(self, publication_id: str) -> dict[str, object] | None:
+        self.publication_reads += 1
+        if self.fail_publication_reconciliation:
+            raise RuntimeError("publication lookup unavailable")
+        row = self.publications.get(publication_id)
+        return dict(row) if row is not None else None
+
+    async def update_publication(
+        self,
+        publication_id: str,
+        *,
+        status: str,
+        message_id: int | None = None,
+        last_error: str | None = None,
+    ) -> dict[str, object]:
+        self.publication_updates.append(
+            {
+                "publication_id": publication_id,
+                "status": status,
+                "message_id": message_id,
+                "last_error": last_error,
+            }
+        )
+        if self.publication_not_found:
+            raise RepositoryError(f"Publication {publication_id} was not found")
+        if status == "published" and self.fail_published_update:
+            raise RuntimeError("publication update unavailable")
+        row = self.publications.setdefault(
+            publication_id,
+            {
+                "id": publication_id,
+                "status": "pending",
+                "message_id": None,
+                "published_at": None,
+            },
+        )
+        if status == "published" and self.return_unpersisted_published_update:
+            return dict(row)
+        if row.get("status") == "published":
+            # Mirror the repository's terminal-state guard.
+            return dict(row)
+        if status == "published":
+            row.update(
+                status="published",
+                message_id=message_id,
+                last_error=last_error,
+                published_at="2026-11-15T00:00:00+00:00",
+            )
+            if self.fail_published_update_after_commit:
+                raise TimeoutError("response lost after commit")
+        else:
+            row.update(status=status, last_error=last_error)
+            if message_id is not None:
+                row["message_id"] = message_id
+        return dict(row)
+
+
+class FailingRandomStorage(FakeRandomStorage):
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def download_bytes(
+        self, _object_key: str, *, max_bytes: int | None = None, timeout: float | None = None
+    ) -> bytes:
+        raise self.error
+
+
+class ControlledFollowup(FakeFollowup):
+    def __init__(self, errors: list[BaseException] | None = None) -> None:
+        super().__init__()
+        self.errors = list(errors or [])
+        self.attempts: list[dict[str, object]] = []
+
+    async def send(self, *args: object, **kwargs: object) -> FakeSentMessage:
+        self.attempts.append({"args": args, **kwargs})
+        if self.errors:
+            raise self.errors.pop(0)
+        return await super().send(*args, **kwargs)
+
+
+class FakeDiscordResponse:
+    def __init__(self, status: int) -> None:
+        self.status = status
+        self.reason = "test response"
+
+
+def discord_http_error(status: int) -> discord.HTTPException:
+    return discord.HTTPException(FakeDiscordResponse(status), "test failure")
+
+
+def random_interaction(*errors: BaseException) -> FakeInteraction:
+    interaction = FakeInteraction(channel_id=5)
+    interaction.followup = ControlledFollowup(list(errors))
+    return interaction
+
+
+def random_cog(
+    *,
+    repository: FakeOperationalRepository | None = None,
+    storage: object | None = None,
+) -> PhaseFourCommands:
+    return PhaseFourCommands(
+        FakeBot(
+            None,  # type: ignore[arg-type]
+            FakeStatusService(),
+            repository=repository or FakeOperationalRepository(),
+            storage=storage or FakeRandomStorage(),
+        )
+    )
+
+
+def mark_publication_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    message_id: int | None,
+    conclusive: bool,
+) -> None:
+    async def fake_lookup(self, *, channel_id: int, marker: str, limit: int = 500):
+        del self, channel_id, marker, limit
+        return MarkerLookup(message_id=message_id, conclusive=conclusive)
+
+    monkeypatch.setattr(
+        "app.bot.commands.DiscordPublisher.find_publication_marker",
+        fake_lookup,
+    )
+
+
 async def test_status_command_reports_real_digest_state(make_settings) -> None:
     report = StatusReport(
         discord_connected=True,
@@ -536,7 +709,7 @@ async def test_stop_pauses_collection_without_touching_digest(make_settings) -> 
 
 
 async def test_random_command_still_delivers_archived_media(make_settings) -> None:
-    repository = FakeOperationalRepository()
+    repository = RecordingRandomRepository()
     bot = FakeBot(
         make_settings(),
         FakeStatusService(),
@@ -551,9 +724,612 @@ async def test_random_command_still_delivers_archived_media(make_settings) -> No
     assert interaction.response.deferred == [{"thinking": True}]
     message = interaction.followup.messages[0]
     assert isinstance(message["file"], discord.File)
+    assert message["file"].fp.closed
     assert "Random Tifa artwork" in message["args"][0]
     assert "Creator: [artist](https://example.com/artist)" in message["args"][0]
+    assert "tifa-random-publication:publication-random" in message["args"][0]
     assert message["suppress_embeds"] is True
+    assert repository.publication_updates[-1] == {
+        "publication_id": "publication-random",
+        "status": "published",
+        "message_id": 999,
+        "last_error": "",
+    }
+
+
+async def test_random_command_bounds_large_crawler_provenance(make_settings) -> None:
+    repository = RecordingRandomRepository()
+    repository.media_sources = [
+        {
+            "source_url": f"https://example.com/gallery/tifa-{index}",
+            "creator_name": f"Artist {index}",
+            "creator_profile_url": f"https://example.com/artist/{index}",
+            "title": f"Tifa artwork {index}",
+        }
+        for index in range(60)
+    ]
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    message = interaction.followup.messages[0]["args"][0]
+    assert len(message) <= 1800
+    assert "more archived reference" in message
+    assert repository.publication_updates[-1]["status"] == "published"
+
+
+async def test_random_command_reports_missing_archive_object(make_settings) -> None:
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FailingRandomStorage(StorageObjectNotFoundError("object missing")),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert repository.publication_updates[-1]["status"] == "failed"
+    assert str(repository.publication_updates[-1]["last_error"]).startswith(
+        "archive_object_not_found:"
+    )
+    assert "missing from storage" in interaction.followup.messages[0]["args"][0]
+
+
+@pytest.mark.parametrize(
+    ("storage_error", "failure_code", "user_message"),
+    [
+        (
+            StorageObjectTooLargeError("too large"),
+            "archive_object_too_large",
+            "too large to deliver",
+        ),
+        (
+            StorageTimeoutError("timed out"),
+            "archive_download_failed",
+            "could not be retrieved",
+        ),
+        (
+            StorageAccessDeniedError("denied"),
+            "archive_download_failed",
+            "could not be retrieved",
+        ),
+        (
+            StorageOperationError("storage failure"),
+            "archive_download_failed",
+            "could not be retrieved",
+        ),
+    ],
+)
+async def test_random_command_reports_storage_stage_failures(
+    make_settings,
+    storage_error: Exception,
+    failure_code: str,
+    user_message: str,
+) -> None:
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FailingRandomStorage(storage_error),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    update = repository.publication_updates[-1]
+    assert update["status"] == "failed"
+    assert str(update["last_error"]).startswith(f"{failure_code}:")
+    assert user_message in interaction.followup.messages[0]["args"][0]
+
+
+async def test_random_command_reports_media_selection_failure(make_settings) -> None:
+    class SelectionFailureRepository(RecordingRandomRepository):
+        async def random_asset(self) -> dict[str, object] | None:
+            raise RuntimeError("eligible count unavailable")
+
+    repository = SelectionFailureRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert repository.publication_updates == []
+    assert "Could not select archived media" in interaction.followup.messages[0]["args"][0]
+
+
+async def test_random_command_reports_publication_creation_failure(make_settings) -> None:
+    class CreationFailureRepository(RecordingRandomRepository):
+        async def create_publication(
+            self, _media_item_id: str, _channel_id: int, _purpose: str
+        ) -> dict[str, object]:
+            raise RuntimeError("publication insert unavailable")
+
+    repository = CreationFailureRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert repository.publication_updates == []
+    assert (
+        "publication record could not be created" in (interaction.followup.messages[0]["args"][0])
+    )
+
+
+async def test_random_command_reports_source_metadata_failure(make_settings) -> None:
+    class SourceFailureRepository(RecordingRandomRepository):
+        async def sources_for_media(self, _media_item_id: str) -> list[dict[str, object]]:
+            raise RuntimeError("source lookup unavailable")
+
+    repository = SourceFailureRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    update = repository.publication_updates[-1]
+    assert update["status"] == "failed"
+    assert str(update["last_error"]).startswith("source_metadata_retrieval_failed:")
+    assert "source details could not be loaded" in interaction.followup.messages[0]["args"][0]
+
+
+async def test_random_command_reports_integrity_failure(make_settings) -> None:
+    class TamperedStorage(FakeRandomStorage):
+        async def download_bytes(self, _object_key: str, **_kwargs: object) -> bytes:
+            return b"tampered"
+
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=TamperedStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert repository.publication_updates[-1]["status"] == "failed"
+    assert str(repository.publication_updates[-1]["last_error"]).startswith(
+        "integrity_verification_failed:"
+    )
+    assert "integrity verification" in interaction.followup.messages[0]["args"][0]
+
+
+async def test_random_command_message_construction_failure_is_not_a_discord_rejection(
+    make_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_construction(_context: object) -> str:
+        raise DiscordPublicationMessageError("message could not be bounded")
+
+    monkeypatch.setattr("app.bot.commands.build_publication_message", fail_construction)
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    update = repository.publication_updates[-1]
+    assert update["status"] == "failed"
+    assert str(update["last_error"]).startswith("message_construction_failed:")
+    assert interaction.followup.attempts
+    assert all("file" not in attempt for attempt in interaction.followup.attempts)
+    assert "could not be formatted" in interaction.followup.messages[0]["args"][0]
+
+
+async def test_random_command_definitive_discord_rejection(make_settings) -> None:
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction(discord_http_error(400))
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    update = repository.publication_updates[-1]
+    assert update["status"] == "failed"
+    assert str(update["last_error"]).startswith("discord_publication_rejected:")
+    assert "could not be published to Discord" in interaction.followup.messages[0]["args"][0]
+    attempt_file = interaction.followup.attempts[0]["file"]
+    assert isinstance(attempt_file, discord.File)
+    assert attempt_file.fp.closed
+
+
+async def test_random_command_uncertain_send_reconciles_existing_marker(
+    make_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction(RuntimeError("transport response lost"))
+    mark_publication_lookup(monkeypatch, message_id=321, conclusive=True)
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert len(interaction.followup.attempts) == 1
+    assert interaction.followup.messages == []
+    assert repository.fail_published_update is False
+    assert repository.publication_updates[-1]["status"] == "published"
+    assert repository.publication_updates[-1]["message_id"] == 321
+
+
+async def test_random_command_uncertain_send_conclusive_miss_is_failed(
+    make_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction(RuntimeError("transport response lost"))
+    mark_publication_lookup(monkeypatch, message_id=None, conclusive=True)
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert len(interaction.followup.attempts) == 2
+    assert "file" in interaction.followup.attempts[0]
+    assert "file" not in interaction.followup.attempts[1]
+    update = repository.publication_updates[-1]
+    assert update["status"] == "failed"
+    assert str(update["last_error"]).startswith("discord_publication_not_delivered:")
+    assert "could not be published to Discord" in interaction.followup.messages[0]["args"][0]
+
+
+async def test_random_command_uncertain_send_inconclusive_stays_pending(
+    make_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction(discord_http_error(429))
+    mark_publication_lookup(monkeypatch, message_id=None, conclusive=False)
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert len(interaction.followup.attempts) == 2
+    assert "file" in interaction.followup.attempts[0]
+    assert "file" not in interaction.followup.attempts[1]
+    update = repository.publication_updates[-1]
+    assert update["status"] == "pending"
+    assert str(update["last_error"]).startswith("discord_publication_ambiguous:")
+    assert "outcome is uncertain" in interaction.followup.messages[0]["args"][0]
+
+
+async def test_random_command_persistence_failure_never_marks_delivery_failed(
+    make_settings,
+) -> None:
+    repository = RecordingRandomRepository()
+    repository.fail_published_update = True
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert len(interaction.followup.attempts) == 1
+    assert len(interaction.followup.messages) == 1
+    assert not any(
+        "could not" in str(message["args"][0]) for message in interaction.followup.messages
+    )
+    assert [update["status"] for update in repository.publication_updates] == [
+        "published",
+        "pending",
+    ]
+    assert str(repository.publication_updates[-1]["last_error"]).startswith(
+        "publication_persistence_failed:"
+    )
+
+
+async def test_random_command_ambiguous_publish_commit_is_reconciled(
+    make_settings,
+) -> None:
+    repository = RecordingRandomRepository()
+    repository.fail_published_update_after_commit = True
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert len(interaction.followup.attempts) == 1
+    assert len(interaction.followup.messages) == 1
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    publication = repository.publications["publication-random"]
+    assert publication["status"] == "published"
+    assert publication["message_id"] == 999
+    assert publication["published_at"] == "2026-11-15T00:00:00+00:00"
+
+
+async def test_random_command_ambiguous_publish_without_reconciliation_does_not_downgrade(
+    make_settings,
+) -> None:
+    repository = RecordingRandomRepository()
+    repository.fail_published_update_after_commit = True
+    repository.fail_publication_reconciliation = True
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    publication = repository.publications["publication-random"]
+    assert publication["status"] == "published"
+    assert publication["message_id"] == 999
+    assert publication["published_at"] == "2026-11-15T00:00:00+00:00"
+
+
+async def test_random_command_matching_published_record_is_confirmed(make_settings) -> None:
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    assert repository.publication_reads == 0
+    publication = repository.publications["publication-random"]
+    assert publication["status"] == "published"
+    assert publication["message_id"] == 999
+    assert publication["published_at"] == "2026-11-15T00:00:00+00:00"
+
+
+async def test_random_command_mismatched_published_record_never_downgrades(
+    make_settings,
+) -> None:
+    repository = RecordingRandomRepository()
+    repository.publications["publication-random"] = {
+        "id": "publication-random",
+        "status": "published",
+        "message_id": 111,
+        "published_at": "2026-11-01T00:00:00+00:00",
+    }
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    assert repository.publication_reads == 1
+    assert repository.publications["publication-random"] == {
+        "id": "publication-random",
+        "status": "published",
+        "message_id": 111,
+        "published_at": "2026-11-01T00:00:00+00:00",
+    }
+
+
+async def test_random_command_returned_pending_record_is_not_published(make_settings) -> None:
+    repository = RecordingRandomRepository()
+    repository.return_unpersisted_published_update = True
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert [update["status"] for update in repository.publication_updates] == [
+        "published",
+        "pending",
+    ]
+    assert repository.publication_reads == 1
+    publication = repository.publications["publication-random"]
+    assert publication["status"] == "pending"
+    assert publication["message_id"] is None
+
+
+async def test_random_command_missing_publication_record_does_not_downgrade(
+    make_settings,
+) -> None:
+    repository = RecordingRandomRepository()
+    repository.publication_not_found = True
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    assert repository.publication_reads == 1
+    assert repository.publications == {}
+    assert len(interaction.followup.messages) == 1
+
+
+async def test_random_command_marker_reconciliation_preserves_committed_publish(
+    make_settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = RecordingRandomRepository()
+    repository.fail_published_update_after_commit = True
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction(RuntimeError("transport response lost"))
+    mark_publication_lookup(monkeypatch, message_id=321, conclusive=True)
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert len(interaction.followup.attempts) == 1
+    assert interaction.followup.messages == []
+    assert [update["status"] for update in repository.publication_updates] == ["published"]
+    publication = repository.publications["publication-random"]
+    assert publication["status"] == "published"
+    assert publication["message_id"] == 321
+    assert publication["published_at"] == "2026-11-15T00:00:00+00:00"
+
+
+async def test_random_command_post_delivery_error_never_reports_failure(
+    make_settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    cog = PhaseFourCommands(bot)
+    interaction = random_interaction()
+
+    async def broken_persistence(_publication_id: str, _message_id: int) -> bool:
+        raise RuntimeError("local post-delivery failure")
+
+    monkeypatch.setattr(cog, "_persist_random_published", broken_persistence)
+
+    await PhaseFourCommands.random_asset.callback(cog, interaction)
+
+    assert len(interaction.followup.attempts) == 1
+    assert len(interaction.followup.messages) == 1
+    assert not any(
+        "could not" in str(message["args"][0]) for message in interaction.followup.messages
+    )
+    assert repository.publication_updates[-1]["status"] == "pending"
+    assert str(repository.publication_updates[-1]["last_error"]).startswith(
+        "publication_persistence_failed:"
+    )
+
+
+async def test_random_command_cancellation_before_send_is_failed_and_propagates(
+    make_settings,
+) -> None:
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FailingRandomStorage(asyncio.CancelledError()),
+    )
+    interaction = random_interaction()
+
+    with pytest.raises(asyncio.CancelledError):
+        await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert repository.publication_updates[-1]["status"] == "failed"
+    assert str(repository.publication_updates[-1]["last_error"]).startswith(
+        "command_cancelled_before_delivery:"
+    )
+    assert interaction.followup.attempts == []
+
+
+async def test_random_command_cancellation_during_send_stays_pending(
+    make_settings,
+) -> None:
+    repository = RecordingRandomRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction(asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert repository.publication_updates[-1]["status"] == "pending"
+    assert str(repository.publication_updates[-1]["last_error"]).startswith(
+        "discord_publication_ambiguous:"
+    )
+    attempt_file = interaction.followup.attempts[0]["file"]
+    assert isinstance(attempt_file, discord.File)
+    assert attempt_file.fp.closed
+
+
+async def test_random_command_reports_no_eligible_media_without_publication(
+    make_settings,
+) -> None:
+    class EmptyRepository(RecordingRandomRepository):
+        async def random_asset(self) -> dict[str, object] | None:
+            return None
+
+    repository = EmptyRepository()
+    bot = FakeBot(
+        make_settings(),
+        FakeStatusService(),
+        repository=repository,
+        storage=FakeRandomStorage(),
+    )
+    interaction = random_interaction()
+
+    await PhaseFourCommands.random_asset.callback(PhaseFourCommands(bot), interaction)
+
+    assert repository.publication_updates == []
+    assert "No verified archived media" in interaction.followup.messages[0]["args"][0]
 
 
 async def test_stats_command_still_reports_archive_counts(make_settings) -> None:

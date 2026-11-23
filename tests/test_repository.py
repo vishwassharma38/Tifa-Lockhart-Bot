@@ -64,6 +64,10 @@ class FakeQuery:
         self.filters.append((f"is.{column}", value))
         return self
 
+    def neq(self, column: str, value: object) -> FakeQuery:
+        self.filters.append((f"neq.{column}", value))
+        return self
+
     def gte(self, column: str, value: object) -> FakeQuery:
         self.filters.append((f"gte.{column}", value))
         return self
@@ -104,11 +108,15 @@ class FakeQuery:
         error = self.table.errors.get(self.operation)
         if error is not None:
             raise error
-        queued = self.table.queued_results.get(self.operation)
-        if queued:
-            data = queued.pop(0)
-        else:
+        if self.count is not None:
+            # A count-only query does not consume queued row payloads.
             data = self.table.results.get(self.operation, [])
+        else:
+            queued = self.table.queued_results.get(self.operation)
+            if queued:
+                data = queued.pop(0)
+            else:
+                data = self.table.results.get(self.operation, [])
         count = self.table.counts.get(self.operation)
         queued_counts = self.table.queued_counts.get(self.operation)
         if self.count is not None:
@@ -692,11 +700,12 @@ async def test_update_publication_records_message_and_published_time() -> None:
     assert payload["message_id"] == 555
     assert "published_at" in payload
     query = client.table("publications").queries[0]
-    assert query.filters == [("id", "publication-1")]
+    assert query.filters == [("id", "publication-1"), ("neq.status", "published")]
 
 
 async def test_update_publication_records_failure_without_published_time() -> None:
     client = FakeClient()
+    client.table("publications").results["update"] = [{"id": "publication-1", "status": "failed"}]
     repository = make_repository(client)
 
     await repository.update_publication(
@@ -709,6 +718,67 @@ async def test_update_publication_records_failure_without_published_time() -> No
     assert payload["status"] == "failed"
     assert payload["last_error"] == "publication_failed"
     assert "published_at" not in payload
+    query = client.table("publications").queries[0]
+    assert query.filters == [("id", "publication-1"), ("neq.status", "published")]
+
+
+async def test_update_publication_missing_record_raises_without_fabricated_success() -> None:
+    client = FakeClient()
+    client.table("publications").queued_results["update"] = [[]]
+    client.table("publications").queued_results["select"] = [[]]
+    repository = make_repository(client)
+
+    with pytest.raises(RepositoryError, match="Publication publication-missing was not found"):
+        await repository.update_publication(
+            "publication-missing",
+            status="published",
+            message_id=555,
+        )
+
+    query = client.table("publications").queries[0]
+    assert query.filters == [("id", "publication-missing"), ("neq.status", "published")]
+    select_query = client.table("publications").queries[1]
+    assert select_query.filters == [("id", "publication-missing")]
+
+
+async def test_update_publication_returns_published_row_without_downgrade() -> None:
+    client = FakeClient()
+    published = {
+        "id": "publication-1",
+        "status": "published",
+        "message_id": 555,
+        "published_at": "2026-11-15T00:00:00+00:00",
+    }
+    client.table("publications").queued_results["update"] = [[]]
+    client.table("publications").queued_results["select"] = [[published]]
+    repository = make_repository(client)
+
+    row = await repository.update_publication(
+        "publication-1",
+        status="pending",
+        last_error="publication_persistence_failed",
+    )
+
+    assert row == published
+    query = client.table("publications").queries[0]
+    assert query.filters == [("id", "publication-1"), ("neq.status", "published")]
+    select_query = client.table("publications").queries[1]
+    assert select_query.filters == [("id", "publication-1")]
+
+
+async def test_get_publication_returns_persisted_state() -> None:
+    client = FakeClient()
+    published = {
+        "id": "publication-1",
+        "status": "published",
+        "message_id": 555,
+        "published_at": "2026-11-15T00:00:00+00:00",
+    }
+    client.table("publications").queued_results["select"] = [[published]]
+    repository = make_repository(client)
+
+    assert await repository.get_publication("publication-1") == published
+    assert await repository.get_publication("publication-missing") is None
 
 
 async def test_unconfigured_database_fails_clearly() -> None:
@@ -1314,6 +1384,150 @@ async def test_requeue_discovery_confirms_ambiguous_commit_on_retry() -> None:
 
     assert result == queued
     assert thread.calls == 2
+
+
+async def test_random_asset_uses_full_eligible_count_and_injected_offset() -> None:
+    client = FakeClient()
+    media = client.table("media_items")
+    media.queued_counts["select"] = [1000]
+    media.queued_results["select"] = [[{"id": "media-777", "filename": "tifa.png"}]]
+    offsets: list[int] = []
+
+    def choose_offset(count: int) -> int:
+        offsets.append(count)
+        return 777
+
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=immediate_thread,
+        random_offset=choose_offset,
+    )
+
+    row = await repository.random_asset()
+
+    assert row == {"id": "media-777", "filename": "tifa.png"}
+    assert offsets == [1000]
+    count_query, row_query = media.queries[:2]
+    assert count_query.count == "exact"
+    assert count_query.filters == [
+        ("verification_status", "verified"),
+        ("download_status", "stored"),
+    ]
+    assert row_query.order_value == ("id", False)
+    assert row_query.range_value == (777, 777)
+    assert row_query.filters == count_query.filters
+
+
+async def test_random_asset_returns_none_for_empty_archive() -> None:
+    client = FakeClient()
+    media = client.table("media_items")
+    media.queued_counts["select"] = [0]
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=immediate_thread,
+        random_offset=pytest.fail,
+    )
+
+    assert await repository.random_asset() is None
+    assert len(media.queries) == 1
+
+
+async def test_random_asset_retries_once_when_offset_races_a_delete() -> None:
+    client = FakeClient()
+    media = client.table("media_items")
+    media.queued_counts["select"] = [1000, 999]
+    media.queued_results["select"] = [[], [{"id": "media-500"}]]
+    offsets: list[int] = []
+
+    def choose_offset(count: int) -> int:
+        offsets.append(count)
+        return 999 if count == 1000 else 500
+
+    repository = MediaRepository(
+        make_database(client),
+        to_thread=immediate_thread,
+        random_offset=choose_offset,
+    )
+
+    row = await repository.random_asset()
+
+    assert row == {"id": "media-500"}
+    assert offsets == [1000, 999]
+
+
+async def test_requeue_discoveries_batches_owned_claims_atomically() -> None:
+    client = FakeClient()
+    client.rpc_data = 2
+    repository = make_repository(client)
+
+    recovered = await repository.requeue_discoveries(
+        [
+            {"id": "discovery-1", "claimed_at": "2026-11-13T10:00:00+00:00"},
+            {"id": "discovery-2", "claimed_at": None},
+            {"id": "", "claimed_at": None},
+        ],
+        reason="interrupted_by_shutdown",
+    )
+
+    assert recovered == 2
+    assert client.rpc_calls == [
+        (
+            "requeue_crawl_claims",
+            {
+                "p_claims": [
+                    {"id": "discovery-1", "claimed_at": "2026-11-13T10:00:00+00:00"},
+                    {"id": "discovery-2", "claimed_at": None},
+                ],
+                "p_reason": "interrupted_by_shutdown",
+                "p_next_attempt_at": None,
+            },
+        )
+    ]
+
+
+async def test_requeue_discoveries_accepts_zero_recovery_count() -> None:
+    client = FakeClient()
+    client.rpc_data = 0
+    repository = make_repository(client)
+
+    recovered = await repository.requeue_discoveries(
+        [{"id": "discovery-1", "claimed_at": None}],
+        reason="interrupted_by_shutdown",
+    )
+
+    assert recovered == 0
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        None,
+        {},
+        [],
+        ["2"],
+        "2",
+        True,
+        -1,
+    ],
+)
+async def test_requeue_discoveries_rejects_invalid_rpc_responses(response: object) -> None:
+    client = FakeClient()
+    client.rpc_data = response
+    repository = make_repository(client)
+
+    with pytest.raises(RepositoryError, match="requeue_crawl_claims returned an invalid"):
+        await repository.requeue_discoveries(
+            [{"id": "discovery-1", "claimed_at": None}],
+            reason="interrupted_by_shutdown",
+        )
+
+
+async def test_requeue_discoveries_skips_empty_claim_batch() -> None:
+    client = FakeClient()
+    repository = make_repository(client)
+
+    assert await repository.requeue_discoveries([], reason="interrupted_by_shutdown") == 0
+    assert client.rpc_calls == []
 
 
 async def test_record_discovery_edge_uses_rpc_without_read_before_write() -> None:

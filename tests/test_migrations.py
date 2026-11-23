@@ -349,6 +349,43 @@ def test_batch_edge_rpc_migration_is_atomic_and_service_role_only() -> None:
     assert "truncate" not in lowered
 
 
+def test_random_eligible_media_index_is_partial_and_additive() -> None:
+    sql = read_migration("016_random_eligible_media_index.sql").lower()
+
+    assert "create index if not exists idx_media_items_random_eligible" in sql
+    assert "on public.media_items (id)" in sql
+    assert "where verification_status = 'verified'" in sql
+    assert "and download_status = 'stored'" in sql
+    assert "create table" not in sql
+    assert "update " not in sql
+    assert "delete from" not in sql
+    assert "drop table" not in sql
+
+
+def test_batch_crawl_claim_requeue_is_atomic_and_ownership_safe() -> None:
+    sql = read_migration("017_batch_crawl_claim_requeue.sql").lower()
+
+    assert "create or replace function public.requeue_crawl_claims(" in sql
+    assert "p_claims jsonb" in sql
+    assert "p_next_attempt_at timestamptz default null" in sql
+    assert "security definer" in sql
+    assert "set search_path = ''" in sql
+    assert "pg_catalog.jsonb_typeof(p_claims) <> 'array'" in sql
+    assert "pg_catalog.jsonb_to_recordset(p_claims)" in sql
+    assert "d.status = 'processing'" in sql
+    assert "d.claimed_at is not distinct from c.claimed_at" in sql
+    assert "set status = 'queued'" in sql
+    assert "claimed_at = null" in sql
+    assert "last_error = pg_catalog.left(" in sql
+    assert "returning d.id" in sql
+    assert "requeued_count integer" in sql
+    assert "revoke all on function public.requeue_crawl_claims" in sql
+    assert "to service_role" in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+    assert "truncate" not in sql
+
+
 def test_bing_search_provider_migration_preserves_history() -> None:
     files, _sql = read_migrations()
     names = [path.name for path in files]
