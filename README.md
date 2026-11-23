@@ -923,7 +923,7 @@ The locked V1 blueprint defines the implementation sequence:
 | 4     | Reddit automation and Discord controls                                                      | **Complete** |
 | 5     | Bing discovery and controlled crawler, only if permitted                                    | **Complete** |
 | 6     | Daily digest and publication reliability                                                    | **Complete** |
-| 7     | Render deployment and acceptance testing                                                    | **Complete** |
+| 7     | Render deployment and acceptance testing                                                    | **In Progress** |
 
 Phase 6 implements the daily digest, category-specific Discord publication, and restart-safe publication reconciliation. Phase 7 deployment and the full V1 acceptance checklist in Section 19 of the blueprint remain outstanding; V1 is complete only when that checklist passes.
 
